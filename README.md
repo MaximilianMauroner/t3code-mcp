@@ -2,7 +2,7 @@
 
 `t3-code-mcp` is a standalone MCP gateway for one configured remote T3 Code environment. T3 remains the authority for projects, threads, coding-agent sessions, workspaces, and execution. The gateway owns only MCP-facing policy and a small operation journal.
 
-The first slice is live against T3 `v0.0.41-nightly.20260909.1439` and uses T3’s authenticated HTTP orchestration boundary:
+The first slice is live against T3 `v0.0.41-nightly.20260910.1507` and uses T3’s authenticated HTTP orchestration boundary:
 
 - read-only project, thread, message, and connection tools;
 - project registration, thread creation, agent turns, bounded waits, interruption, pending-action responses, and archiving;
@@ -34,7 +34,20 @@ Build and test without relying on a globally installed toolchain:
 pnpm install
 pnpm build
 pnpm test
+pnpm typecheck:test
 ```
+
+The default suite is disposable and credential-free. It exercises the typed T3 HTTP boundary, all implemented gateway operations, journal recovery and idempotency, MCP tool schemas and errors, Streamable HTTP authentication, stateless clients, body limits, stale state, and ambiguous dispatch reconciliation.
+
+The real-environment acceptance test is opt-in. It uses the configured Codex Pro provider and Spark model (`instanceId=codex_openai`, `model=gpt-5.3-codex-spark`), creates a disposable thread, starts a no-file-change prompt, reconnects through a second gateway instance, waits for the run, and archives the thread:
+
+```sh
+T3_LIVE_ACCESS_TOKEN='server-side-t3-token' \
+T3_LIVE_PROJECT_ID='remote-project-id' \
+pnpm test:live
+```
+
+Set `T3_LIVE_HTTP_BASE_URL` and `T3_LIVE_ENVIRONMENT_ID` when the live environment is not the local default. The live test is skipped unless `T3_LIVE_TESTS=1` is set by the script and a token is supplied. Never commit or pass the token to an MCP prompt.
 
 ## Connection spike
 
@@ -64,6 +77,43 @@ The gateway exposes task-specific tools rather than a generic RPC escape hatch: 
 Mutation tools require an `idempotencyKey`. The journal stores the caller’s key, payload hash, command ID, operation handle, and reconciliation fields. It never stores the original prompt or credentials. A retry with the same key and different input fails; a connection failure leaves the operation uncertain and does not replay raw terminal input or an agent turn.
 
 The configured `T3_ACCESS_TOKEN` is checked for `orchestration:operate` before control tools dispatch. A read-only T3 credential cannot trigger execution through this gateway. `MCP_READ_ONLY=true` is an additional endpoint-level guard.
+
+## Auto-start on Linux
+
+This repository includes hardened user-level systemd units for the gateway and
+the OpenAI Secure MCP Tunnel. They use the fixed T3 environment and tunnel ID
+for this deployment, restart after unexpected exits, bind local listeners to
+loopback, and start the gateway in read-only mode.
+The tunnel unit derives the `Bearer` header at launch from `MCP_BEARER_TOKEN`
+and waits for the gateway health endpoint before probing MCP. This keeps the
+secret out of `ExecStart` and avoids a startup race. `ProtectKernelModules` is
+omitted because this host's user systemd rejects that restriction; the other
+compatible hardening controls remain enabled.
+
+Install and enable them after building:
+
+```sh
+test -e "$HOME/.config/t3-code-mcp.env" || install -m 600 deploy/systemd/t3-code-mcp.env.example "$HOME/.config/t3-code-mcp.env"
+install -d -m 700 "$HOME/.config/systemd/user"
+install -m 644 deploy/systemd/t3-code-mcp.service "$HOME/.config/systemd/user/t3-code-mcp.service"
+install -m 644 deploy/systemd/t3-code-mcp-tunnel.service "$HOME/.config/systemd/user/t3-code-mcp-tunnel.service"
+systemctl --user daemon-reload
+systemctl --user enable t3-code-mcp.service t3-code-mcp-tunnel.service
+```
+
+Edit `~/.config/t3-code-mcp.env` and set `T3_ACCESS_TOKEN`, a separate
+random `MCP_BEARER_TOKEN`, and the OpenAI runtime `CONTROL_PLANE_API_KEY`.
+Start and verify only after those values are present:
+
+```sh
+systemctl --user start t3-code-mcp.service t3-code-mcp-tunnel.service
+systemctl --user status t3-code-mcp.service t3-code-mcp-tunnel.service
+curl -fsS http://127.0.0.1:8787/healthz
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+Keep `MCP_READ_ONLY=true` until the read-only ChatGPT connection is verified;
+then change it deliberately and restart the gateway before using control tools.
 
 ## Remote ownership and compatibility
 

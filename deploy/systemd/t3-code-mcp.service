@@ -1,0 +1,25 @@
+[Unit]
+Description=T3 Code MCP gateway
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/codex/work/t3code-mcp
+EnvironmentFile=/home/codex/.config/t3-code-mcp.env
+ExecStart=/home/codex/.local/share/pnpm/bin/node /home/codex/work/t3code-mcp/dist/cli.js serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

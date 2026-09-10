@@ -1,0 +1,26 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for T3 Code
+Requires=t3-code-mcp.service
+Wants=network-online.target
+After=t3-code-mcp.service network-online.target
+StartLimitIntervalSec=1min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/codex/work/t3code-mcp
+EnvironmentFile=/home/codex/.config/t3-code-mcp.env
+ExecStart=/home/codex/work/t3code-mcp/deploy/systemd/t3-code-mcp-tunnel.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=20s
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

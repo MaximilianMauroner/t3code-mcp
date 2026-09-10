@@ -1,0 +1,30 @@
+{
+  "name": "t3-code-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A standalone MCP gateway for controlling a remote T3 Code environment.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts serve",
+    "spike": "tsx src/cli.ts spike",
+    "start": "node dist/cli.js serve",
+    "test": "vitest run",
+    "test:live": "T3_LIVE_TESTS=1 vitest run tests/live.integration.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}
