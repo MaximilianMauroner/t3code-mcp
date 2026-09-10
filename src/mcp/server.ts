@@ -20,6 +20,7 @@ const modelSelection = z
   .passthrough();
 
 const idempotencyKey = z.string().trim().min(1).max(200);
+const query = z.string().trim().min(1).max(200).optional();
 const cursor = z.string().regex(/^\d+$/).optional();
 const limit = z.number().int().min(1).max(100).default(50);
 
@@ -87,6 +88,13 @@ const threadSummaryOutput = z
     worktreePath: z.string().nullable(),
     latestTurn: latestTurnOutput.nullable(),
     sessionStatus: z.string().nullable(),
+    status: z.enum(["open", "snoozed", "settled", "archived"]),
+    settledOverride: z.enum(["settled", "active"]).nullable(),
+    settledAt: z.string().nullable(),
+    snoozedUntil: z.string().nullable(),
+    pinnedAt: z.string().nullable(),
+    hasActionableProposedPlan: z.boolean(),
+    backgroundLiveness: z.enum(["working", "monitoring"]).nullable(),
     archivedAt: z.string().nullable(),
     createdAt: z.string().nullable(),
     updatedAt: z.string().nullable(),
@@ -271,8 +279,8 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_projects_list",
     {
       title: "List T3 projects",
-      description: "List projects registered in the remote T3 environment with cursor pagination.",
-      inputSchema: { cursor, limit },
+      description: "Find projects by case-insensitive title, workspace path, or ID substring. Filtering happens before pagination.",
+      inputSchema: { query, cursor, limit },
       outputSchema: projectsListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -284,7 +292,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Register a T3 project",
       description:
-        "Register an existing remote workspace as a T3 project. This does not clone a repository or create a missing directory. Requires orchestration control scope and an idempotencyKey.",
+        "Register a remote workspace as a T3 project. Set createWorkspaceRootIfMissing to request creation of a missing directory. This does not clone a repository. Requires orchestration control scope and an idempotencyKey.",
       inputSchema: {
         title: z.string().trim().min(1).max(200),
         workspaceRoot: z.string().trim().min(1).max(4096),
@@ -302,10 +310,12 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_threads_list",
     {
       title: "List T3 threads",
-      description: "List compact thread summaries from T3. Full history is fetched separately.",
+      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters server-backed open, snoozed, settled, or archived state; UI-local inactivity/PR auto-settle rules are unavailable. Open includes pinned work and is not synonymous with running. Without a specific status, includeArchived controls archive visibility.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
+        query,
+        status: z.enum(["all", "open", "snoozed", "settled", "archived"]).optional(),
         cursor,
         limit,
       },
@@ -320,7 +330,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Create a T3 thread",
       description:
-        "Create a thread in an existing T3 project. Supply modelSelection when the project has no default. The returned branch and worktree are the values T3 accepted.",
+        "Create a thread in an existing T3 project. Supply modelSelection when the project has no default. The returned branch and worktree reflect the request; check the mutation status for acceptance.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -372,7 +382,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Send a T3 thread message",
       description:
-        "Start one T3 agent turn and return immediately after command intent is accepted. Busy threads are rejected; queueing and steering are not enabled. Never reuse an idempotencyKey for different input.",
+        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads are rejected; queueing and steering are not enabled. Never reuse an idempotencyKey for different input.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         message: z.string().min(1).max(120_000),
@@ -428,6 +438,22 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
   );
 
   server.registerTool(
+    "t3_thread_interrupt",
+    {
+      title: "Interrupt work in an existing T3 thread",
+      description: "Request stopping the active turn in a thread, including one started outside this gateway. Read the thread first and supply latestTurn.turnId as expectedTurnId. Stale observations are rejected before dispatch, but T3 interrupts by session and cannot guarantee atomic turn targeting. This does not archive or delete the thread; poll thread_get to confirm it stopped.",
+      inputSchema: {
+        threadId: z.string().trim().min(1),
+        expectedTurnId: z.string().trim().min(1),
+        idempotencyKey,
+      },
+      outputSchema: mutationResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.threadInterrupt(args)),
+  );
+
+  server.registerTool(
     "t3_pending_actions_list",
     {
       title: "List pending T3 actions",
@@ -443,7 +469,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_pending_action_respond",
     {
       title: "Respond to a T3 pending action",
-      description: "Respond to a T3 approval or user-input request using its stable requestId. A model-provided approval is not treated as human confirmation by this gateway.",
+      description: "Respond to a T3 approval or user-input request using its stable requestId. The gateway forwards the supplied response and does not independently verify human confirmation.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         requestId: z.string().trim().min(1),

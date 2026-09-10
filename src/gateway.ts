@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { threadStatus, type ThreadStatus } from "./t3/thread-state.js";
 import type { GatewayConfig } from "./config.js";
 import {
   OperationJournal,
@@ -77,6 +78,13 @@ export interface ThreadSummary {
   readonly worktreePath: string | null;
   readonly latestTurn: LatestTurn | null;
   readonly sessionStatus: string | null;
+  readonly status: ThreadStatus;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly settledAt: string | null;
+  readonly snoozedUntil: string | null;
+  readonly pinnedAt: string | null;
+  readonly hasActionableProposedPlan: boolean;
+  readonly backgroundLiveness: "working" | "monitoring" | null;
   readonly archivedAt: string | null;
   readonly createdAt: string | null;
   readonly updatedAt: string | null;
@@ -230,6 +238,11 @@ export interface ThreadSendInput extends MutationCommonInput {
   readonly titleSeed?: string;
 }
 
+export interface ThreadInterruptInput extends MutationCommonInput {
+  readonly threadId: string;
+  readonly expectedTurnId: string;
+}
+
 export interface RunInterruptInput extends MutationCommonInput {
   readonly runId: string;
 }
@@ -261,6 +274,7 @@ const GATEWAY_OPERATIONS = [
   "t3_pending_actions_list",
   "t3_pending_action_respond",
   "t3_thread_archive",
+  "t3_thread_interrupt",
 ] as const;
 
 const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
@@ -270,6 +284,7 @@ const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
   "t3_run_interrupt",
   "t3_pending_action_respond",
   "t3_thread_archive",
+  "t3_thread_interrupt",
 ]);
 
 export class GatewayError extends Error {
@@ -336,34 +351,46 @@ export class T3Gateway {
     };
   }
 
-  async projectsList(input: { readonly cursor?: string; readonly limit: number }): Promise<{
+  async projectsList(input: { readonly query?: string; readonly cursor?: string; readonly limit: number }): Promise<{
     readonly environmentId: string;
     readonly page: Page<ProjectSummary>;
   }> {
     const shell = await this.client.getShell();
-    const page = paginate(shell.projects.map(projectSummary), input.cursor, input.limit);
+    const projects = shell.projects.filter((project) =>
+      matchesQuery(input.query, project.title, project.workspaceRoot, project.id),
+    );
+    const page = paginate(projects.map(projectSummary), input.cursor, input.limit);
     return { environmentId: await this.environmentId(), page };
   }
 
   async threadsList(input: {
     readonly projectId?: string;
     readonly includeArchived: boolean;
+    readonly query?: string;
+    readonly status?: ThreadStatus | "all";
     readonly cursor?: string;
     readonly limit: number;
   }): Promise<{ readonly environmentId: string; readonly page: Page<ThreadSummary> }> {
     const shell = await this.client.getShell();
-    const filtered = shell.threads.filter(
-      (thread) =>
-        (input.projectId === undefined || thread.projectId === input.projectId) &&
-        (input.includeArchived || thread.archivedAt === null || thread.archivedAt === undefined),
-    );
-    const page = paginate(filtered.map(threadSummary), input.cursor, input.limit);
+    const now = Date.now();
+    const filtered = shell.threads.filter((thread) => {
+      if (input.projectId !== undefined && thread.projectId !== input.projectId) return false;
+      if (!matchesQuery(input.query, thread.title, thread.branch, thread.id)) return false;
+      if (input.status !== undefined && input.status !== "all") {
+        return threadStatus(thread, now) === input.status;
+      }
+      return input.includeArchived || !thread.archivedAt;
+    });
+    const page = paginate(filtered.map((thread) => threadSummary(thread, now)), input.cursor, input.limit);
     return { environmentId: await this.environmentId(), page };
   }
 
   async threadGet(threadId: string): Promise<{ readonly environmentId: string; readonly thread: ThreadDetail }> {
     const snapshot = await this.client.getThread(threadId);
-    return { environmentId: await this.environmentId(), thread: threadDetail(snapshot.thread) };
+    // Full thread snapshots omit the shell's pending flags and latest-user timestamp.
+    const shell = await this.client.getShell();
+    const summary = shell.threads.find((thread) => thread.id === threadId);
+    return { environmentId: await this.environmentId(), thread: threadDetail(snapshot.thread, summary) };
   }
 
   async threadMessages(
@@ -642,6 +669,43 @@ export class T3Gateway {
     };
     const result = await this.dispatchNew(begun.record, command);
     return mutationResult(result, await this.knownEnvironmentId());
+  }
+
+  async threadInterrupt(input: ThreadInterruptInput): Promise<MutationResult> {
+    if (this.config.readOnly) await this.requireOperationScope();
+    const payload = { threadId: input.threadId, expectedTurnId: input.expectedTurnId };
+    const beginInput = {
+      kind: "thread.turn.interrupt" as const,
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: hashPayload(payload),
+      threadId: input.threadId,
+      turnId: input.expectedTurnId,
+    };
+    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      const begun = await this.journal.begin(beginInput);
+      return mutationResult(begun.record, await this.knownEnvironmentId());
+    }
+    await this.requireOperationScope();
+    // Check identity before dispatch; a misconfigured endpoint must never stop work.
+    const environmentId = await this.environmentId();
+    const { thread } = await this.client.getThread(input.threadId);
+    if (thread.latestTurn?.turnId !== input.expectedTurnId) {
+      throw new GatewayError("turn_changed", "The thread's latest turn changed. Read the thread again before interrupting.");
+    }
+    if (thread.latestTurn.state !== "running") {
+      throw new GatewayError("thread_not_running", "The observed turn is no longer running.");
+    }
+    const begun = await this.journal.begin(beginInput);
+    if (begun.reused) return mutationResult(begun.record, environmentId);
+    const result = await this.dispatchNew(begun.record, {
+      type: "thread.turn.interrupt",
+      commandId: begun.record.commandId,
+      threadId: input.threadId,
+      turnId: input.expectedTurnId,
+      createdAt: new Date().toISOString(),
+    });
+    return mutationResult(result, environmentId);
   }
 
   async pendingActionsList(threadId: string): Promise<PendingActionsResult> {
@@ -1004,7 +1068,7 @@ function projectSummary(project: Project): ProjectSummary {
   };
 }
 
-function threadSummary(thread: ThreadShell): ThreadSummary {
+function threadSummary(thread: ThreadShell, now = Date.now()): ThreadSummary {
   const session = asRecord(thread.session);
   return {
     id: thread.id,
@@ -1017,6 +1081,13 @@ function threadSummary(thread: ThreadShell): ThreadSummary {
     worktreePath: thread.worktreePath ?? null,
     latestTurn: thread.latestTurn ?? null,
     sessionStatus: typeof session?.status === "string" ? session.status : null,
+    status: threadStatus(thread, now),
+    settledOverride: thread.settledOverride ?? null,
+    settledAt: thread.settledAt ?? null,
+    snoozedUntil: thread.snoozedUntil ?? null,
+    pinnedAt: thread.pinnedAt ?? null,
+    hasActionableProposedPlan: thread.hasActionableProposedPlan ?? false,
+    backgroundLiveness: thread.backgroundLiveness ?? null,
     archivedAt: thread.archivedAt ?? null,
     createdAt: thread.createdAt ?? null,
     updatedAt: thread.updatedAt ?? null,
@@ -1025,9 +1096,9 @@ function threadSummary(thread: ThreadShell): ThreadSummary {
   };
 }
 
-function threadDetail(thread: Thread): ThreadDetail {
+function threadDetail(thread: Thread, summary: ThreadShell = thread): ThreadDetail {
   return {
-    ...threadSummary(thread),
+    ...threadSummary(summary),
     latestResponse: latestAssistant(thread.messages, thread.latestTurn?.turnId ?? null),
     messageCount: thread.messages.length,
     activityCount: thread.activities.length,
@@ -1099,6 +1170,11 @@ function extractPendingActions(thread: Thread): PendingAction[] {
     }
   }
   return actions;
+}
+
+function matchesQuery(query: string | undefined, ...values: Array<string | null | undefined>): boolean {
+  const normalized = query?.trim().toLowerCase();
+  return !normalized || values.some((value) => value?.toLowerCase().includes(normalized));
 }
 
 function paginate<T>(items: ReadonlyArray<T>, cursor: string | undefined, limit: number): Page<T> {

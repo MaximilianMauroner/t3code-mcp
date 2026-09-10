@@ -51,6 +51,7 @@ describe("MCP tool contract", () => {
       "t3_thread_archive",
       "t3_thread_create",
       "t3_thread_get",
+      "t3_thread_interrupt",
       "t3_thread_messages",
       "t3_thread_send",
       "t3_threads_list",
@@ -71,6 +72,29 @@ describe("MCP tool contract", () => {
       page: { items: [{ id: "project-mcp", title: "MCP project" }] },
     });
     expect(result.content).toBeTruthy();
+  });
+
+  it("finds open threads and interrupts the observed external turn through MCP", async () => {
+    const { fake, client } = await connectedClient();
+    fake.addThread({ id: "voice-thread", projectId: "voice-project", title: "Login fix",
+      latestTurn: { turnId: "voice-turn", state: "running", requestedAt: "2026-09-10T12:00:00Z" },
+      session: { status: "running" },
+    });
+    fake.addThread({ id: "settled-thread", title: "Login fix", settledOverride: "settled" });
+    const found = await client.callTool({ name: "t3_threads_list", arguments: { query: "LOGIN", status: "open", projectId: "voice-project" } });
+    expect(found.isError).not.toBe(true);
+    expect(found.structuredContent).toMatchObject({ page: { total: 1, items: [{ id: "voice-thread", status: "open" }] } });
+    const stopped = await client.callTool({ name: "t3_thread_interrupt", arguments: {
+      threadId: "voice-thread", expectedTurnId: "voice-turn", idempotencyKey: "voice-stop",
+    } });
+    expect(stopped.isError).not.toBe(true);
+    expect(stopped.structuredContent).toMatchObject({ status: "accepted" });
+    expect(fake.dispatches).toHaveLength(1);
+    const invalid = await client.callTool({ name: "t3_threads_list", arguments: { status: "running" } });
+    expect(invalid.isError).toBe(true);
+    const missingTurn = await client.callTool({ name: "t3_thread_interrupt", arguments: { threadId: "voice-thread", idempotencyKey: "missing-turn" } });
+    expect(missingTurn.isError).toBe(true);
+    expect(fake.dispatches).toHaveLength(1);
   });
 
   it("turns gateway failures into stable structured MCP errors", async () => {
@@ -123,6 +147,10 @@ describe("MCP tool contract", () => {
 
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({ error: { code: "gateway_read_only" } });
+    const interruption = await client.callTool({ name: "t3_thread_interrupt", arguments: {
+      threadId: "thread-1", expectedTurnId: "turn-1", idempotencyKey: "read-only-stop",
+    } });
+    expect(interruption.structuredContent).toMatchObject({ error: { code: "gateway_read_only" } });
     expect(fake.dispatches).toHaveLength(0);
   });
 });

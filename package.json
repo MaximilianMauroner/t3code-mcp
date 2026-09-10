@@ -2,7 +2,7 @@
   "name": "t3-code-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "A standalone MCP gateway for controlling a remote T3 Code environment.",
+  "description": "MCP tools for hands-free T3 Code workflows through GPTVoice.",
   "type": "module",
   "engines": {
     "node": ">=20"
