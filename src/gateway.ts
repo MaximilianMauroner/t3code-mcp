@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import {
   GATEWAY_COMMIT,
   GATEWAY_VERSION,
@@ -56,6 +57,14 @@ import type {
   Thread,
   ThreadShell,
 } from "./t3/types.js";
+import {
+  GitInspectionError,
+  GitInspector,
+  type GitDiffMode,
+  type GitDiffResult,
+  type GitStatusResult,
+  type GitWorkspaceSelection,
+} from "./git/inspection.js";
 
 export type ConnectionStatus = "connected" | "disconnected";
 export type StateFreshness = "fresh" | "stale" | "unknown";
@@ -434,6 +443,21 @@ export interface ThreadsListResult {
   readonly resolutionHint: string | null;
 }
 
+export interface GitTargetInput {
+  readonly projectId: string;
+  readonly threadId?: string;
+}
+
+export interface GitStatusInput extends GitTargetInput {
+  readonly maxEntries: number;
+}
+
+export interface GitDiffInput extends GitTargetInput {
+  readonly mode: GitDiffMode;
+  readonly paths: ReadonlyArray<string>;
+  readonly maxBytes: number;
+}
+
 const GATEWAY_OPERATIONS: ReadonlyArray<string> = [...TOOL_NAMES];
 
 const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
@@ -466,6 +490,7 @@ export class T3Gateway {
     private readonly client: T3HttpClient,
     private readonly journal: OperationJournal,
     private readonly config: GatewayConfig,
+    private readonly gitInspector = new GitInspector(),
   ) {}
 
   async connectionStatus(): Promise<ConnectionStatusResult> {
@@ -548,6 +573,24 @@ export class T3Gateway {
     );
     const page = paginate(projects.map(projectSummary), input.cursor, input.limit);
     return { environmentId: await this.environmentId(), page };
+  }
+
+  async gitStatus(input: GitStatusInput): Promise<GitStatusResult> {
+    const selection = await this.resolveGitWorkspace(input);
+    try {
+      return await this.gitInspector.status(selection, input.maxEntries);
+    } catch (error) {
+      throw asGatewayGitError(error);
+    }
+  }
+
+  async gitDiff(input: GitDiffInput): Promise<GitDiffResult> {
+    const selection = await this.resolveGitWorkspace(input);
+    try {
+      return await this.gitInspector.diff(selection, input.mode, input.paths, input.maxBytes);
+    } catch (error) {
+      throw asGatewayGitError(error);
+    }
   }
 
   async threadsList(input: {
@@ -1671,6 +1714,51 @@ export class T3Gateway {
     return project;
   }
 
+  private async resolveGitWorkspace(input: GitTargetInput): Promise<GitWorkspaceSelection> {
+    const shell = await this.client.getShell();
+    const project = shell.projects.find((candidate) => candidate.id === input.projectId);
+    if (!project) {
+      throw new GatewayError(
+        "project_not_found",
+        `Project ${input.projectId} was not found. Call t3_projects_list to discover available project IDs.`,
+      );
+    }
+    const thread = input.threadId === undefined
+      ? null
+      : shell.threads.find((candidate) => candidate.id === input.threadId) ?? null;
+    if (input.threadId !== undefined && thread === null) {
+      throw new GatewayError(
+        "thread_not_found",
+        `Thread ${input.threadId} was not found. Call t3_threads_list to discover available thread IDs.`,
+      );
+    }
+    if (thread !== null && thread.projectId !== project.id) {
+      throw new GatewayError(
+        "thread_project_mismatch",
+        `Thread ${thread.id} belongs to project ${thread.projectId}, not selected project ${project.id}.`,
+      );
+    }
+    const source = thread?.worktreePath ? "thread_worktree" : "project_workspace";
+    const selectedPath = thread?.worktreePath ?? project.workspaceRoot;
+    if (!isAbsolute(selectedPath)) {
+      throw new GatewayError(
+        "workspace_path_not_absolute",
+        `T3 returned a relative workspace path for ${source}; refusing to resolve it against the gateway working directory: ${selectedPath}`,
+      );
+    }
+    return {
+      environmentId: await this.environmentId(),
+      projectId: project.id,
+      projectTitle: project.title,
+      projectWorkspaceRoot: project.workspaceRoot,
+      threadId: thread?.id ?? null,
+      threadBranch: thread?.branch ?? null,
+      threadWorktreePath: thread?.worktreePath ?? null,
+      source,
+      selectedPath,
+    };
+  }
+
   private async buildHighlights(
     filtered: ReadonlyArray<ThreadShell>,
     projectTitles: Map<string, string>,
@@ -1931,6 +2019,12 @@ function truncateExcerpt(text: string, maxChars: number): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, maxChars)}…`;
+}
+
+function asGatewayGitError(error: unknown): GatewayError {
+  if (error instanceof GatewayError) return error;
+  if (error instanceof GitInspectionError) return new GatewayError(error.code, error.message);
+  return new GatewayError("git_inspection_failed", safeErrorMessage(error));
 }
 
 function resolutionHint(

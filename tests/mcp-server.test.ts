@@ -41,6 +41,8 @@ describe("MCP tool contract", () => {
 
     expect(names).toEqual([
       "t3_connection_status",
+      "t3_git_diff",
+      "t3_git_status",
       "t3_pending_action_respond",
       "t3_pending_actions_list",
       "t3_project_create",

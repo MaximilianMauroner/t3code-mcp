@@ -12,6 +12,7 @@
 | “What is running right now?” | `t3_threads_list` with `onlyRunning: true`, or `sessionStatus: "running"` |
 | “Show snoozed / settled threads.” | `t3_threads_list` with `status: "snoozed"` or `"settled"` |
 | “How is the login fix going?” | `t3_threads_list`, `t3_thread_get`, and `t3_thread_messages` as needed |
+| “What actually changed in that project?” | `t3_git_status`, then `t3_git_diff` for staged or unstaged content |
 | “Start a thread in that project and investigate the failing tests.” | `t3_thread_create`, then `t3_thread_send` |
 | “Any update?” | `t3_run_get` or `t3_run_wait` for the returned run handle |
 | “What does it need from me?” | `t3_pending_actions_list` |
@@ -28,6 +29,16 @@
 The client should resolve project and thread names to IDs, keep those IDs and returned run handles in conversation context, and present concise summaries. It should ask for clarification when a name or action is ambiguous. These are client responsibilities; the gateway returns structured results and does not manage the client interface or conversation context.
 
 A task can keep running in T3 after the client disconnects. To check it later, the client calls the same gateway with the saved `runId`. If that handle is unavailable, it can still find the thread and read its latest state and messages. The gateway has no run-list tool.
+
+## Inspect Git changes directly
+
+`t3_git_status` and `t3_git_diff` are read-only checks performed by the gateway process against a workspace selected from a fresh T3 shell snapshot. Both require an exact `projectId`. Supplying `threadId` also verifies that the thread belongs to that project and selects its T3-recorded `worktreePath`; a thread with no separate worktree falls back to the project's `workspaceRoot`. The result identifies the environment, project, optional thread, T3-selected path, resolved path, repository root, Git directory, common Git directory, and the T3-recorded thread branch. The observed Git branch is reported separately. Relative workspace paths are rejected rather than resolved against the gateway's own working directory.
+
+`t3_git_status` returns branch name/detached/unborn state, HEAD commit, upstream and ahead/behind counts when available, plus structured `staged`, `unstaged`, `untracked`, and `conflicts` categories. Each category contains an exact total `count`, a bounded `items` list, and `truncated`. `maxEntries` is the per-category item limit (default 100, maximum 500). Top-level `truncation` repeats the limit and exact omitted count per category, so a short response is never mistaken for a complete status. Rename/copy rows include both paths and Git's score; conflict rows preserve the two-letter index/worktree state.
+
+`t3_git_diff` accepts `mode: "unstaged"` (working tree versus index, the default) or `mode: "staged"` (index versus HEAD). `paths` optionally selects up to 100 literal paths relative to the chosen workspace. Absolute paths, parent traversal, NULs, and Git pathspec magic are rejected; a leading dash is treated as a filename, not an option. `maxBytes` bounds the patch (default 100,000; range 1,024–1,000,000). Its `truncation` object reports `truncated`, `reason`, `maxBytes`, `capturedBytes`, `totalBytes`, and `omittedBytes`; a truncated patch can end mid-line. Normal Git binary-difference markers and rename detection are retained, but binary patch payloads are not emitted.
+
+These tools are available even when `MCP_READ_ONLY=true`; that setting prevents mutations, not source disclosure. They do not expose arbitrary Git arguments, commits, pushes, filesystem reads, or a shell. Git is invoked directly with fixed read-only arguments, optional index locking disabled, external diff/textconv disabled, and inherited `GIT_*` overrides removed. T3 remains the workspace authority, but the gateway service must share the same filesystem namespace and have read access to the T3-recorded worktree. Missing paths, non-Git directories, bare repositories, ambiguous identity, project/thread mismatches, and unavailable Git are returned as explicit tool errors.
 
 ## Find and check on existing work
 
@@ -58,6 +69,7 @@ Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal
 The gateway uses T3’s authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment.
 
 - Project search and registration, thread search with lifecycle/execution/attention filters and deterministic sort, one-call bounded overviews with execution counts and highlights, provider discovery, thread creation with T3-accepted workspace, compact check-ins, and paginated messages with bounded text.
+- Direct read-only Git status and bounded staged/unstaged patches, resolved only from T3 project and thread workspace identity.
 - Starting agent turns with typed busy rejection, inspecting runs with shared observation quality, polling for changes, requesting interruption by gateway run handle or observed thread turn with post-dispatch verification, responding to approval or user-input requests, snoozing/settling threads, and archiving threads.
 - Connection status with gateway version/commit/fingerprint (`T3_CODE_MCP_COMMIT` plus package version), observation time, effective access mode with callable/disabled operations and stable reason codes (`gateway_read_only`/`t3_scope_required`), upstream T3 scopes, capabilities, freshness, and credential expiry. Run results also report connection, freshness, and thread quality; other tool results include the environment ID and observation time.
 - A local operation journal for idempotency and reconciliation after uncertain dispatches.
@@ -82,4 +94,4 @@ Busy threads reject new turns; queueing and steering are not implemented. Pendin
 
 Run inspection relies on the journaled message/turn IDs and T3's latest-turn projection. Status for older runs or runs whose turn ID is not yet known can be incomplete. A provider-owned turn ID is not currently exposed.
 
-There are no terminal tools, managed command jobs, direct file/Git inspection tools, MCP OAuth server, or multi-environment routing. The HTTP endpoint uses a static bearer token; use a trusted network, tunnel, or HTTPS reverse proxy for remote access. The gateway does not read T3's database, manipulate project files locally, or create provider sessions outside T3.
+There are no terminal tools, managed command jobs, general file-reading tools, Git mutation tools, MCP OAuth server, or multi-environment routing. Git inspection requires the gateway and T3 workspaces to share a filesystem namespace; it does not work across an HTTP-only host boundary where T3's workspace paths are absent. Status item lists and diff bytes are bounded, and very large Git operations fail after 30 seconds instead of returning a partial result. The HTTP endpoint uses a static bearer token; use a trusted network, tunnel, or HTTPS reverse proxy for remote access. The gateway does not read T3's database, manipulate project files, or create provider sessions outside T3.

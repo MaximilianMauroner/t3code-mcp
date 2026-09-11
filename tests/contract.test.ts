@@ -49,6 +49,8 @@ describe("slice 1: dependable check-ins", () => {
     const ro = await readOnly.gateway.connectionStatus();
     expect(ro.effectiveAccessMode).toBe("read-only");
     expect(ro.disabledOperations.map((d) => d.reasonCode)).toContain("gateway_read_only");
+    expect(ro.callableOperations).toEqual(expect.arrayContaining(["t3_git_status", "t3_git_diff"]));
+    expect(ro.disabledOperations.map((d) => d.operation)).not.toEqual(expect.arrayContaining(["t3_git_status", "t3_git_diff"]));
 
     const limited = new FakeT3({ scopes: ["orchestration:read"] });
     fakes.push(limited);

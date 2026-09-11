@@ -6,6 +6,7 @@ import {
   GatewayError,
   T3Gateway,
   type PendingActionRespondInput,
+  type GitDiffInput,
   type ProjectCreateInput,
   type ThreadCreateInput,
   type ThreadSendInput,
@@ -195,6 +196,94 @@ const projectsListOutputSchema = {
       total: z.number(),
     })
     .passthrough(),
+};
+
+const gitWorkspaceOutput = z.object({
+  environmentId: z.string(),
+  projectId: z.string(),
+  projectTitle: z.string(),
+  projectWorkspaceRoot: z.string(),
+  threadId: z.string().nullable(),
+  threadBranch: z.string().nullable(),
+  threadWorktreePath: z.string().nullable(),
+  source: z.enum(["project_workspace", "thread_worktree"]),
+  selectedPath: z.string(),
+  resolvedPath: z.string(),
+  repositoryRoot: z.string(),
+  gitDirectory: z.string(),
+  gitCommonDirectory: z.string(),
+});
+
+const gitChangeOutput = z.object({
+  path: z.string(),
+  originalPath: z.string().optional(),
+  kind: z.enum(["ordinary", "rename_or_copy"]),
+  indexStatus: z.string(),
+  worktreeStatus: z.string(),
+  score: z.string().optional(),
+  submodule: z.string(),
+});
+
+const gitCategoryOutput = <T extends z.ZodType>(item: T) => z.object({
+  count: z.number().int().nonnegative(),
+  items: z.array(item),
+  truncated: z.boolean(),
+});
+
+const gitStatusOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  workspace: gitWorkspaceOutput,
+  branch: z.object({
+    name: z.string().nullable(),
+    detached: z.boolean(),
+    unborn: z.boolean(),
+    headCommit: z.string().nullable(),
+    upstream: z.string().nullable(),
+    ahead: z.number().int().nonnegative().nullable(),
+    behind: z.number().int().nonnegative().nullable(),
+  }),
+  staged: gitCategoryOutput(gitChangeOutput),
+  unstaged: gitCategoryOutput(gitChangeOutput),
+  untracked: gitCategoryOutput(z.object({ path: z.string() })),
+  conflicts: gitCategoryOutput(z.object({
+    path: z.string(),
+    indexStatus: z.string(),
+    worktreeStatus: z.string(),
+    submodule: z.string(),
+  })),
+  clean: z.boolean(),
+  truncation: z.object({
+    truncated: z.boolean(),
+    itemLimitPerCategory: z.number().int().positive(),
+    omittedItems: z.object({
+      staged: z.number().int().nonnegative(),
+      unstaged: z.number().int().nonnegative(),
+      untracked: z.number().int().nonnegative(),
+      conflicts: z.number().int().nonnegative(),
+    }),
+  }),
+};
+
+const gitDiffOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  workspace: gitWorkspaceOutput,
+  mode: z.enum(["unstaged", "staged"]),
+  comparison: z.object({
+    base: z.enum(["index", "HEAD"]),
+    target: z.enum(["working_tree", "index"]),
+  }),
+  paths: z.array(z.string()),
+  patch: z.string(),
+  truncation: z.object({
+    truncated: z.boolean(),
+    reason: z.literal("byte_limit").nullable(),
+    maxBytes: z.number().int().positive(),
+    capturedBytes: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative(),
+    omittedBytes: z.number().int().nonnegative(),
+  }),
 };
 
 const projectCreateOutputSchema = {
@@ -434,6 +523,42 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (args) => runTool(() => gateway.projectCreate(args satisfies ProjectCreateInput)),
+  );
+
+  server.registerTool(
+    "t3_git_status",
+    {
+      title: "Inspect T3 workspace Git status",
+      description:
+        "Read structured Git branch/worktree identity and staged, unstaged, untracked, and conflict summaries from a T3-selected project workspace or thread worktree. projectId is always required; threadId selects its recorded worktree when present. Output item lists are bounded and report exact omitted counts.",
+      inputSchema: {
+        projectId: z.string().trim().min(1),
+        threadId: z.string().trim().min(1).optional(),
+        maxEntries: z.number().int().min(1).max(500).default(100),
+      },
+      outputSchema: gitStatusOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.gitStatus(args)),
+  );
+
+  server.registerTool(
+    "t3_git_diff",
+    {
+      title: "Inspect T3 workspace Git diff",
+      description:
+        "Read a bounded patch from a T3-selected project workspace or thread worktree. mode=unstaged compares working tree to index; mode=staged compares index to HEAD. Optional paths are literal workspace-relative filters. Truncation metadata always reports captured, total, and omitted bytes.",
+      inputSchema: {
+        projectId: z.string().trim().min(1),
+        threadId: z.string().trim().min(1).optional(),
+        mode: z.enum(["unstaged", "staged"]).default("unstaged"),
+        paths: z.array(z.string().min(1).max(4096)).max(100).default([]),
+        maxBytes: z.number().int().min(1_024).max(1_000_000).default(100_000),
+      },
+      outputSchema: gitDiffOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.gitDiff(args satisfies GitDiffInput)),
   );
 
   server.registerTool(
