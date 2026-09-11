@@ -77,6 +77,33 @@ export interface ThreadArchiveCommand {
   readonly threadId: string;
 }
 
+export interface ThreadSnoozeCommand {
+  readonly type: "thread.snooze";
+  readonly commandId: string;
+  readonly threadId: string;
+  readonly snoozedUntil: string;
+}
+
+export interface ThreadUnsnoozeCommand {
+  readonly type: "thread.unsnooze";
+  readonly commandId: string;
+  readonly threadId: string;
+  readonly reason: "user";
+}
+
+export interface ThreadSettleCommand {
+  readonly type: "thread.settle";
+  readonly commandId: string;
+  readonly threadId: string;
+}
+
+export interface ThreadUnsettleCommand {
+  readonly type: "thread.unsettle";
+  readonly commandId: string;
+  readonly threadId: string;
+  readonly reason: "user";
+}
+
 export type T3Command =
   | ProjectCreateCommand
   | ThreadCreateCommand
@@ -84,4 +111,8 @@ export type T3Command =
   | ThreadTurnInterruptCommand
   | ThreadApprovalResponseCommand
   | ThreadUserInputResponseCommand
-  | ThreadArchiveCommand;
+  | ThreadArchiveCommand
+  | ThreadSnoozeCommand
+  | ThreadUnsnoozeCommand
+  | ThreadSettleCommand
+  | ThreadUnsettleCommand;

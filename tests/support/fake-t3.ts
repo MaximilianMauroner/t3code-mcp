@@ -326,6 +326,36 @@ export class FakeT3 {
         thread.updatedAt = now;
         return;
       }
+      case "thread.snooze": {
+        const thread = this.thread(command.threadId);
+        thread.snoozedUntil = command.snoozedUntil;
+        thread.snoozedAt = now;
+        thread.updatedAt = now;
+        return;
+      }
+      case "thread.unsnooze": {
+        const thread = this.thread(command.threadId);
+        thread.snoozedUntil = null;
+        thread.snoozedAt = null;
+        thread.updatedAt = now;
+        return;
+      }
+      case "thread.settle": {
+        const thread = this.thread(command.threadId);
+        thread.settledOverride = "settled";
+        thread.settledAt = now;
+        thread.snoozedUntil = null;
+        thread.snoozedAt = null;
+        thread.pinnedAt = null;
+        thread.updatedAt = now;
+        return;
+      }
+      case "thread.unsettle": {
+        const thread = this.thread(command.threadId);
+        thread.settledOverride = "active";
+        thread.updatedAt = now;
+        return;
+      }
     }
   }
 }

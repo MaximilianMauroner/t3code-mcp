@@ -365,6 +365,23 @@ const pendingActionsListOutputSchema = {
   detailsAvailable: z.boolean(),
 };
 
+const threadSnoozeOutputSchema = {
+  ...mutationResultShape,
+  threadId: z.string(),
+  snoozedUntil: z.string(),
+  preset: z.enum(["hour", "three-hours", "evening", "tomorrow", "next-week", "custom"]),
+  wakeDescription: z.string(),
+  note: z.string().optional(),
+};
+
+const threadSettleOutputSchema = {
+  ...mutationResultShape,
+  threadId: z.string(),
+  settledOverride: z.enum(["settled", "active"]).nullable(),
+  lifecycle: z.enum(["open", "snoozed", "settled", "archived"]).nullable(),
+  note: z.string().optional(),
+};
+
 export function createMcpServer(gateway: T3Gateway): McpServer {
   const server = new McpServer(
     { name: "t3-code-mcp", version: GATEWAY_VERSION },
@@ -642,6 +659,61 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (args) => runTool(() => gateway.threadArchive(args)),
+  );
+
+  server.registerTool(
+    "t3_thread_snooze",
+    {
+      title: "Snooze a T3 thread",
+      description:
+        "Hide a thread from the inbox until a wake time. Omit preset and snoozedUntil to snooze until this evening (before evening) or tomorrow morning. Preset options: hour, three-hours, evening, tomorrow, next-week. Alternatively supply an explicit future ISO snoozedUntil. Snooze never stops a running agent; pending approvals, user input, or queued turns are rejected.",
+      inputSchema: {
+        threadId: z.string().trim().min(1),
+        preset: z.enum(["default", "hour", "three-hours", "evening", "tomorrow", "next-week"]).optional(),
+        snoozedUntil: z.string().trim().min(1).optional(),
+        idempotencyKey,
+      },
+      outputSchema: threadSnoozeOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.threadSnooze(args)),
+  );
+
+  server.registerTool(
+    "t3_thread_unsnooze",
+    {
+      title: "Wake a snoozed T3 thread",
+      description: "Bring a snoozed thread back to the inbox immediately.",
+      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
+      outputSchema: { ...mutationResultShape, threadId: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.threadUnsnooze(args)),
+  );
+
+  server.registerTool(
+    "t3_thread_settle",
+    {
+      title: "Settle a T3 thread",
+      description:
+        "Mark a thread done. Clears snooze and pin. Blocked while the thread is running, has a pending approval, or has a queued turn start; interrupt or respond first.",
+      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
+      outputSchema: threadSettleOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.threadSettle(args)),
+  );
+
+  server.registerTool(
+    "t3_thread_unsettle",
+    {
+      title: "Reopen a settled T3 thread",
+      description: "Return a settled thread to the active list.",
+      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
+      outputSchema: threadSettleOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.threadUnsettle(args)),
   );
 
   return server;

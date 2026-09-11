@@ -446,6 +446,10 @@ describe("gateway mutation and recovery hardening", () => {
       () => readOnly.gateway.threadCreate({ projectId: "project-read-only", title: "x", idempotencyKey: "ro-thread" }),
       () => readOnly.gateway.threadSend({ threadId: "thread-read-only", message: "x", idempotencyKey: "ro-send" }),
       () => readOnly.gateway.threadArchive({ threadId: "thread-read-only", idempotencyKey: "ro-archive" }),
+      () => readOnly.gateway.threadSnooze({ threadId: "thread-read-only", idempotencyKey: "ro-snooze" }),
+      () => readOnly.gateway.threadUnsnooze({ threadId: "thread-read-only", idempotencyKey: "ro-unsnooze" }),
+      () => readOnly.gateway.threadSettle({ threadId: "thread-read-only", idempotencyKey: "ro-settle" }),
+      () => readOnly.gateway.threadUnsettle({ threadId: "thread-read-only", idempotencyKey: "ro-unsettle" }),
       () => readOnly.gateway.pendingActionRespond({ threadId: "thread-read-only", requestId: "a", kind: "approval", decision: "decline", idempotencyKey: "ro-action" }),
     ];
     for (const operation of cases) {

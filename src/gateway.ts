@@ -6,6 +6,7 @@ import {
   toolSchemaFingerprint,
 } from "./contract.js";
 import {
+  hasQueuedTurnStart,
   isThreadRunning,
   needsAttentionFor,
   observeThread,
@@ -16,6 +17,12 @@ import {
   type ThreadActivity,
   type ThreadStatus,
 } from "./t3/thread-state.js";
+import {
+  defaultSnoozePreset,
+  resolveSnoozePresets,
+  snoozeWakeDescription,
+  type SnoozePresetId,
+} from "./t3/snooze.js";
 import type { GatewayConfig } from "./config.js";
 import {
   OperationJournal,
@@ -31,8 +38,12 @@ import {
   type ThreadApprovalResponseCommand,
   type ThreadArchiveCommand,
   type ThreadCreateCommand,
+  type ThreadSettleCommand,
+  type ThreadSnoozeCommand,
   type ThreadTurnInterruptCommand,
   type ThreadTurnStartCommand,
+  type ThreadUnsettleCommand,
+  type ThreadUnsnoozeCommand,
   type ThreadUserInputResponseCommand,
 } from "./t3/commands.js";
 import { T3HttpClient, T3HttpError } from "./t3/http-client.js";
@@ -331,6 +342,54 @@ export interface PendingActionRespondInput extends MutationCommonInput {
   readonly answers?: Record<string, unknown>;
 }
 
+export type SnoozePresetInput = SnoozePresetId | "default";
+
+export interface ThreadSnoozeInput extends MutationCommonInput {
+  readonly threadId: string;
+  /** Named wake time. Defaults to "default" (this evening, else tomorrow morning). */
+  readonly preset?: SnoozePresetInput;
+  /** Explicit ISO wake time. Specify either preset or snoozedUntil, not both. */
+  readonly snoozedUntil?: string;
+}
+
+export interface ThreadUnsnoozeInput extends MutationCommonInput {
+  readonly threadId: string;
+}
+
+export interface ThreadSettleInput extends MutationCommonInput {
+  readonly threadId: string;
+}
+
+export interface ThreadUnsettleInput extends MutationCommonInput {
+  readonly threadId: string;
+}
+
+export type ThreadSnoozeResult = MutationResult & {
+  readonly threadId: string;
+  /** Requested wake time (also the accepted time when status is accepted). */
+  readonly snoozedUntil: string;
+  readonly preset: SnoozePresetId | "custom";
+  readonly wakeDescription: string;
+  readonly note?: string;
+};
+
+export type ThreadUnsnoozeResult = MutationResult & {
+  readonly threadId: string;
+};
+
+export type ThreadSettleResult = MutationResult & {
+  readonly threadId: string;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly lifecycle: ThreadStatus | null;
+  readonly note?: string;
+};
+
+export type ThreadUnsettleResult = MutationResult & {
+  readonly threadId: string;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly lifecycle: ThreadStatus | null;
+};
+
 export interface ProviderOption {
   readonly instanceId: string | null;
   readonly provider: string | null;
@@ -385,6 +444,10 @@ const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
   "t3_pending_action_respond",
   "t3_thread_archive",
   "t3_thread_interrupt",
+  "t3_thread_snooze",
+  "t3_thread_unsnooze",
+  "t3_thread_settle",
+  "t3_thread_unsettle",
 ]);
 
 export class GatewayError extends Error {
@@ -1173,6 +1236,287 @@ export class T3Gateway {
     return mutationResult(result, await this.knownEnvironmentId());
   }
 
+  async threadSnooze(input: ThreadSnoozeInput): Promise<ThreadSnoozeResult> {
+    if (this.config.readOnly) {
+      await this.requireOperationScope();
+    }
+    if (input.snoozedUntil !== undefined && input.preset !== undefined && input.preset !== "default") {
+      throw new GatewayError("invalid_snooze_input", "Specify either preset or snoozedUntil, not both.");
+    }
+    if (input.snoozedUntil !== undefined) {
+      const parsed = Date.parse(input.snoozedUntil);
+      if (!Number.isFinite(parsed)) {
+        throw new GatewayError("invalid_snooze_time", `snoozedUntil ${JSON.stringify(input.snoozedUntil)} is not a valid date.`);
+      }
+      if (parsed <= Date.now()) {
+        throw new GatewayError("invalid_snooze_time", "The snooze wake time must be in the future.");
+      }
+    }
+    // The idempotency hash covers user intent (preset or explicit time), not
+    // the resolved clock time, so a retry with the same key stays identical
+    // while the resolved wake time is journaled with the operation.
+    const payload = { threadId: input.threadId, preset: input.preset ?? "default", snoozedUntil: input.snoozedUntil ?? null };
+    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      const begun = await this.journal.begin({
+        kind: "thread.snooze",
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: hashPayload(payload),
+        threadId: existing.threadId ?? input.threadId,
+      });
+      const snoozedUntil = begun.record.snoozedUntil ?? resolveSnoozeWakeTime(input);
+      const reconciled = await this.reconcile(begun.record);
+      return this.threadSnoozeResult(reconciled, input.threadId, snoozedUntil, presetOf(input, snoozedUntil), false);
+    }
+    await this.requireOperationScope();
+    const snoozedUntil = resolveSnoozeWakeTime(input);
+    const snapshot = await this.client.getThread(input.threadId);
+    assertNotArchived(snapshot.thread, input.threadId);
+    if (snapshot.thread.hasPendingApprovals === true || snapshot.thread.hasPendingUserInput === true) {
+      throw new GatewayError(
+        "snooze_not_allowed",
+        `Thread ${input.threadId} has a pending approval or user-input request. Respond to the request first; snoozing would hide the agent waiting on you.`,
+      );
+    }
+    if (hasQueuedTurnStart(snapshot.thread)) {
+      throw new GatewayError(
+        "snooze_not_allowed",
+        `Thread ${input.threadId} has a queued turn start that no turn has adopted yet. Wait for the turn to start before snoozing.`,
+      );
+    }
+    const running = isThreadRunning(snapshot.thread);
+    const begun = await this.journal.begin({
+      kind: "thread.snooze",
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: hashPayload(payload),
+      threadId: input.threadId,
+      snoozedUntil,
+    });
+    if (begun.reused) {
+      const reconciled = await this.reconcile(begun.record);
+      const wakeTime = begun.record.snoozedUntil ?? snoozedUntil;
+      return this.threadSnoozeResult(reconciled, input.threadId, wakeTime, presetOf(input, wakeTime), running);
+    }
+    const command: ThreadSnoozeCommand = {
+      type: "thread.snooze",
+      commandId: begun.record.commandId,
+      threadId: input.threadId,
+      snoozedUntil,
+    };
+    const result = await this.dispatchNew(begun.record, command);
+    return this.threadSnoozeResult(result, input.threadId, snoozedUntil, presetOf(input, snoozedUntil), running);
+  }
+
+  async threadUnsnooze(input: ThreadUnsnoozeInput): Promise<ThreadUnsnoozeResult> {
+    if (this.config.readOnly) {
+      await this.requireOperationScope();
+    }
+    const payload = { threadId: input.threadId };
+    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      const begun = await this.journal.begin({
+        kind: "thread.unsnooze",
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: hashPayload(payload),
+        threadId: existing.threadId ?? input.threadId,
+      });
+      return {
+        ...mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId()),
+        threadId: input.threadId,
+      };
+    }
+    await this.requireOperationScope();
+    const snapshot = await this.client.getThread(input.threadId);
+    assertNotArchived(snapshot.thread, input.threadId);
+    const begun = await this.journal.begin({
+      kind: "thread.unsnooze",
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: hashPayload(payload),
+      threadId: input.threadId,
+    });
+    if (begun.reused) {
+      return {
+        ...mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId()),
+        threadId: input.threadId,
+      };
+    }
+    const command: ThreadUnsnoozeCommand = {
+      type: "thread.unsnooze",
+      commandId: begun.record.commandId,
+      threadId: input.threadId,
+      reason: "user",
+    };
+    const result = await this.dispatchNew(begun.record, command);
+    return {
+      ...mutationResult(result, await this.knownEnvironmentId()),
+      threadId: input.threadId,
+    };
+  }
+
+  async threadSettle(input: ThreadSettleInput): Promise<ThreadSettleResult> {
+    if (this.config.readOnly) {
+      await this.requireOperationScope();
+    }
+    const payload = { threadId: input.threadId };
+    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      const begun = await this.journal.begin({
+        kind: "thread.settle",
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: hashPayload(payload),
+        threadId: existing.threadId ?? input.threadId,
+      });
+      const reconciled = await this.reconcile(begun.record);
+      return this.threadSettleResult(reconciled, input.threadId);
+    }
+    await this.requireOperationScope();
+    const snapshot = await this.client.getThread(input.threadId);
+    assertNotArchived(snapshot.thread, input.threadId);
+    const sessionStatus = snapshot.thread.session?.status ?? null;
+    if (sessionStatus === "starting" || sessionStatus === "running" || snapshot.thread.latestTurn?.state === "running") {
+      const turn = snapshot.thread.latestTurn?.turnId ?? null;
+      throw new GatewayError(
+        "settle_blocked",
+        `Thread ${input.threadId} is still running${turn ? ` (turn ${turn})` : ""}. ` +
+          `Interrupt the observed turn with t3_thread_interrupt or wait for completion before settling.`,
+      );
+    }
+    if (snapshot.thread.hasPendingApprovals === true) {
+      throw new GatewayError(
+        "settle_blocked",
+        `Thread ${input.threadId} has a pending approval. Respond with t3_pending_action_respond first; settling cannot answer approvals.`,
+      );
+    }
+    if (hasQueuedTurnStart(snapshot.thread)) {
+      throw new GatewayError(
+        "settle_blocked",
+        `Thread ${input.threadId} has a queued turn start that no turn has adopted yet. Wait for the turn to start before settling.`,
+      );
+    }
+    const begun = await this.journal.begin({
+      kind: "thread.settle",
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: hashPayload(payload),
+      threadId: input.threadId,
+    });
+    if (begun.reused) {
+      const reconciled = await this.reconcile(begun.record);
+      return this.threadSettleResult(reconciled, input.threadId);
+    }
+    const command: ThreadSettleCommand = {
+      type: "thread.settle",
+      commandId: begun.record.commandId,
+      threadId: input.threadId,
+    };
+    const result = await this.dispatchNew(begun.record, command);
+    return this.threadSettleResult(result, input.threadId);
+  }
+
+  async threadUnsettle(input: ThreadUnsettleInput): Promise<ThreadUnsettleResult> {
+    if (this.config.readOnly) {
+      await this.requireOperationScope();
+    }
+    const payload = { threadId: input.threadId };
+    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      const begun = await this.journal.begin({
+        kind: "thread.unsettle",
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: hashPayload(payload),
+        threadId: existing.threadId ?? input.threadId,
+      });
+      const reconciled = await this.reconcile(begun.record);
+      return this.threadUnsettleResult(reconciled, input.threadId);
+    }
+    await this.requireOperationScope();
+    const snapshot = await this.client.getThread(input.threadId);
+    assertNotArchived(snapshot.thread, input.threadId);
+    const begun = await this.journal.begin({
+      kind: "thread.unsettle",
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: hashPayload(payload),
+      threadId: input.threadId,
+    });
+    if (begun.reused) {
+      const reconciled = await this.reconcile(begun.record);
+      return this.threadUnsettleResult(reconciled, input.threadId);
+    }
+    const command: ThreadUnsettleCommand = {
+      type: "thread.unsettle",
+      commandId: begun.record.commandId,
+      threadId: input.threadId,
+      reason: "user",
+    };
+    const result = await this.dispatchNew(begun.record, command);
+    return this.threadUnsettleResult(result, input.threadId);
+  }
+
+  private async threadSnoozeResult(
+    record: OperationRecord,
+    threadId: string,
+    snoozedUntil: string,
+    preset: SnoozePresetId | "custom",
+    running: boolean,
+  ): Promise<ThreadSnoozeResult> {
+    const base = mutationResult(record, await this.knownEnvironmentId());
+    const wakeDescription = snoozeWakeDescription(snoozedUntil);
+    if (base.status === "accepted" && running) {
+      return {
+        ...base,
+        threadId,
+        snoozedUntil,
+        preset,
+        wakeDescription,
+        note: "Snooze hides the thread; the agent keeps running.",
+      };
+    }
+    return { ...base, threadId, snoozedUntil, preset, wakeDescription };
+  }
+
+  private async threadSettleResult(record: OperationRecord, threadId: string): Promise<ThreadSettleResult> {
+    const base = mutationResult(record, await this.knownEnvironmentId());
+    if (base.status !== "accepted") {
+      return { ...base, threadId, settledOverride: null, lifecycle: null };
+    }
+    try {
+      const snapshot = await this.client.getThread(threadId);
+      const now = Date.now();
+      const lifecycle = threadStatus(snapshot.thread, now);
+      const override = snapshot.thread.settledOverride ?? null;
+      if (lifecycle !== "settled") {
+        return {
+          ...base,
+          threadId,
+          settledOverride: override,
+          lifecycle,
+          note: `Settle accepted but the thread shows ${lifecycle} (${threadStatusReason(snapshot.thread, now)}).`,
+        };
+      }
+      return { ...base, threadId, settledOverride: override, lifecycle };
+    } catch {
+      return { ...base, threadId, settledOverride: null, lifecycle: null };
+    }
+  }
+
+  private async threadUnsettleResult(record: OperationRecord, threadId: string): Promise<ThreadUnsettleResult> {
+    const base = mutationResult(record, await this.knownEnvironmentId());
+    if (base.status !== "accepted") {
+      return { ...base, threadId, settledOverride: null, lifecycle: null };
+    }
+    try {
+      const snapshot = await this.client.getThread(threadId);
+      const now = Date.now();
+      return {
+        ...base,
+        threadId,
+        settledOverride: snapshot.thread.settledOverride ?? null,
+        lifecycle: threadStatus(snapshot.thread, now),
+      };
+    } catch {
+      return { ...base, threadId, settledOverride: null, lifecycle: null };
+    }
+  }
+
   private async dispatchNew(record: OperationRecord, command: T3Command): Promise<OperationRecord> {
     try {
       const dispatch = await this.client.dispatch(command);
@@ -1218,6 +1562,19 @@ export class T3Gateway {
           }
         }
         if (record.kind === "thread.archive" && threadSnapshot.thread.archivedAt) {
+          return this.journal.update(record.operationId, { status: "accepted" });
+        }
+        if (record.kind === "thread.snooze" && threadSnapshot.thread.snoozedUntil != null &&
+          Date.parse(threadSnapshot.thread.snoozedUntil) > Date.now()) {
+          return this.journal.update(record.operationId, { status: "accepted" });
+        }
+        if (record.kind === "thread.unsnooze" && threadSnapshot.thread.snoozedUntil == null) {
+          return this.journal.update(record.operationId, { status: "accepted" });
+        }
+        if (record.kind === "thread.settle" && threadSnapshot.thread.settledOverride === "settled") {
+          return this.journal.update(record.operationId, { status: "accepted" });
+        }
+        if (record.kind === "thread.unsettle" && threadSnapshot.thread.settledOverride !== "settled") {
           return this.journal.update(record.operationId, { status: "accepted" });
         }
       }
@@ -1602,6 +1959,33 @@ function projectSummary(project: Project): ProjectSummary {
     createdAt: project.createdAt ?? null,
     updatedAt: project.updatedAt ?? null,
   };
+}
+
+function assertNotArchived(thread: Thread, threadId: string): void {
+  if (thread.archivedAt) {
+    throw new GatewayError("thread_archived", `Thread ${threadId} is archived. Unarchive it before changing snooze or settlement.`);
+  }
+}
+
+function resolveSnoozeWakeTime(input: ThreadSnoozeInput, now: Date = new Date()): string {
+  if (input.snoozedUntil !== undefined) {
+    return new Date(Date.parse(input.snoozedUntil)).toISOString();
+  }
+  const presetId = input.preset ?? "default";
+  const resolved = presetId === "default"
+    ? defaultSnoozePreset(now)
+    : resolveSnoozePresets(now).find((candidate) => candidate.id === presetId);
+  if (!resolved) {
+    throw new GatewayError("invalid_snooze_preset", `Unknown snooze preset ${JSON.stringify(presetId)}.`);
+  }
+  return resolved.snoozedUntil;
+}
+
+function presetOf(input: ThreadSnoozeInput, _snoozedUntil: string): SnoozePresetId | "custom" {
+  if (input.snoozedUntil !== undefined) return "custom";
+  const presetId = input.preset ?? "default";
+  if (presetId !== "default") return presetId;
+  return defaultSnoozePreset().id;
 }
 
 function threadSummary(

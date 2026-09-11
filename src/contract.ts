@@ -7,7 +7,7 @@ export const GATEWAY_VERSION = "0.1.0";
 export const GATEWAY_COMMIT = (process.env.T3_CODE_MCP_COMMIT ?? "").trim() || "unknown";
 
 // Bump when any MCP output shape changes in a way a stale client must detect.
-export const TOOL_SCHEMA_VERSION = 2;
+export const TOOL_SCHEMA_VERSION = 3;
 
 export const TOOL_NAMES = [
   "t3_connection_status",
@@ -27,6 +27,10 @@ export const TOOL_NAMES = [
   "t3_thread_archive",
   "t3_thread_interrupt",
   "t3_providers_list",
+  "t3_thread_snooze",
+  "t3_thread_unsnooze",
+  "t3_thread_settle",
+  "t3_thread_unsettle",
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];

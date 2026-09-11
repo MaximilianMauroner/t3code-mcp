@@ -29,6 +29,11 @@ flowchart LR
 | “Approve that request.” | `t3_pending_action_respond` with the request ID and decision |
 | “Stop that thread.” | `t3_thread_get`, then `t3_thread_interrupt` with the observed `latestTurn.turnId` |
 | “Follow up and ask it to run the tests.” | `t3_thread_send` on the existing idle thread |
+| “Snooze this thread.” | `t3_thread_snooze` with no preset (this evening, else tomorrow morning) |
+| “Snooze it for an hour / 3 hours / tomorrow / next week.” | `t3_thread_snooze` with `preset: "hour"`, `"three-hours"`, `"tomorrow"`, or `"next-week"` |
+| “Wake this thread up.” | `t3_thread_unsnooze` |
+| “Settle this thread.” / “Mark it done.” | `t3_thread_settle` |
+| “Reopen that thread.” | `t3_thread_unsettle` |
 | “Archive that thread.” | `t3_thread_archive` |
 
 The client should resolve project and thread names to IDs, keep those IDs and returned run handles in conversation context, and present concise summaries. It should ask for clarification when a name or action is ambiguous. These are client responsibilities; the gateway returns structured results and does not manage the client interface or conversation context.
@@ -55,14 +60,16 @@ To start work, create a thread if needed and send a message. Call `t3_providers_
 
 `t3_thread_interrupt` works on threads started in T3's UI or by another client, without requiring a gateway `runId`. Read the thread and supply `threadId`, `expectedTurnId` (the `observedTarget.turnId`), and an `idempotencyKey`. The gateway rejects a changed or finished turn before dispatch (`turn_changed`/`thread_not_running` with current target details) and never automatically replays an uncertain interruption. Acceptance returns post-dispatch `verification` (`interrupted`/`still_running`/`target_changed`/`not_running`/`inconsistent`/`unknown`); acceptance alone never confirms a stop. T3 currently interrupts by provider session, so a turn change after the gateway's check remains a race; the expected turn ID is not an atomic upstream condition. Poll `t3_thread_get` to verify the outcome. Interruption does not archive or delete the conversation.
 
-Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal commands are not exposed. Filtering snoozed/settled work is read-only; changing snooze or settlement is not implemented by this gateway.
+Snooze hides a thread from the inbox until its wake time; it never stops a running agent. `t3_thread_snooze` defaults to this evening (18:00 gateway-local) while meaningfully before evening, else tomorrow morning (09:00); presets `hour`, `three-hours`, `evening`, `tomorrow`, and `next-week` (Monday 09:00) match the T3 clients, or supply an explicit future ISO `snoozedUntil`. Threads blocked on you (pending approval/input) or with a queued turn start cannot be snoozed. `t3_thread_unsnooze` wakes immediately. `t3_thread_settle` marks a thread done and clears snooze and pin; it is blocked while the thread runs, has a pending approval, or has a queued turn start. `t3_thread_unsettle` reopens. All four are idempotent mutations with the same journal, read-only, and scope handling as the other control tools.
+
+Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal commands are not exposed.
 
 ## What is implemented
 
 The gateway uses T3’s authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment.
 
 - Project search and registration, thread search with lifecycle/execution/attention filters and deterministic sort, one-call bounded overviews with execution counts and highlights, provider discovery, thread creation with T3-accepted workspace, compact check-ins, and paginated messages with bounded text.
-- Starting agent turns with typed busy rejection, inspecting runs with shared observation quality, polling for changes, requesting interruption by gateway run handle or observed thread turn with post-dispatch verification, responding to approval or user-input requests, and archiving threads.
+- Starting agent turns with typed busy rejection, inspecting runs with shared observation quality, polling for changes, requesting interruption by gateway run handle or observed thread turn with post-dispatch verification, responding to approval or user-input requests, snoozing/settling threads, and archiving threads.
 - Connection status with gateway version/commit/fingerprint (`T3_CODE_MCP_COMMIT` plus package version), observation time, effective access mode with callable/disabled operations and stable reason codes (`gateway_read_only`/`t3_scope_required`), upstream T3 scopes, capabilities, freshness, and credential expiry. Run results also report connection, freshness, and thread quality; other tool results include the environment ID and observation time.
 - A local operation journal for idempotency and reconciliation after uncertain dispatches.
 - Stateless Streamable HTTP at `/mcp`, plus stdio for clients that launch a local process.

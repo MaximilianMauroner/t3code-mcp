@@ -55,6 +55,10 @@ describe("MCP tool contract", () => {
       "t3_thread_interrupt",
       "t3_thread_messages",
       "t3_thread_send",
+      "t3_thread_settle",
+      "t3_thread_snooze",
+      "t3_thread_unsettle",
+      "t3_thread_unsnooze",
       "t3_threads_list",
       "t3_threads_overview",
     ]);

@@ -11,7 +11,11 @@ export type OperationKind =
   | "thread.turn.interrupt"
   | "thread.approval.respond"
   | "thread.user-input.respond"
-  | "thread.archive";
+  | "thread.archive"
+  | "thread.snooze"
+  | "thread.unsnooze"
+  | "thread.settle"
+  | "thread.unsettle";
 
 export interface OperationRecord {
   readonly operationId: string;
@@ -27,6 +31,7 @@ export interface OperationRecord {
   readonly runId?: string;
   readonly messageId?: string;
   readonly turnId?: string;
+  readonly snoozedUntil?: string;
   readonly t3Sequence?: number;
   readonly lastError?: string;
 }
@@ -41,6 +46,7 @@ export interface BeginOperationInput {
   readonly runId?: string;
   readonly messageId?: string;
   readonly turnId?: string;
+  readonly snoozedUntil?: string;
 }
 
 export class IdempotencyConflictError extends Error {
@@ -127,6 +133,7 @@ export class OperationJournal {
       ...(input.runId === undefined ? {} : { runId: input.runId }),
       ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
       ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
+      ...(input.snoozedUntil === undefined ? {} : { snoozedUntil: input.snoozedUntil }),
     };
     this.entries.set(input.idempotencyKey, record);
     await this.persist();
