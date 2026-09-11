@@ -1,4 +1,9 @@
 #!/bin/sh
+# Template: render host-specific values with `node dist/cli.js setup`.
+# Required env (from the operator-owned env file, mode 600):
+#   MCP_BEARER_TOKEN, CONTROL_PLANE_API_KEY
+# Non-secret values below are defaults for `setup`; edit via setup flags,
+# not by committing host IDs here.
 
 set -eu
 
@@ -24,8 +29,8 @@ if [ "$attempt" -ge 60 ]; then
   exit 1
 fi
 
-exec /home/codex/.local/bin/tunnel-client run \
-  --control-plane.tunnel-id=tunnel_6aa312ede7408191882c8b269fec7cdd \
+exec /usr/local/bin/tunnel-client run \
+  --control-plane.tunnel-id=tunnel_YOURS \
   --control-plane.api-key=env:CONTROL_PLANE_API_KEY \
   --mcp.server-url=url=http://127.0.0.1:8787/mcp,channel=main \
   '--mcp.extra-headers=Authorization: env:MCP_AUTH_HEADER' \

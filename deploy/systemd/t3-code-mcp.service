@@ -5,11 +5,15 @@ After=network-online.target
 StartLimitIntervalSec=1min
 StartLimitBurst=5
 
+# Template: do not edit host paths here. Render host-specific units with:
+#   node dist/cli.js setup --workspace=/opt/t3code-mcp --node=/usr/bin/node \
+#     --tunnel-bin=/usr/local/bin/tunnel-client --tunnel-id=tunnel_YOURS \
+#     --environment-id=YOUR_ENV_ID
 [Service]
 Type=simple
-WorkingDirectory=/home/codex/work/t3code-mcp
-EnvironmentFile=/home/codex/.config/t3-code-mcp.env
-ExecStart=/home/codex/.local/share/pnpm/bin/node /home/codex/work/t3code-mcp/dist/cli.js serve
+WorkingDirectory=/opt/t3code-mcp
+EnvironmentFile=%h/.config/t3-code-mcp.env
+ExecStart=/usr/bin/node /opt/t3code-mcp/dist/cli.js serve
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=10s

@@ -45,6 +45,7 @@ describe("MCP tool contract", () => {
       "t3_pending_actions_list",
       "t3_project_create",
       "t3_projects_list",
+      "t3_providers_list",
       "t3_run_get",
       "t3_run_interrupt",
       "t3_run_wait",

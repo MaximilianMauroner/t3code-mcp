@@ -1,9 +1,20 @@
 import { loadConfig } from "./config.js";
+import { runDoctor } from "./doctor.js";
 import { makeGateway } from "./gateway.js";
 import { listenHttp, runStdio } from "./mcp/transport.js";
+import { parseSetupArgs, renderSetup } from "./setup.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "serve";
+  if (command === "setup") {
+    const options = parseSetupArgs(process.argv.slice(3));
+    const result = await renderSetup(options);
+    console.log(JSON.stringify({ ok: true, files: result.files }, null, 2));
+    console.error(
+      "Setup rendered without secrets. Edit the env file to set T3_ACCESS_TOKEN, MCP_BEARER_TOKEN, and CONTROL_PLANE_API_KEY (mode 600), then enable the user services.",
+    );
+    return;
+  }
   const config = loadConfig();
   const { gateway } = makeGateway(config);
 
@@ -30,6 +41,28 @@ async function main(): Promise<void> {
     }
     case "status": {
       console.log(JSON.stringify(await gateway.connectionStatus(), null, 2));
+      return;
+    }
+    case "doctor": {
+      const result = await runDoctor(gateway, config);
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) process.exitCode = 1;
+      return;
+    }
+    case "smoke": {
+      // Deployment smoke: same read path the voice client uses, through the gateway.
+      // Run after every interface deployment, then repeat from the actual client.
+      const status = await gateway.connectionStatus();
+      const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+      const providers = await gateway.providersList();
+      const bounded = overview.highlights.length <= 5 &&
+        overview.highlights.every((h) => (h.latestResponseExcerpt ?? "").length <= 201);
+      console.log(JSON.stringify({ status, overview, providers: { options: providers.options.length } }, null, 2));
+      if (!bounded) throw new Error("Smoke failed: overview highlights exceed bounds.");
+      console.error(
+        `Smoke ok: fingerprint=${status.toolSchemaFingerprint} total=${overview.total} needsAttention=${overview.needsAttentionCount}. ` +
+          `Next: force fresh client discovery and ask "What's running and does anything need me?" by voice.`,
+      );
       return;
     }
     case "spike": {
@@ -66,7 +99,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      throw new Error(`Unknown command ${command}. Use serve, status, or spike.`);
+      throw new Error(`Unknown command ${command}. Use serve, status, doctor, smoke, spike, or setup.`);
   }
 }
 

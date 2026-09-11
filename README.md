@@ -35,7 +35,7 @@ A task can keep running in T3 after the phone disconnects. To check it later, th
 
 ## Find and check on existing work
 
-`t3_projects_list` accepts an optional `query` matching a case-insensitive substring of the project title, workspace path, or ID. `t3_threads_list` accepts `projectId`, a `query` matching title, branch, or ID, a `status`, plus `onlyRunning` and `sessionStatus` to find running work server-side. Filters combine and apply before cursor pagination. `t3_threads_overview` accepts the same `projectId`/`query`/`includeArchived` scope and returns `total`, `counts` by status, `runningCount`, and running thread summaries capped by `runningLimit`.
+`t3_projects_list` accepts an optional `query` matching a case-insensitive substring of the project title, workspace path, or ID. `t3_threads_list` accepts `projectId`, a `query` matching title, branch, or ID, a lifecycle `status`, plus execution filters (`activity`, `onlyRunning`, `sessionStatus`) kept separate from lifecycle. `needsAttention` filters pending approval/input, inconsistent/stale observations, and failures. `sort` is deterministic (`recent`/`title`/`status`); `detail` is `summary` or `full` (full adds latest-response enrichment on the page only). Filters combine and apply before cursor pagination. Zero results return a `resolutionHint` retry note; one exact candidate may be selected; multiple candidates must be presented with project/title/branch/activity for clarification, never an invented newest choice. `t3_threads_overview` accepts the same `projectId`/`query`/`includeArchived` scope and returns `total`, lifecycle `counts`, `executionCounts`, `needsAttentionCount`, `runningCount`, running summaries capped by `runningLimit`, and up to five deterministic `highlights` (pending approval/input, inconsistent/stale, failed, running, recent) with project title and a 200-char response excerpt. All rows share one `observedAt`.
 
 | Thread status | Meaning in this gateway |
 | --- | --- |
@@ -47,11 +47,11 @@ A task can keep running in T3 after the phone disconnects. To check it later, th
 
 The gateway uses the lifecycle fields exposed by T3. The T3 UI also derives settlement from client preferences, inactivity, and linked PR state; those inputs are not available to these tools, so the settled/open lists can differ from the UI's automatic classification. Older servers with no lifecycle fields show unarchived threads as open. This behavior follows the server-backed portion of T3's `threadSettled.ts` and sidebar partitioning, inspected at source revision `4b8388773`.
 
-Thread summaries include `status`, `statusReason`, `activity` (`running`, `starting`, `awaiting_approval`, `awaiting_input`, `failed`, `idle`), `isRunning`, `hasConflictingSignals` (for example a completed turn while the session still reports running), the raw settlement override, snooze time and snooze start, pin timestamp, session status and session update time, latest user-message time, latest turn, pending flags, actionable-plan flag, and background liveness (`working` or `monitoring` when T3 provides it). `t3_thread_get` combines the full thread with these shell fields and its latest response. Use `t3_thread_messages` for more history.
+Thread summaries include `status` (lifecycle), `statusReason`, `activity` (execution), `isRunning`, `quality` (`fresh`/`stale`/`incomplete`/`inconsistent`), `warning` when T3 signals disagree or are incomplete, `observedTurnId`/`observedAt`/`observedTarget` (`environmentId`/`threadId`/`turnId`/`observedAt`), project title, the raw settlement override, snooze time and snooze start, pin timestamp, session status and session update time, latest user-message time, latest turn, pending flags, actionable-plan flag, and background liveness (`working` or `monitoring` when T3 provides it). `hasConflictingSignals` is kept for compatibility and mirrors `quality=inconsistent`. Overview, detail, and run reads share this normalizer and never silently resolve contradictory fields. `t3_thread_get` combines the full thread with these shell fields and its latest response. Use `t3_thread_messages` for more history. `t3_providers_list` aggregates observed `instanceId`/`provider`/`model` labels, per-project defaults, and thread usage for thread creation.
 
-To start work, create a thread if needed and send a message. To continue existing work, send another message to that thread once it is idle. Creating a thread does not itself start a turn. Runtime mode follows the existing tool defaults; request `approval-required` explicitly when creating a thread if that is the intended T3 permission mode.
+To start work, create a thread if needed and send a message. Call `t3_providers_list` first when a project has no default model; thread creation returns the T3-accepted `modelSelection`, branch, and worktree. To continue existing work, send another message to that thread once it is idle. Busy threads return `thread_busy` with the active turn/session and valid next actions. Uncertain dispatches return the durable operation handle with reconcile guidance: use `t3_run_get`, never resubmit with a fresh key. Creating a thread does not itself start a turn. Runtime mode follows the existing tool defaults; request `approval-required` explicitly when creating a thread if that is the intended T3 permission mode.
 
-`t3_thread_interrupt` works on threads started in T3's UI or by another client, without requiring a gateway `runId`. Read the thread and supply `threadId`, `expectedTurnId` (the observed `latestTurn.turnId`), and an `idempotencyKey`. The gateway rejects a changed or finished turn before dispatch and never automatically replays an uncertain interruption. T3 currently interrupts by provider session, so a turn change after the gateway's check remains a race; the expected turn ID is not an atomic upstream condition. Poll `t3_thread_get` to verify the outcome. Interruption does not archive or delete the conversation.
+`t3_thread_interrupt` works on threads started in T3's UI or by another client, without requiring a gateway `runId`. Read the thread and supply `threadId`, `expectedTurnId` (the `observedTarget.turnId`), and an `idempotencyKey`. The gateway rejects a changed or finished turn before dispatch (`turn_changed`/`thread_not_running` with current target details) and never automatically replays an uncertain interruption. Acceptance returns post-dispatch `verification` (`interrupted`/`still_running`/`target_changed`/`not_running`/`inconsistent`/`unknown`); acceptance alone never confirms a stop. T3 currently interrupts by provider session, so a turn change after the gateway's check remains a race; the expected turn ID is not an atomic upstream condition. Poll `t3_thread_get` to verify the outcome. Interruption does not archive or delete the conversation.
 
 Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal commands are not exposed. Filtering snoozed/settled work is read-only; changing snooze or settlement is not implemented by this gateway.
 
@@ -59,12 +59,12 @@ Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal
 
 The gateway uses T3’s authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment.
 
-- Project search and registration, thread search and lifecycle filters, one-call thread overviews with running work, thread creation, compact check-ins, and paginated messages with bounded text.
-- Starting agent turns, inspecting runs, polling for changes, requesting interruption by gateway run handle or observed thread turn, responding to approval or user-input requests, and archiving threads.
-- Connection status with environment identity, scopes, capabilities, and freshness information. Run results also report connection and freshness; other tool results include the environment ID.
+- Project search and registration, thread search with lifecycle/execution/attention filters and deterministic sort, one-call bounded overviews with execution counts and highlights, provider discovery, thread creation with T3-accepted workspace, compact check-ins, and paginated messages with bounded text.
+- Starting agent turns with typed busy rejection, inspecting runs with shared observation quality, polling for changes, requesting interruption by gateway run handle or observed thread turn with post-dispatch verification, responding to approval or user-input requests, and archiving threads.
+- Connection status with gateway version/commit/fingerprint (`T3_CODE_MCP_COMMIT` plus package version), observation time, effective access mode with callable/disabled operations and stable reason codes (`gateway_read_only`/`t3_scope_required`), upstream T3 scopes, capabilities, freshness, and credential expiry. Run results also report connection, freshness, and thread quality; other tool results include the environment ID and observation time.
 - A local operation journal for idempotency and reconciliation after uncertain dispatches.
 - Stateless Streamable HTTP at `/mcp`, plus stdio for clients that launch a local process.
-- User systemd units and a launcher for the configured OpenAI Secure MCP Tunnel deployment.
+- A `setup` command that renders host systemd/tunnel files from explicit flags without secrets, and a read-only `doctor` command for the gateway-to-client chain.
 
 The automated tests exercise the gateway and MCP boundary. They do not establish that the complete GPTVoice phone experience works. That acceptance check still needs to be performed with the intended voice client and its tool connection.
 
@@ -147,11 +147,19 @@ There are no terminal tools, managed command jobs, direct file/Git inspection to
 
 ## Auto-start on Linux
 
-The included user systemd units start the gateway and [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), restart after unexpected exits, and bind local listeners to loopback. These are deployment-specific files: review the absolute paths in both services and the launcher, the T3 environment ID in the environment example, and the tunnel ID in `deploy/systemd/t3-code-mcp-tunnel.sh` before using them on another host. The tunnel client must already be installed at the launcher's configured path.
+The gateway supports two remote routes: the included [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) option, and any MCP host that can launch a local process (stdio) or reach authenticated Streamable HTTP at `/mcp`. The tunnel is one deployment choice; general MCP-host compatibility is separate and depends on the client's supported tool integration.
 
-The launcher derives the `Bearer` header from `MCP_BEARER_TOKEN` and waits for gateway health before starting tunnel discovery. Credentials are read from `~/.config/t3-code-mcp.env`.
+Render host-specific units with `setup` instead of editing committed paths. `deploy/systemd/*` are templates with placeholder IDs and paths:
 
-After building, install the units:
+```sh
+node dist/cli.js setup --workspace=/opt/t3code-mcp --node=/usr/bin/node \
+  --tunnel-bin=/usr/local/bin/tunnel-client --tunnel-id=tunnel_YOURS \
+  --environment-id=YOUR_ENV_ID --out="$HOME/.config/systemd/user"
+```
+
+`setup` writes service files and a launcher template without secrets, creates the env file only when missing (mode 600), and never overwrites existing credentials. The launcher derives the `Bearer` header from `MCP_BEARER_TOKEN` and waits for gateway health before starting tunnel discovery. Credentials are read from `~/.config/t3-code-mcp.env`. The tunnel client must already be installed at the launcher's configured path.
+
+After building, install the rendered units (or copy the templates and edit placeholders):
 
 ```sh
 install -d -m 700 "$HOME/.config/systemd/user"
@@ -187,8 +195,12 @@ For a read-only connection diagnostic:
 
 ```sh
 node --env-file=.env dist/cli.js status
+node --env-file=.env dist/cli.js doctor
+node --env-file=.env dist/cli.js smoke
 node --env-file=.env dist/cli.js spike
 ```
+
+`doctor` checks config, journal writability, T3 identity/scopes/expiry, effective access, freshness, build fingerprint, MCP discovery, a harmless overview call, and tunnel readiness without mutation. `smoke` calls status plus the bounded overview path the voice client uses and validates highlight/excerpt bounds. After every interface deployment, run `smoke`, restart gateway then tunnel, force fresh client discovery, compare the discovered `toolSchemaFingerprint`, and invoke status plus overview from the actual voice client ("What's running and does anything need me?").
 
 `spike` also lists up to five projects. Its optional mutation path requires `T3_SPIKE_ENABLE_MUTATIONS=true`, `T3_SPIKE_CONFIRM=I_UNDERSTAND`, `T3_SPIKE_PROJECT_ID`, and `T3_SPIKE_PROMPT`. Optional `T3_SPIKE_THREAD_TITLE` and `T3_SPIKE_IDEMPOTENCY_KEY` customize the thread title and retry-key prefix. This path creates a thread and submits a prompt; it does not archive the thread afterward.
 

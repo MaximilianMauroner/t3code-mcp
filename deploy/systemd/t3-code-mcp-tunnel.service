@@ -6,11 +6,12 @@ After=t3-code-mcp.service network-online.target
 StartLimitIntervalSec=1min
 StartLimitBurst=5
 
+# Template: render with `node dist/cli.js setup`. See t3-code-mcp.service.
 [Service]
 Type=simple
-WorkingDirectory=/home/codex/work/t3code-mcp
-EnvironmentFile=/home/codex/.config/t3-code-mcp.env
-ExecStart=/home/codex/work/t3code-mcp/deploy/systemd/t3-code-mcp-tunnel.sh
+WorkingDirectory=/opt/t3code-mcp
+EnvironmentFile=%h/.config/t3-code-mcp.env
+ExecStart=/opt/t3code-mcp/deploy/systemd/t3-code-mcp-tunnel.sh
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=20s

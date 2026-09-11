@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { GATEWAY_VERSION } from "../contract.js";
 import {
   GatewayError,
   T3Gateway,
@@ -76,10 +77,20 @@ const projectSummaryOutput = z
   })
   .passthrough();
 
+const observedTargetOutput = z
+  .object({
+    environmentId: z.string(),
+    threadId: z.string(),
+    turnId: z.string().nullable(),
+    observedAt: z.string(),
+  })
+  .passthrough();
+
 const threadSummaryOutput = z
   .object({
     id: z.string(),
     projectId: z.string(),
+    projectTitle: z.string().nullable(),
     title: z.string(),
     modelSelection: modelSelectionOutput,
     runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]),
@@ -94,6 +105,11 @@ const threadSummaryOutput = z
     activity: z.enum(["running", "starting", "awaiting_approval", "awaiting_input", "failed", "idle"]),
     isRunning: z.boolean(),
     hasConflictingSignals: z.boolean(),
+    quality: z.enum(["fresh", "stale", "incomplete", "inconsistent"]),
+    warning: z.string().nullable(),
+    observedTurnId: z.string().nullable(),
+    observedAt: z.string(),
+    observedTarget: observedTargetOutput,
     settledOverride: z.enum(["settled", "active"]).nullable(),
     settledAt: z.string().nullable(),
     snoozedUntil: z.string().nullable(),
@@ -109,6 +125,10 @@ const threadSummaryOutput = z
     hasPendingUserInput: z.boolean(),
   })
   .passthrough();
+
+const overviewHighlightOutput = threadSummaryOutput.extend({
+  latestResponseExcerpt: z.string().nullable(),
+});
 
 const threadDetailOutput = threadSummaryOutput.extend({
   latestResponse: messageOutput.nullable(),
@@ -136,15 +156,32 @@ const mutationResultShape = {
   reason: z.string().optional(),
 };
 
+const disabledOperationOutput = z
+  .object({
+    operation: z.string(),
+    reasonCode: z.enum(["gateway_read_only", "t3_scope_required"]),
+    reason: z.string(),
+  })
+  .passthrough();
+
 const connectionStatusOutputSchema = {
   environment: environmentIdentityOutput.nullable(),
   connectionStatus: z.enum(["connected", "disconnected"]),
   stateFreshness: z.enum(["fresh", "stale", "unknown"]),
   lastObservedAt: z.string().nullable(),
+  observedAt: z.string(),
+  gatewayVersion: z.string(),
+  gatewayCommit: z.string(),
+  toolSchemaFingerprint: z.string(),
+  effectiveAccessMode: z.enum(["read-only", "read-write"]),
+  callableOperations: z.array(z.string()),
+  disabledOperations: z.array(disabledOperationOutput),
   supportedCapabilities: z.array(z.string()),
   permittedOperations: z.array(z.string()),
   t3Scopes: z.array(z.string()),
+  upstreamScopes: z.array(z.string()),
   gatewayOperations: z.array(z.string()),
+  sessionExpiresAt: z.string().nullable(),
   error: z.string().optional(),
 };
 
@@ -168,6 +205,7 @@ const projectCreateOutputSchema = {
 
 const threadsListOutputSchema = {
   environmentId: z.string(),
+  observedAt: z.string(),
   page: z
     .object({
       items: z.array(threadSummaryOutput),
@@ -176,10 +214,12 @@ const threadsListOutputSchema = {
       total: z.number(),
     })
     .passthrough(),
+  resolutionHint: z.string().nullable(),
 };
 
 const threadsOverviewOutputSchema = {
   environmentId: z.string(),
+  observedAt: z.string(),
   total: z.number(),
   counts: z
     .object({
@@ -189,14 +229,27 @@ const threadsOverviewOutputSchema = {
       archived: z.number(),
     })
     .passthrough(),
+  executionCounts: z
+    .object({
+      running: z.number(),
+      starting: z.number(),
+      awaiting_approval: z.number(),
+      awaiting_input: z.number(),
+      failed: z.number(),
+      idle: z.number(),
+    })
+    .passthrough(),
   runningCount: z.number(),
+  needsAttentionCount: z.number(),
   running: z.array(threadSummaryOutput),
+  highlights: z.array(overviewHighlightOutput),
 };
 
 const threadCreateOutputSchema = {
   ...mutationResultShape,
   projectId: z.string(),
   threadId: z.string(),
+  modelSelection: modelSelectionOutput.nullable(),
   workspace: z
     .object({
       branch: z.string().nullable(),
@@ -256,6 +309,9 @@ const runResultOutputSchema = {
   connectionStatus: z.enum(["connected", "disconnected"]),
   stateFreshness: z.enum(["fresh", "stale", "unknown"]),
   lastObservedAt: z.string().nullable(),
+  observedAt: z.string(),
+  threadQuality: z.enum(["fresh", "stale", "incomplete", "inconsistent"]).nullable(),
+  threadWarning: z.string().nullable(),
   latestResponse: messageOutput.nullable(),
   pendingActions: z
     .object({
@@ -265,6 +321,39 @@ const runResultOutputSchema = {
     .passthrough(),
   timedOut: z.boolean().optional(),
   error: z.string().optional(),
+};
+
+const threadInterruptOutputSchema = {
+  ...mutationResultShape,
+  threadId: z.string(),
+  expectedTurnId: z.string(),
+  verification: z
+    .object({
+      observed: z.enum(["interrupted", "still_running", "target_changed", "not_running", "inconsistent", "unknown"]),
+      observedTurnId: z.string().nullable(),
+      observedAt: z.string(),
+      detail: z.string(),
+    })
+    .nullable(),
+};
+
+const providersListOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  defaultsByProject: z.record(z.string(), modelSelectionOutput.nullable()),
+  options: z
+    .array(
+      z
+        .object({
+          instanceId: z.string().nullable(),
+          provider: z.string().nullable(),
+          model: z.string(),
+          label: z.string(),
+          projectsWithDefault: z.array(z.string()),
+          threadsUsing: z.number(),
+        })
+        .passthrough(),
+    ),
 };
 
 const pendingActionsListOutputSchema = {
@@ -278,10 +367,12 @@ const pendingActionsListOutputSchema = {
 
 export function createMcpServer(gateway: T3Gateway): McpServer {
   const server = new McpServer(
-    { name: "t3-code-mcp", version: "0.1.0" },
+    { name: "t3-code-mcp", version: GATEWAY_VERSION },
     {
       instructions:
-        "This gateway controls one configured remote T3 Code environment. T3 remains authoritative for projects, threads, messages, runs, and workspaces. Mutation tools return after T3 accepts command intent; poll a returned runId with t3_run_get or t3_run_wait.",
+        "This gateway controls one configured remote T3 Code environment. T3 remains authoritative for projects, threads, messages, runs, and workspaces. Mutation tools return after T3 accepts command intent; poll a returned runId with t3_run_get or t3_run_wait. " +
+        "Name-based resolution: zero results need a broader retry, one exact candidate may be selected, multiple candidates need clarification with project/title/branch/activity. " +
+        "Interruptions are non-atomic: T3 interrupts by provider session, so always carry observedTarget (environmentId/threadId/turnId/observedAt) and verify with t3_thread_get.",
     },
   );
 
@@ -289,7 +380,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_connection_status",
     {
       title: "T3 connection status",
-      description: "Inspect the configured T3 environment, connection health, freshness, capabilities, and scopes.",
+      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. Compare toolSchemaFingerprint after every deployment; rediscover tools when it changes.",
       inputSchema: {},
       outputSchema: connectionStatusOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -332,7 +423,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_threads_list",
     {
       title: "List T3 threads",
-      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters server-backed open, snoozed, settled, or archived state; UI-local inactivity/PR auto-settle rules are unavailable. Open includes pinned work and is not synonymous with running: use onlyRunning or sessionStatus to find running work, or isRunning/activity in the result. Without a specific status, includeArchived controls archive visibility.",
+      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters lifecycle (open/snoozed/settled/archived); use activity/onlyRunning/sessionStatus for execution, never overload status with running. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page; full transcripts need t3_thread_messages.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
@@ -340,6 +431,10 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
         status: z.enum(["all", "open", "snoozed", "settled", "archived"]).optional(),
         onlyRunning: z.boolean().optional(),
         sessionStatus: z.string().trim().min(1).max(100).optional(),
+        activity: z.enum(["running", "starting", "awaiting_approval", "awaiting_input", "failed", "idle"]).optional(),
+        needsAttention: z.boolean().optional(),
+        sort: z.enum(["recent", "title", "status"]).default("recent"),
+        detail: z.enum(["summary", "full"]).default("summary"),
         cursor,
         limit,
       },
@@ -353,7 +448,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_threads_overview",
     {
       title: "Summarize T3 threads",
-      description: "Return counts by lifecycle status and the currently running threads in one call, for questions like 'what about the threads'. Filters combine before counting; running lists full thread summaries capped by runningLimit.",
+      description: "One bounded call for 'what's running and does anything need me': lifecycle counts, execution counts, needsAttentionCount, running summaries capped by runningLimit, and up to five deterministic highlights (pending approval/input, inconsistent/stale, failed, running, recent) with project title and a 200-char response excerpt. All rows share one observedAt. Transcripts and full records need detail tools.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
@@ -367,11 +462,23 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
   );
 
   server.registerTool(
+    "t3_providers_list",
+    {
+      title: "List T3 provider options",
+      description: "Read-only discovery of model selections observed in this environment: distinct instanceId/provider/model labels, per-project defaults, and thread usage. Use before t3_thread_create when a project has no default model.",
+      inputSchema: {},
+      outputSchema: providersListOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async () => runTool(() => gateway.providersList()),
+  );
+
+  server.registerTool(
     "t3_thread_create",
     {
       title: "Create a T3 thread",
       description:
-        "Create a thread in an existing T3 project. Supply modelSelection when the project has no default. The returned branch and worktree reflect the request; check the mutation status for acceptance.",
+        "Create a thread in an existing T3 project. Call t3_providers_list first when the project has no default model. Returns the T3-accepted modelSelection, branch, and worktree; check the mutation status for acceptance.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -423,7 +530,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Send a T3 thread message",
       description:
-        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads are rejected; queueing and steering are not enabled. Never reuse an idempotencyKey for different input.",
+        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads return thread_busy with the active turn/session and valid next actions. Uncertain results return the durable operation handle: reconcile with t3_run_get, never resubmit with a fresh key. Never reuse an idempotencyKey for different input.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         message: z.string().min(1).max(120_000),
@@ -482,13 +589,13 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_thread_interrupt",
     {
       title: "Interrupt work in an existing T3 thread",
-      description: "Request stopping the active turn in a thread, including one started outside this gateway. Read the thread first and supply latestTurn.turnId as expectedTurnId. Stale observations are rejected before dispatch, but T3 interrupts by session and cannot guarantee atomic turn targeting. This does not archive or delete the thread; poll thread_get to confirm it stopped.",
+      description: "Request stopping the active turn in a thread, including one started outside this gateway. Read the thread first and supply observedTarget.turnId as expectedTurnId. Returns acceptance plus post-dispatch verification (interrupted/still_running/target_changed/not_running/inconsistent/unknown). Acceptance alone never confirms a stop; poll t3_thread_get. Stale observations return turn_changed/thread_not_running. T3 interrupts by provider session without an atomic turn condition.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         expectedTurnId: z.string().trim().min(1),
         idempotencyKey,
       },
-      outputSchema: mutationResultShape,
+      outputSchema: threadInterruptOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (args) => runTool(() => gateway.threadInterrupt(args)),

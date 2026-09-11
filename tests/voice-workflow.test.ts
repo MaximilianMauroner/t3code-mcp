@@ -66,8 +66,18 @@ describe("voice discovery and control", () => {
     const first = await gateway.threadInterrupt(interrupt);
     expect(first.status).toBe("accepted");
     expect(fake.dispatches[0]?.command).toMatchObject({ type: "thread.turn.interrupt", threadId: interrupt.threadId, turnId: running.turnId });
+    expect(first.verification?.observed).toBe("interrupted");
     const restarted = makeGateway(fixture.config).gateway;
-    expect(await restarted.threadInterrupt(interrupt)).toEqual(first);
+    const second = await restarted.threadInterrupt(interrupt);
+    // Durable handle is stable; verification is a fresh observation and may differ in observedAt.
+    expect(second).toMatchObject({
+      status: first.status,
+      operationId: first.operationId,
+      commandId: first.commandId,
+      threadId: first.threadId,
+      expectedTurnId: first.expectedTurnId,
+    });
+    expect(second.verification?.observed).toBe("interrupted");
     expect(fake.dispatches).toHaveLength(1);
     await expect(restarted.threadInterrupt({ ...interrupt, expectedTurnId: "another-turn" })).rejects.toThrow("different operation");
   });

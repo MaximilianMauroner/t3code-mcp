@@ -57,6 +57,92 @@ export function threadActivity(thread: ThreadShell): ThreadActivity {
   return "idle";
 }
 
+export type ObservationQuality = "fresh" | "stale" | "incomplete" | "inconsistent";
+
+export interface ThreadObservation {
+  readonly lifecycle: ThreadStatus;
+  readonly execution: ThreadActivity;
+  readonly quality: ObservationQuality;
+  readonly warning: string | null;
+  readonly observedTurnId: string | null;
+  readonly observedAt: string;
+}
+
+// Stale when a running/starting signal has not been refreshed recently.
+// Idle threads with old timestamps are not stale; only active signals age out.
+const STALE_ACTIVE_AFTER_MS = 5 * 60_000;
+
+export function observeThread(thread: ThreadShell, now = Date.now()): ThreadObservation {
+  const lifecycle = threadStatus(thread, now);
+  const execution = threadActivity(thread);
+  const observedTurnId = thread.latestTurn?.turnId ?? null;
+  const observedAt = new Date(now).toISOString();
+  const conflicting = hasConflictingSignals(thread);
+  if (conflicting) {
+    const reason = threadStatusReason(thread, now);
+    return {
+      lifecycle,
+      execution,
+      quality: "inconsistent",
+      warning: `T3 signals disagree: ${reason}. Treat status as uncertain and read the thread before acting.`,
+      observedTurnId,
+      observedAt,
+    };
+  }
+  const sessionStatus = thread.session?.status ?? null;
+  const hasSession = sessionStatus !== null;
+  const hasTurn = thread.latestTurn != null;
+  const hasPending = thread.hasPendingApprovals === true || thread.hasPendingUserInput === true;
+  if (!hasSession && !hasTurn && !hasPending) {
+    return {
+      lifecycle,
+      execution,
+      quality: "incomplete",
+      warning: "T3 omitted session and turn signals. Treat status as incomplete and read the thread before acting.",
+      observedTurnId,
+      observedAt,
+    };
+  }
+  if (execution === "running" || execution === "starting") {
+    const updatedAt = Date.parse(thread.session?.updatedAt ?? "");
+    const requestedAt = Date.parse(thread.latestTurn?.requestedAt ?? "");
+    const lastActive = Number.isFinite(updatedAt)
+      ? updatedAt
+      : Number.isFinite(requestedAt)
+        ? requestedAt
+        : Number.NaN;
+    if (Number.isFinite(lastActive) && now - lastActive > STALE_ACTIVE_AFTER_MS) {
+      return {
+        lifecycle,
+        execution,
+        quality: "stale",
+        warning: `Active ${execution} signal is older than 5 minutes. It may be stale; read the thread before acting.`,
+        observedTurnId,
+        observedAt,
+      };
+    }
+    if (!Number.isFinite(lastActive)) {
+      return {
+        lifecycle,
+        execution,
+        quality: "incomplete",
+        warning: `Active ${execution} signal has no timestamp. Treat status as incomplete and read the thread before acting.`,
+        observedTurnId,
+        observedAt,
+      };
+    }
+  }
+  return { lifecycle, execution, quality: "fresh", warning: null, observedTurnId, observedAt };
+}
+
+export function needsAttentionFor(thread: ThreadShell, now = Date.now()): boolean {
+  if (thread.hasPendingApprovals === true || thread.hasPendingUserInput === true) return true;
+  const observation = observeThread(thread, now);
+  if (observation.quality === "inconsistent" || observation.quality === "stale") return true;
+  if (observation.execution === "failed") return true;
+  return false;
+}
+
 export function hasConflictingSignals(thread: ThreadShell): boolean {
   const sessionStatus = thread.session?.status;
   const turnState = thread.latestTurn?.state;

@@ -1,10 +1,18 @@
 import { randomUUID } from "node:crypto";
 import {
-  hasConflictingSignals,
+  GATEWAY_COMMIT,
+  GATEWAY_VERSION,
+  TOOL_NAMES,
+  toolSchemaFingerprint,
+} from "./contract.js";
+import {
   isThreadRunning,
+  needsAttentionFor,
+  observeThread,
   threadActivity,
   threadStatus,
   threadStatusReason,
+  type ObservationQuality,
   type ThreadActivity,
   type ThreadStatus,
 } from "./t3/thread-state.js";
@@ -52,11 +60,34 @@ export interface ConnectionStatusResult {
   readonly connectionStatus: ConnectionStatus;
   readonly stateFreshness: StateFreshness;
   readonly lastObservedAt: string | null;
+  readonly observedAt: string;
+  readonly gatewayVersion: string;
+  readonly gatewayCommit: string;
+  readonly toolSchemaFingerprint: string;
+  readonly effectiveAccessMode: "read-only" | "read-write";
+  readonly callableOperations: ReadonlyArray<string>;
+  readonly disabledOperations: ReadonlyArray<DisabledOperation>;
   readonly supportedCapabilities: ReadonlyArray<string>;
   readonly permittedOperations: ReadonlyArray<string>;
   readonly t3Scopes: ReadonlyArray<string>;
+  /** Upstream T3 scopes. `t3Scopes` is kept for compatibility and mirrors this value. */
+  readonly upstreamScopes: ReadonlyArray<string>;
   readonly gatewayOperations: ReadonlyArray<string>;
+  readonly sessionExpiresAt: string | null;
   readonly error?: string;
+}
+
+export interface DisabledOperation {
+  readonly operation: string;
+  readonly reasonCode: "gateway_read_only" | "t3_scope_required";
+  readonly reason: string;
+}
+
+export interface ObservedTarget {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly turnId: string | null;
+  readonly observedAt: string;
 }
 
 export interface Page<T> {
@@ -78,6 +109,7 @@ export interface ProjectSummary {
 export interface ThreadSummary {
   readonly id: string;
   readonly projectId: string;
+  readonly projectTitle: string | null;
   readonly title: string;
   readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
@@ -92,6 +124,11 @@ export interface ThreadSummary {
   readonly activity: ThreadActivity;
   readonly isRunning: boolean;
   readonly hasConflictingSignals: boolean;
+  readonly quality: ObservationQuality;
+  readonly warning: string | null;
+  readonly observedTurnId: string | null;
+  readonly observedAt: string;
+  readonly observedTarget: ObservedTarget;
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
   readonly snoozedUntil: string | null;
@@ -107,12 +144,20 @@ export interface ThreadSummary {
   readonly hasPendingUserInput: boolean;
 }
 
+export interface OverviewHighlight extends ThreadSummary {
+  readonly latestResponseExcerpt: string | null;
+}
+
 export interface ThreadsOverview {
   readonly environmentId: string;
+  readonly observedAt: string;
   readonly total: number;
   readonly counts: Record<ThreadStatus, number>;
+  readonly executionCounts: Record<ThreadActivity, number>;
   readonly runningCount: number;
+  readonly needsAttentionCount: number;
   readonly running: ReadonlyArray<ThreadSummary>;
+  readonly highlights: ReadonlyArray<OverviewHighlight>;
 }
 
 export interface ThreadDetail extends ThreadSummary {
@@ -166,6 +211,7 @@ export type ProjectCreateResult = MutationResult & {
 export type ThreadCreateResult = MutationResult & {
   readonly projectId: string;
   readonly threadId: string;
+  readonly modelSelection: ModelSelection | null;
   readonly workspace: {
     readonly branch: string | null;
     readonly worktreePath: string | null;
@@ -206,6 +252,9 @@ export interface RunResult {
   readonly connectionStatus: ConnectionStatus;
   readonly stateFreshness: StateFreshness;
   readonly lastObservedAt: string | null;
+  readonly observedAt: string;
+  readonly threadQuality: ObservationQuality | null;
+  readonly threadWarning: string | null;
   readonly latestResponse: Message | null;
   readonly pendingActions: {
     readonly approvals: boolean;
@@ -282,24 +331,51 @@ export interface PendingActionRespondInput extends MutationCommonInput {
   readonly answers?: Record<string, unknown>;
 }
 
-const GATEWAY_OPERATIONS = [
-  "t3_connection_status",
-  "t3_projects_list",
-  "t3_project_create",
-  "t3_threads_list",
-  "t3_threads_overview",
-  "t3_thread_create",
-  "t3_thread_get",
-  "t3_thread_messages",
-  "t3_thread_send",
-  "t3_run_get",
-  "t3_run_wait",
-  "t3_run_interrupt",
-  "t3_pending_actions_list",
-  "t3_pending_action_respond",
-  "t3_thread_archive",
-  "t3_thread_interrupt",
-] as const;
+export interface ProviderOption {
+  readonly instanceId: string | null;
+  readonly provider: string | null;
+  readonly model: string;
+  readonly label: string;
+  readonly projectsWithDefault: ReadonlyArray<string>;
+  readonly threadsUsing: number;
+}
+
+export interface ProvidersResult {
+  readonly environmentId: string;
+  readonly observedAt: string;
+  readonly defaultsByProject: Record<string, ModelSelection | null>;
+  readonly options: ReadonlyArray<ProviderOption>;
+}
+
+export type InterruptVerification =
+  | "interrupted"
+  | "still_running"
+  | "target_changed"
+  | "not_running"
+  | "inconsistent"
+  | "unknown";
+
+export interface ThreadInterruptVerification {
+  readonly observed: InterruptVerification;
+  readonly observedTurnId: string | null;
+  readonly observedAt: string;
+  readonly detail: string;
+}
+
+export type ThreadInterruptResult = MutationResult & {
+  readonly threadId: string;
+  readonly expectedTurnId: string;
+  readonly verification: ThreadInterruptVerification | null;
+};
+
+export interface ThreadsListResult {
+  readonly environmentId: string;
+  readonly observedAt: string;
+  readonly page: Page<ThreadSummary>;
+  readonly resolutionHint: string | null;
+}
+
+const GATEWAY_OPERATIONS: ReadonlyArray<string> = [...TOOL_NAMES];
 
 const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
   "t3_project_create",
@@ -332,16 +408,21 @@ export class T3Gateway {
   async connectionStatus(): Promise<ConnectionStatusResult> {
     let descriptor: Descriptor | null = null;
     let sessionScopes: ReadonlyArray<string> = [];
+    let sessionExpiresAt: string | null = null;
     let failure: string | null = null;
     try {
       descriptor = await this.client.getDescriptor();
       this.assertEnvironment(descriptor);
       const session = await this.client.getSession();
       sessionScopes = session.scopes ?? [];
+      sessionExpiresAt = session.expiresAt ?? null;
       await this.client.getShell();
     } catch (error) {
       failure = safeErrorMessage(error);
       descriptor = this.client.getCachedDescriptor();
+      if (descriptor === null && failure.includes("does not match")) {
+        // Environment mismatch is a hard failure; keep descriptor null only when truly unknown.
+      }
     }
 
     const telemetry = this.client.telemetry();
@@ -359,18 +440,37 @@ export class T3Gateway {
           }
         : null;
     const lastObservedAt = telemetry.lastSnapshotAt ?? telemetry.lastSuccessfulAt;
+    const observedAt = new Date().toISOString();
+    const readOnly = this.config.readOnly;
+    const hasOperate = sessionScopes.includes("orchestration:operate");
+    // When disconnected we cannot confirm scopes; report read-only to fail closed.
+    const effective: "read-only" | "read-write" = readOnly ? "read-only" : failure === null && hasOperate ? "read-write" : "read-only";
+    const gatewayOps = readOnly
+      ? GATEWAY_OPERATIONS.filter((operation) => !MUTATING_GATEWAY_OPERATIONS.has(operation))
+      : [...GATEWAY_OPERATIONS];
+    const { callableOperations, disabledOperations } = partitionOperations([...TOOL_NAMES], {
+      readOnly,
+      hasOperate: failure === null ? hasOperate : false,
+    });
 
     return {
       environment,
       connectionStatus: failure === null ? "connected" : "disconnected",
       stateFreshness: freshness(lastObservedAt, this.config.staleAfterMs),
       lastObservedAt,
+      observedAt,
+      gatewayVersion: GATEWAY_VERSION,
+      gatewayCommit: GATEWAY_COMMIT,
+      toolSchemaFingerprint: toolSchemaFingerprint(),
+      effectiveAccessMode: effective,
+      callableOperations,
+      disabledOperations,
       supportedCapabilities: descriptor ? Object.keys(descriptor.capabilities).sort() : [],
       permittedOperations: permittedOperations(sessionScopes),
       t3Scopes: sessionScopes,
-      gatewayOperations: this.config.readOnly
-        ? GATEWAY_OPERATIONS.filter((operation) => !MUTATING_GATEWAY_OPERATIONS.has(operation))
-        : [...GATEWAY_OPERATIONS],
+      upstreamScopes: sessionScopes,
+      gatewayOperations: gatewayOps,
+      sessionExpiresAt,
       ...(failure === null ? {} : { error: failure }),
     };
   }
@@ -394,23 +494,46 @@ export class T3Gateway {
     readonly status?: ThreadStatus | "all";
     readonly onlyRunning?: boolean;
     readonly sessionStatus?: string;
+    readonly activity?: ThreadActivity;
+    readonly needsAttention?: boolean;
+    readonly sort?: "recent" | "title" | "status";
+    readonly detail?: "summary" | "full";
     readonly cursor?: string;
     readonly limit: number;
-  }): Promise<{ readonly environmentId: string; readonly page: Page<ThreadSummary> }> {
+  }): Promise<ThreadsListResult> {
     const shell = await this.client.getShell();
+    const environmentId = await this.environmentId();
     const now = Date.now();
+    const observedAt = new Date(now).toISOString();
+    const projectTitles = new Map(shell.projects.map((project) => [project.id, project.title]));
     const filtered = shell.threads.filter((thread) => {
       if (input.projectId !== undefined && thread.projectId !== input.projectId) return false;
       if (!matchesQuery(input.query, thread.title, thread.branch, thread.id)) return false;
       if (input.onlyRunning === true && !isThreadRunning(thread)) return false;
       if (input.sessionStatus !== undefined && (thread.session?.status ?? null) !== input.sessionStatus) return false;
+      if (input.activity !== undefined && threadActivity(thread) !== input.activity) return false;
+      if (input.needsAttention === true && !needsAttentionFor(thread, now)) return false;
+      if (input.needsAttention === false && needsAttentionFor(thread, now)) return false;
       if (input.status !== undefined && input.status !== "all") {
         return threadStatus(thread, now) === input.status;
       }
       return input.includeArchived || !thread.archivedAt;
     });
-    const page = paginate(filtered.map((thread) => threadSummary(thread, now)), input.cursor, input.limit);
-    return { environmentId: await this.environmentId(), page };
+    const sorted = sortThreads(filtered, input.sort ?? "recent", now);
+    const summaries = sorted.map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
+    // detail=full is served by the same shell rows plus latest-response enrichment on the page only.
+    // Full transcripts still require t3_thread_messages.
+    let items: ReadonlyArray<ThreadSummary> = summaries;
+    if (input.detail === "full") {
+      items = await this.enrichWithLatestResponse(summaries, 200);
+    }
+    const page = paginate(items, input.cursor, input.limit);
+    return {
+      environmentId,
+      observedAt,
+      page,
+      resolutionHint: resolutionHint(filtered.length, input),
+    };
   }
 
   async threadsOverview(input: {
@@ -420,32 +543,102 @@ export class T3Gateway {
     readonly runningLimit: number;
   }): Promise<ThreadsOverview> {
     const shell = await this.client.getShell();
+    const environmentId = await this.environmentId();
     const now = Date.now();
+    const observedAt = new Date(now).toISOString();
+    const projectTitles = new Map(shell.projects.map((project) => [project.id, project.title]));
     const filtered = shell.threads.filter((thread) => {
       if (input.projectId !== undefined && thread.projectId !== input.projectId) return false;
       if (!matchesQuery(input.query, thread.title, thread.branch, thread.id)) return false;
       return input.includeArchived || !thread.archivedAt;
     });
     const counts: Record<ThreadStatus, number> = { open: 0, snoozed: 0, settled: 0, archived: 0 };
+    const executionCounts: Record<ThreadActivity, number> = {
+      running: 0,
+      starting: 0,
+      awaiting_approval: 0,
+      awaiting_input: 0,
+      failed: 0,
+      idle: 0,
+    };
+    let needsAttentionCount = 0;
     for (const thread of filtered) {
       counts[threadStatus(thread, now)] += 1;
+      executionCounts[threadActivity(thread)] += 1;
+      if (needsAttentionFor(thread, now)) needsAttentionCount += 1;
     }
-    const running = filtered.filter(isThreadRunning).map((thread) => threadSummary(thread, now));
+    const running = filtered
+      .filter(isThreadRunning)
+      .map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
+    const highlights = await this.buildHighlights(filtered, projectTitles, environmentId, now);
     return {
-      environmentId: await this.environmentId(),
+      environmentId,
+      observedAt,
       total: filtered.length,
       counts,
+      executionCounts,
       runningCount: running.length,
+      needsAttentionCount,
       running: running.slice(0, input.runningLimit),
+      highlights,
     };
+  }
+
+  async providersList(): Promise<ProvidersResult> {
+    const shell = await this.client.getShell();
+    const environmentId = await this.environmentId();
+    const observedAt = new Date().toISOString();
+    const defaultsByProject: Record<string, ModelSelection | null> = {};
+    for (const project of shell.projects) {
+      defaultsByProject[project.id] = project.defaultModelSelection ?? null;
+    }
+    const byKey = new Map<string, { selection: ModelSelection; projectsWithDefault: Set<string>; threadsUsing: number }>();
+    const keyOf = (selection: ModelSelection): string =>
+      `${selection.instanceId ?? ""}\u0000${selection.provider ?? ""}\u0000${selection.model}`;
+    for (const project of shell.projects) {
+      const def = project.defaultModelSelection;
+      if (!def) continue;
+      const key = keyOf(def);
+      const entry = byKey.get(key) ?? { selection: def, projectsWithDefault: new Set<string>(), threadsUsing: 0 };
+      entry.projectsWithDefault.add(project.id);
+      byKey.set(key, entry);
+    }
+    for (const thread of shell.threads) {
+      const key = keyOf(thread.modelSelection);
+      const entry = byKey.get(key) ?? {
+        selection: thread.modelSelection,
+        projectsWithDefault: new Set<string>(),
+        threadsUsing: 0,
+      };
+      entry.threadsUsing += 1;
+      byKey.set(key, entry);
+    }
+    const options: ProviderOption[] = [...byKey.values()]
+      .map((entry) => ({
+        instanceId: entry.selection.instanceId ?? null,
+        provider: entry.selection.provider ?? null,
+        model: entry.selection.model,
+        label: [entry.selection.instanceId ?? entry.selection.provider ?? "t3", entry.selection.model]
+          .filter(Boolean)
+          .join("/"),
+        projectsWithDefault: [...entry.projectsWithDefault].sort(),
+        threadsUsing: entry.threadsUsing,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    return { environmentId, observedAt, defaultsByProject, options };
   }
 
   async threadGet(threadId: string): Promise<{ readonly environmentId: string; readonly thread: ThreadDetail }> {
     const snapshot = await this.client.getThread(threadId);
     // Full thread snapshots omit the shell's pending flags and latest-user timestamp.
     const shell = await this.client.getShell();
+    const environmentId = await this.environmentId();
     const summary = shell.threads.find((thread) => thread.id === threadId);
-    return { environmentId: await this.environmentId(), thread: threadDetail(snapshot.thread, summary) };
+    const projectTitle = shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ?? null;
+    return {
+      environmentId,
+      thread: threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now()),
+    };
   }
 
   async threadMessages(
@@ -544,7 +737,13 @@ export class T3Gateway {
         threadId: existing.threadId,
       });
       const reconciled = await this.reconcile(begun.record);
-      return this.threadCreateResult(reconciled, input.projectId, input.branch ?? null, input.worktreePath ?? null);
+      return this.threadCreateResult(
+        reconciled,
+        input.projectId,
+        input.modelSelection ?? null,
+        input.branch ?? null,
+        input.worktreePath ?? null,
+      );
     }
     await this.requireOperationScope();
     const project = await this.findProject(input.projectId);
@@ -552,7 +751,7 @@ export class T3Gateway {
     if (modelSelection === null || modelSelection === undefined) {
       throw new GatewayError(
         "model_selection_required",
-        "The project has no default model. Supply modelSelection from the connected environment.",
+        "The project has no default model. Call t3_providers_list to discover available instanceId/model values, then supply modelSelection.",
       );
     }
     const threadId = randomUUID();
@@ -565,7 +764,7 @@ export class T3Gateway {
     });
     if (begun.reused) {
       const reconciled = await this.reconcile(begun.record);
-      return this.threadCreateResult(reconciled, input.projectId, input.branch ?? null, input.worktreePath ?? null);
+      return this.threadCreateResult(reconciled, input.projectId, modelSelection, input.branch ?? null, input.worktreePath ?? null);
     }
     const command: ThreadCreateCommand = {
       type: "thread.create",
@@ -581,7 +780,7 @@ export class T3Gateway {
       createdAt: new Date().toISOString(),
     };
     const result = await this.dispatchNew(begun.record, command);
-    return this.threadCreateResult(result, input.projectId, command.branch, command.worktreePath);
+    return this.threadCreateResult(result, input.projectId, modelSelection, command.branch, command.worktreePath);
   }
 
   async threadSend(input: ThreadSendInput): Promise<ThreadSendResult> {
@@ -612,9 +811,19 @@ export class T3Gateway {
     await this.requireOperationScope();
     const snapshot = await this.client.getThread(input.threadId);
     if (threadIsBusy(snapshot.thread)) {
+      const now = Date.now();
+      const observation = observeThread(snapshot.thread, now);
+      const activeTurn = snapshot.thread.latestTurn?.turnId ?? null;
+      const sessionStatus = snapshot.thread.session != null
+        ? (snapshot.thread.session as { status?: unknown }).status
+        : null;
       throw new GatewayError(
         "thread_busy",
-        "The thread already has an active turn. Queueing and steering are not enabled in this gateway version.",
+        `Thread ${input.threadId} is busy (execution=${observation.execution}, ` +
+          `turn=${activeTurn ?? "unknown"}, session=${typeof sessionStatus === "string" ? sessionStatus : "unknown"}, ` +
+          `quality=${observation.quality}). Valid next actions: poll t3_thread_get or t3_run_get, ` +
+          `wait for completion, or interrupt the observed turn ${activeTurn ?? "once known"} with t3_thread_interrupt. ` +
+          `Queueing and steering are not enabled.`,
       );
     }
 
@@ -726,7 +935,7 @@ export class T3Gateway {
     return mutationResult(result, await this.knownEnvironmentId());
   }
 
-  async threadInterrupt(input: ThreadInterruptInput): Promise<MutationResult> {
+  async threadInterrupt(input: ThreadInterruptInput): Promise<ThreadInterruptResult> {
     if (this.config.readOnly) await this.requireOperationScope();
     const payload = { threadId: input.threadId, expectedTurnId: input.expectedTurnId };
     const beginInput = {
@@ -739,20 +948,43 @@ export class T3Gateway {
     const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
     if (existing) {
       const begun = await this.journal.begin(beginInput);
-      return mutationResult(begun.record, await this.knownEnvironmentId());
+      const environmentId = await this.knownEnvironmentId();
+      return {
+        ...mutationResult(begun.record, environmentId),
+        threadId: input.threadId,
+        expectedTurnId: input.expectedTurnId,
+        verification: await this.verifyInterruption(environmentId, input.threadId, input.expectedTurnId),
+      };
     }
     await this.requireOperationScope();
     // Check identity before dispatch; a misconfigured endpoint must never stop work.
+    // T3 interrupts by provider session, so this precheck is not atomic.
     const environmentId = await this.environmentId();
     const { thread } = await this.client.getThread(input.threadId);
+    const observedAt = new Date().toISOString();
     if (thread.latestTurn?.turnId !== input.expectedTurnId) {
-      throw new GatewayError("turn_changed", "The thread's latest turn changed. Read the thread again before interrupting.");
+      throw new GatewayError(
+        "turn_changed",
+        `Thread ${input.threadId} latest turn is ${thread.latestTurn?.turnId ?? "unknown"} at ${observedAt}, ` +
+          `not expected ${input.expectedTurnId}. Read t3_thread_get again and use the fresh observedTarget before interrupting.`,
+      );
     }
     if (thread.latestTurn.state !== "running") {
-      throw new GatewayError("thread_not_running", "The observed turn is no longer running.");
+      throw new GatewayError(
+        "thread_not_running",
+        `Thread ${input.threadId} turn ${input.expectedTurnId} is ${thread.latestTurn.state} at ${observedAt}, ` +
+          `not running. Read t3_thread_get to reconcile; do not retry the interrupt.`,
+      );
     }
     const begun = await this.journal.begin(beginInput);
-    if (begun.reused) return mutationResult(begun.record, environmentId);
+    if (begun.reused) {
+      return {
+        ...mutationResult(begun.record, environmentId),
+        threadId: input.threadId,
+        expectedTurnId: input.expectedTurnId,
+        verification: await this.verifyInterruption(environmentId, input.threadId, input.expectedTurnId),
+      };
+    }
     const result = await this.dispatchNew(begun.record, {
       type: "thread.turn.interrupt",
       commandId: begun.record.commandId,
@@ -760,7 +992,79 @@ export class T3Gateway {
       turnId: input.expectedTurnId,
       createdAt: new Date().toISOString(),
     });
-    return mutationResult(result, environmentId);
+    const verification = result.status === "accepted"
+      ? await this.verifyInterruption(environmentId, input.threadId, input.expectedTurnId)
+      : null;
+    return {
+      ...mutationResult(result, environmentId),
+      threadId: input.threadId,
+      expectedTurnId: input.expectedTurnId,
+      verification,
+    };
+  }
+
+  private async verifyInterruption(
+    environmentId: string,
+    threadId: string,
+    expectedTurnId: string,
+  ): Promise<ThreadInterruptVerification> {
+    void environmentId;
+    try {
+      const { thread } = await this.client.getThread(threadId);
+      const now = Date.now();
+      const observation = observeThread(thread, now);
+      const currentTurnId = thread.latestTurn?.turnId ?? null;
+      const currentState = thread.latestTurn?.state ?? null;
+      if (currentTurnId !== expectedTurnId) {
+        return {
+          observed: "target_changed",
+          observedTurnId: currentTurnId,
+          observedAt: observation.observedAt,
+          detail: `Latest turn changed from ${expectedTurnId} to ${currentTurnId ?? "unknown"}. ` +
+            `Acceptance did not confirm the observed run stopped; read t3_thread_get to reconcile. ` +
+            `T3 interrupts by provider session without an atomic turn condition.`,
+        };
+      }
+      if (currentState === "interrupted") {
+        return {
+          observed: "interrupted",
+          observedTurnId: currentTurnId,
+          observedAt: observation.observedAt,
+          detail: `Turn ${expectedTurnId} is interrupted as observed at ${observation.observedAt}.`,
+        };
+      }
+      if (currentState !== "running") {
+        return {
+          observed: "not_running",
+          observedTurnId: currentTurnId,
+          observedAt: observation.observedAt,
+          detail: `Turn ${expectedTurnId} is ${currentState ?? "unknown"}; it is no longer running.`,
+        };
+      }
+      if (observation.quality === "inconsistent") {
+        return {
+          observed: "inconsistent",
+          observedTurnId: currentTurnId,
+          observedAt: observation.observedAt,
+          detail: observation.warning ?? "T3 signals disagree after interrupt acceptance.",
+        };
+      }
+      return {
+        observed: "still_running",
+        observedTurnId: currentTurnId,
+        observedAt: observation.observedAt,
+        detail: `Interrupt accepted but turn ${expectedTurnId} still reports running at ${observation.observedAt}. ` +
+          `Poll t3_thread_get; acceptance alone does not confirm a stop.`,
+      };
+    } catch (error) {
+      return {
+        observed: "unknown",
+        observedTurnId: null,
+        observedAt: new Date().toISOString(),
+        detail: `Could not verify interruption: ${safeErrorMessage(error)}. ` +
+          `Reconcile with t3_thread_get using the durable operation handle; do not resubmit with a fresh key.`,
+      };
+    }
   }
 
   async pendingActionsList(threadId: string): Promise<PendingActionsResult> {
@@ -885,7 +1189,7 @@ export class T3Gateway {
       }
       return this.journal.update(record.operationId, {
         status: "uncertain",
-        lastError: safeErrorMessage(error),
+        lastError: `${safeErrorMessage(error)} Reconcile with operation ${record.operationId} via t3_run_get; do not resubmit with a fresh idempotency key.`,
       });
     }
   }
@@ -930,6 +1234,9 @@ export class T3Gateway {
     try {
       const snapshot = await this.client.getThread(record.threadId);
       const thread = snapshot.thread;
+      const now = Date.now();
+      const observedAt = new Date(now).toISOString();
+      const observation = observeThread(thread, now);
       const message = record.messageId
         ? thread.messages.find((candidate) => candidate.id === record.messageId) ?? null
         : null;
@@ -960,7 +1267,10 @@ export class T3Gateway {
         providerTurnId: null,
         connectionStatus: "connected",
         stateFreshness: "fresh",
-        lastObservedAt: new Date().toISOString(),
+        lastObservedAt: observedAt,
+        observedAt,
+        threadQuality: observation.quality,
+        threadWarning: observation.warning,
         latestResponse: latestAssistant(thread.messages, turnId),
         pendingActions: {
           approvals: thread.hasPendingApprovals ?? false,
@@ -969,6 +1279,7 @@ export class T3Gateway {
       };
     } catch (error) {
       const telemetry = this.client.telemetry();
+      const observedAt = new Date().toISOString();
       return {
         environmentId: await this.environmentId().catch(() => this.config.environmentId ?? "unknown"),
         operationId: record.operationId,
@@ -981,6 +1292,9 @@ export class T3Gateway {
         connectionStatus: "disconnected",
         stateFreshness: freshness(telemetry.lastSnapshotAt, this.config.staleAfterMs),
         lastObservedAt: telemetry.lastSnapshotAt,
+        observedAt,
+        threadQuality: null,
+        threadWarning: null,
         latestResponse: null,
         pendingActions: { approvals: false, userInput: false },
         error: safeErrorMessage(error),
@@ -992,9 +1306,51 @@ export class T3Gateway {
     const shell = await this.client.getShell();
     const project = shell.projects.find((candidate) => candidate.id === projectId);
     if (!project) {
-      throw new GatewayError("project_not_found", `Project ${projectId} was not found.`);
+      throw new GatewayError(
+        "project_not_found",
+        `Project ${projectId} was not found. Call t3_projects_list to discover available project IDs.`,
+      );
     }
     return project;
+  }
+
+  private async buildHighlights(
+    filtered: ReadonlyArray<ThreadShell>,
+    projectTitles: Map<string, string>,
+    environmentId: string,
+    now: number,
+  ): Promise<ReadonlyArray<OverviewHighlight>> {
+    const ranked = [...filtered]
+      .map((thread) => ({
+        thread,
+        rank: highlightRank(thread, now),
+        recency: threadRecency(thread),
+      }))
+      .sort((a, b) => a.rank - b.rank || b.recency - a.recency || a.thread.id.localeCompare(b.thread.id))
+      .slice(0, 5);
+    const summaries = ranked.map(({ thread }) =>
+      threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
+    );
+    return this.enrichWithLatestResponse(summaries, 200);
+  }
+
+  private async enrichWithLatestResponse<T extends ThreadSummary>(
+    summaries: ReadonlyArray<T>,
+    excerptChars: number,
+  ): Promise<Array<T & { latestResponseExcerpt: string | null }>> {
+    const results: Array<T & { latestResponseExcerpt: string | null }> = [];
+    for (const summary of summaries) {
+      try {
+        const snapshot = await this.client.getThread(summary.id);
+        const latest = latestAssistant(snapshot.thread.messages, snapshot.thread.latestTurn?.turnId ?? null)
+          ?? latestAssistant(snapshot.thread.messages, null);
+        const excerpt = latest ? truncateExcerpt(latest.text, excerptChars) : null;
+        results.push({ ...summary, latestResponseExcerpt: excerpt });
+      } catch {
+        results.push({ ...summary, latestResponseExcerpt: null });
+      }
+    }
+    return results;
   }
 
   private async findRun(runId: string): Promise<OperationRecord | null> {
@@ -1059,13 +1415,33 @@ export class T3Gateway {
   private async threadCreateResult(
     record: OperationRecord,
     projectId: string,
+    modelSelection: ModelSelection | null,
     branch: string | null,
     worktreePath: string | null,
   ): Promise<ThreadCreateResult> {
+    // Return the T3-accepted workspace/model when the thread is already visible.
+    if (record.status === "accepted" && record.threadId) {
+      try {
+        const snapshot = await this.client.getThread(record.threadId);
+        return {
+          ...mutationResult(record, await this.knownEnvironmentId()),
+          projectId: snapshot.thread.projectId,
+          threadId: snapshot.thread.id,
+          modelSelection: snapshot.thread.modelSelection,
+          workspace: {
+            branch: snapshot.thread.branch ?? null,
+            worktreePath: snapshot.thread.worktreePath ?? null,
+          },
+        };
+      } catch {
+        // Fall back to the requested values; acceptance is already journaled.
+      }
+    }
     return {
       ...mutationResult(record, await this.knownEnvironmentId()),
       projectId,
       threadId: record.threadId ?? "unknown",
+      modelSelection,
       workspace: { branch, worktreePath },
     };
   }
@@ -1108,8 +1484,113 @@ function mutationResult(record: OperationRecord, environmentId: string): Mutatio
     operationId: record.operationId,
     commandId: record.commandId,
     status: "uncertain",
-    reason: record.lastError ?? "The command outcome could not be reconciled without replaying it.",
+    reason:
+      record.lastError ??
+      `The command outcome could not be reconciled. Reconcile with operation ${record.operationId} via t3_run_get; do not resubmit with a fresh idempotency key.`,
   };
+}
+
+function partitionOperations(
+  operations: ReadonlyArray<string>,
+  access: { readonly readOnly: boolean; readonly hasOperate: boolean },
+): { readonly callableOperations: string[]; readonly disabledOperations: DisabledOperation[] } {
+  const callableOperations: string[] = [];
+  const disabledOperations: DisabledOperation[] = [];
+  for (const operation of operations) {
+    if (!MUTATING_GATEWAY_OPERATIONS.has(operation)) {
+      callableOperations.push(operation);
+      continue;
+    }
+    if (access.readOnly) {
+      disabledOperations.push({
+        operation,
+        reasonCode: "gateway_read_only",
+        reason: "Gateway is configured read-only (MCP_READ_ONLY=true). Restart with MCP_READ_ONLY=false to enable control.",
+      });
+      continue;
+    }
+    if (!access.hasOperate) {
+      disabledOperations.push({
+        operation,
+        reasonCode: "t3_scope_required",
+        reason: "Upstream T3 credential lacks orchestration:operate. Mutations will be rejected until the scope is granted.",
+      });
+      continue;
+    }
+    callableOperations.push(operation);
+  }
+  return { callableOperations, disabledOperations };
+}
+
+function sortThreads(
+  threads: ReadonlyArray<ThreadShell>,
+  sort: "recent" | "title" | "status",
+  now: number,
+): ThreadShell[] {
+  const copy = [...threads];
+  if (sort === "title") {
+    copy.sort((a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id));
+    return copy;
+  }
+  if (sort === "status") {
+    const order: Record<ThreadStatus, number> = { open: 0, snoozed: 1, settled: 2, archived: 3 };
+    copy.sort(
+      (a, b) =>
+        order[threadStatus(a, now)] - order[threadStatus(b, now)] ||
+        threadRecency(b) - threadRecency(a) ||
+        a.id.localeCompare(b.id),
+    );
+    return copy;
+  }
+  copy.sort((a, b) => threadRecency(b) - threadRecency(a) || a.id.localeCompare(b.id));
+  return copy;
+}
+
+function highlightRank(thread: ThreadShell, now: number): number {
+  if (thread.hasPendingApprovals === true || thread.hasPendingUserInput === true) return 0;
+  const observation = observeThread(thread, now);
+  if (observation.quality === "inconsistent" || observation.quality === "stale") return 1;
+  if (observation.execution === "failed") return 2;
+  if (observation.execution === "running" || observation.execution === "starting") return 3;
+  return 4;
+}
+
+function threadRecency(thread: ThreadShell): number {
+  const candidates = [
+    thread.latestUserMessageAt,
+    thread.session?.updatedAt,
+    thread.updatedAt,
+    thread.createdAt,
+  ];
+  let best = 0;
+  for (const value of candidates) {
+    const parsed = Date.parse(value ?? "");
+    if (Number.isFinite(parsed) && parsed > best) best = parsed;
+  }
+  return best;
+}
+
+function truncateExcerpt(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars)}…`;
+}
+
+function resolutionHint(
+  total: number,
+  input: { readonly query?: string; readonly projectId?: string; readonly status?: ThreadStatus | "all" },
+): string | null {
+  if (total === 1) return "One exact candidate. The client may select it and carry its observedTarget into control calls.";
+  if (total > 1) {
+    return "Multiple candidates. Present project, title, branch, and recent activity for clarification; never invent a newest choice for a mutation.";
+  }
+  const scope: string[] = [];
+  if (input.projectId) scope.push(`project ${input.projectId}`);
+  if (input.query) scope.push(`query ${JSON.stringify(input.query)}`);
+  if (input.status && input.status !== "all") scope.push(`status ${input.status}`);
+  const where = scope.length > 0 ? ` for ${scope.join(", ")}` : "";
+  return `No threads${where}. Retry with a broader query, another project, or includeArchived=true. ` +
+    `Zero results must not select a thread for control.`;
 }
 
 function projectSummary(project: Project): ProjectSummary {
@@ -1123,11 +1604,18 @@ function projectSummary(project: Project): ProjectSummary {
   };
 }
 
-function threadSummary(thread: ThreadShell, now = Date.now()): ThreadSummary {
+function threadSummary(
+  thread: ThreadShell,
+  projectTitle: string | null = null,
+  environmentId = "unknown",
+  now = Date.now(),
+): ThreadSummary {
   const session = asRecord(thread.session);
+  const observation = observeThread(thread, now);
   return {
     id: thread.id,
     projectId: thread.projectId,
+    projectTitle,
     title: thread.title,
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,
@@ -1137,11 +1625,21 @@ function threadSummary(thread: ThreadShell, now = Date.now()): ThreadSummary {
     latestTurn: thread.latestTurn ?? null,
     sessionStatus: typeof session?.status === "string" ? session.status : null,
     sessionUpdatedAt: typeof session?.updatedAt === "string" ? session.updatedAt : null,
-    status: threadStatus(thread, now),
+    status: observation.lifecycle,
     statusReason: threadStatusReason(thread, now),
-    activity: threadActivity(thread),
+    activity: observation.execution,
     isRunning: isThreadRunning(thread),
-    hasConflictingSignals: hasConflictingSignals(thread),
+    hasConflictingSignals: observation.quality === "inconsistent",
+    quality: observation.quality,
+    warning: observation.warning,
+    observedTurnId: observation.observedTurnId,
+    observedAt: observation.observedAt,
+    observedTarget: {
+      environmentId,
+      threadId: thread.id,
+      turnId: observation.observedTurnId,
+      observedAt: observation.observedAt,
+    },
     settledOverride: thread.settledOverride ?? null,
     settledAt: thread.settledAt ?? null,
     snoozedUntil: thread.snoozedUntil ?? null,
@@ -1158,9 +1656,17 @@ function threadSummary(thread: ThreadShell, now = Date.now()): ThreadSummary {
   };
 }
 
-function threadDetail(thread: Thread, summary: ThreadShell = thread): ThreadDetail {
+function threadDetail(
+  thread: Thread,
+  summary: ThreadShell | undefined,
+  projectTitle: string | null = null,
+  environmentId = "unknown",
+  now = Date.now(),
+): ThreadDetail {
+  const source: ThreadShell = summary ?? thread;
   return {
-    ...threadSummary(summary),
+    ...threadSummary(source, projectTitle, environmentId, now),
+    // Latest response is bounded to the observed turn; full history needs t3_thread_messages.
     latestResponse: latestAssistant(thread.messages, thread.latestTurn?.turnId ?? null),
     messageCount: thread.messages.length,
     activityCount: thread.activities.length,
@@ -1289,7 +1795,8 @@ function hasRelevantChange(initial: RunResult, current: RunResult): boolean {
     current.t3TurnId !== initial.t3TurnId ||
     current.latestResponse?.id !== initial.latestResponse?.id ||
     current.pendingActions.approvals !== initial.pendingActions.approvals ||
-    current.pendingActions.userInput !== initial.pendingActions.userInput
+    current.pendingActions.userInput !== initial.pendingActions.userInput ||
+    current.threadQuality !== initial.threadQuality
   );
 }
 
