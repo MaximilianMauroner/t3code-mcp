@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { threadStatus } from "../src/t3/thread-state.js";
+import {
+  hasConflictingSignals,
+  isThreadRunning,
+  threadActivity,
+  threadStatus,
+  threadStatusReason,
+} from "../src/t3/thread-state.js";
 import { FakeT3 } from "./support/fake-t3.js";
 import type { Thread } from "../src/t3/types.js";
 
@@ -10,6 +16,10 @@ const completed = { turnId: "turn-1", state: "completed" as const, requestedAt: 
 
 function status(overrides: Partial<Thread> = {}) {
   return threadStatus(new FakeT3().addThread(overrides), NOW);
+}
+
+function shell(overrides: Partial<Thread> = {}) {
+  return new FakeT3().addThread(overrides);
 }
 
 describe("server-backed thread organization", () => {
@@ -56,5 +66,63 @@ describe("server-backed thread organization", () => {
     expect(status({ settledOverride: "settled", latestUserMessageAt })).toBe("open");
     expect(status({ settledOverride: "settled", latestUserMessageAt, settledAt: new Date(NOW).toISOString() })).toBe("settled");
     expect(status({ settledOverride: "settled", latestUserMessageAt: before })).toBe("settled");
+  });
+});
+
+describe("thread activity and signal clarity", () => {
+  it("derives running state from session or turn, not lifecycle status", () => {
+    expect(isThreadRunning(shell({ session: { status: "running" } }))).toBe(true);
+    expect(isThreadRunning(shell({ session: { status: "starting" } }))).toBe(true);
+    expect(isThreadRunning(shell({
+      session: { status: "stopped" },
+      latestTurn: { turnId: "t", state: "running", requestedAt: before },
+    }))).toBe(true);
+    expect(isThreadRunning(shell())).toBe(false);
+    expect(isThreadRunning(shell({ latestTurn: completed }))).toBe(false);
+  });
+
+  it("maps pending, starting, running, failed, and idle activity", () => {
+    expect(threadActivity(shell({ hasPendingApprovals: true }))).toBe("awaiting_approval");
+    expect(threadActivity(shell({ hasPendingUserInput: true }))).toBe("awaiting_input");
+    expect(threadActivity(shell({ session: { status: "starting" } }))).toBe("starting");
+    expect(threadActivity(shell({ session: { status: "running" } }))).toBe("running");
+    expect(threadActivity(shell({ session: { status: "error" } }))).toBe("failed");
+    expect(threadActivity(shell())).toBe("idle");
+  });
+
+  it("flags completed-turn plus running-session as conflicting", () => {
+    expect(hasConflictingSignals(shell({
+      session: { status: "running" },
+      latestTurn: { ...completed },
+    }))).toBe(true);
+    expect(hasConflictingSignals(shell({
+      session: { status: "stopped" },
+      latestTurn: { turnId: "t", state: "running", requestedAt: before },
+    }))).toBe(true);
+    expect(hasConflictingSignals(shell({ session: { status: "running" } }))).toBe(false);
+    expect(hasConflictingSignals(shell())).toBe(false);
+  });
+
+  it("explains why a thread is open, snoozed, settled, or archived", () => {
+    expect(threadStatusReason(shell({ archivedAt: before }), NOW)).toContain("archived");
+    expect(threadStatusReason(shell({ snoozedUntil: future }), NOW)).toContain("snoozed until");
+    expect(threadStatusReason(shell({ session: { status: "running" } }), NOW)).toContain("session is running");
+    expect(threadStatusReason(shell({
+      session: { status: "running" },
+      latestTurn: { ...completed },
+    }), NOW)).toContain("latest turn is completed");
+    expect(threadStatusReason(shell({ hasPendingApprovals: true }), NOW)).toContain("approval is pending");
+    expect(threadStatusReason(shell({ settledOverride: "settled", settledAt: before }), NOW)).toContain("settled by explicit override");
+    expect(threadStatusReason(shell(), NOW)).toContain("idle without a settled override");
+  });
+
+  it("notes when a future snooze is woken early", () => {
+    const reason = threadStatusReason(shell({
+      snoozedUntil: future,
+      snoozedAt: before,
+      hasPendingApprovals: true,
+    }), NOW);
+    expect(reason).toContain("open because approval is pending");
+    expect(reason).toContain("woken");
   });
 });

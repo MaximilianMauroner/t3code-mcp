@@ -16,7 +16,9 @@ flowchart LR
 | What you say | Tools the voice client uses |
 | --- | --- |
 | “Find my website project.” | `t3_projects_list` with `query` |
+| “What about the threads?” | `t3_threads_overview` for counts plus running threads |
 | “What threads are open in that project?” | `t3_threads_list` with `projectId` and `status: "open"` |
+| “What is running right now?” | `t3_threads_list` with `onlyRunning: true`, or `sessionStatus: "running"` |
 | “Show snoozed / settled threads.” | `t3_threads_list` with `status: "snoozed"` or `"settled"` |
 | “How is the login fix going?” | `t3_threads_list`, `t3_thread_get`, and `t3_thread_messages` as needed |
 | “Start a thread in that project and investigate the failing tests.” | `t3_thread_create`, then `t3_thread_send` |
@@ -33,7 +35,7 @@ A task can keep running in T3 after the phone disconnects. To check it later, th
 
 ## Find and check on existing work
 
-`t3_projects_list` accepts an optional `query` matching a case-insensitive substring of the project title, workspace path, or ID. `t3_threads_list` accepts `projectId`, a `query` matching title, branch, or ID, and a `status`. Filters combine and apply before cursor pagination.
+`t3_projects_list` accepts an optional `query` matching a case-insensitive substring of the project title, workspace path, or ID. `t3_threads_list` accepts `projectId`, a `query` matching title, branch, or ID, a `status`, plus `onlyRunning` and `sessionStatus` to find running work server-side. Filters combine and apply before cursor pagination. `t3_threads_overview` accepts the same `projectId`/`query`/`includeArchived` scope and returns `total`, `counts` by status, `runningCount`, and running thread summaries capped by `runningLimit`.
 
 | Thread status | Meaning in this gateway |
 | --- | --- |
@@ -45,7 +47,7 @@ A task can keep running in T3 after the phone disconnects. To check it later, th
 
 The gateway uses the lifecycle fields exposed by T3. The T3 UI also derives settlement from client preferences, inactivity, and linked PR state; those inputs are not available to these tools, so the settled/open lists can differ from the UI's automatic classification. Older servers with no lifecycle fields show unarchived threads as open. This behavior follows the server-backed portion of T3's `threadSettled.ts` and sidebar partitioning, inspected at source revision `4b8388773`.
 
-Thread summaries include `status`, the raw settlement override, snooze time, pin timestamp, session status, latest turn, pending flags, actionable-plan flag, and background liveness (`working` or `monitoring` when T3 provides it). `t3_thread_get` combines the full thread with these shell fields and its latest response. Use `t3_thread_messages` for more history.
+Thread summaries include `status`, `statusReason`, `activity` (`running`, `starting`, `awaiting_approval`, `awaiting_input`, `failed`, `idle`), `isRunning`, `hasConflictingSignals` (for example a completed turn while the session still reports running), the raw settlement override, snooze time and snooze start, pin timestamp, session status and session update time, latest user-message time, latest turn, pending flags, actionable-plan flag, and background liveness (`working` or `monitoring` when T3 provides it). `t3_thread_get` combines the full thread with these shell fields and its latest response. Use `t3_thread_messages` for more history.
 
 To start work, create a thread if needed and send a message. To continue existing work, send another message to that thread once it is idle. Creating a thread does not itself start a turn. Runtime mode follows the existing tool defaults; request `approval-required` explicitly when creating a thread if that is the intended T3 permission mode.
 
@@ -57,7 +59,7 @@ Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal
 
 The gateway uses T3’s authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment.
 
-- Project search and registration, thread search and lifecycle filters, thread creation, compact check-ins, and paginated messages with bounded text.
+- Project search and registration, thread search and lifecycle filters, one-call thread overviews with running work, thread creation, compact check-ins, and paginated messages with bounded text.
 - Starting agent turns, inspecting runs, polling for changes, requesting interruption by gateway run handle or observed thread turn, responding to approval or user-input requests, and archiving threads.
 - Connection status with environment identity, scopes, capabilities, and freshness information. Run results also report connection and freshness; other tool results include the environment ID.
 - A local operation journal for idempotency and reconciliation after uncertain dispatches.

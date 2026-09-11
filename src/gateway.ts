@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { threadStatus, type ThreadStatus } from "./t3/thread-state.js";
+import {
+  hasConflictingSignals,
+  isThreadRunning,
+  threadActivity,
+  threadStatus,
+  threadStatusReason,
+  type ThreadActivity,
+  type ThreadStatus,
+} from "./t3/thread-state.js";
 import type { GatewayConfig } from "./config.js";
 import {
   OperationJournal,
@@ -78,10 +86,17 @@ export interface ThreadSummary {
   readonly worktreePath: string | null;
   readonly latestTurn: LatestTurn | null;
   readonly sessionStatus: string | null;
+  readonly sessionUpdatedAt: string | null;
   readonly status: ThreadStatus;
+  readonly statusReason: string;
+  readonly activity: ThreadActivity;
+  readonly isRunning: boolean;
+  readonly hasConflictingSignals: boolean;
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
   readonly snoozedUntil: string | null;
+  readonly snoozedAt: string | null;
+  readonly latestUserMessageAt: string | null;
   readonly pinnedAt: string | null;
   readonly hasActionableProposedPlan: boolean;
   readonly backgroundLiveness: "working" | "monitoring" | null;
@@ -90,6 +105,14 @@ export interface ThreadSummary {
   readonly updatedAt: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
+}
+
+export interface ThreadsOverview {
+  readonly environmentId: string;
+  readonly total: number;
+  readonly counts: Record<ThreadStatus, number>;
+  readonly runningCount: number;
+  readonly running: ReadonlyArray<ThreadSummary>;
 }
 
 export interface ThreadDetail extends ThreadSummary {
@@ -264,6 +287,7 @@ const GATEWAY_OPERATIONS = [
   "t3_projects_list",
   "t3_project_create",
   "t3_threads_list",
+  "t3_threads_overview",
   "t3_thread_create",
   "t3_thread_get",
   "t3_thread_messages",
@@ -368,6 +392,8 @@ export class T3Gateway {
     readonly includeArchived: boolean;
     readonly query?: string;
     readonly status?: ThreadStatus | "all";
+    readonly onlyRunning?: boolean;
+    readonly sessionStatus?: string;
     readonly cursor?: string;
     readonly limit: number;
   }): Promise<{ readonly environmentId: string; readonly page: Page<ThreadSummary> }> {
@@ -376,6 +402,8 @@ export class T3Gateway {
     const filtered = shell.threads.filter((thread) => {
       if (input.projectId !== undefined && thread.projectId !== input.projectId) return false;
       if (!matchesQuery(input.query, thread.title, thread.branch, thread.id)) return false;
+      if (input.onlyRunning === true && !isThreadRunning(thread)) return false;
+      if (input.sessionStatus !== undefined && (thread.session?.status ?? null) !== input.sessionStatus) return false;
       if (input.status !== undefined && input.status !== "all") {
         return threadStatus(thread, now) === input.status;
       }
@@ -383,6 +411,33 @@ export class T3Gateway {
     });
     const page = paginate(filtered.map((thread) => threadSummary(thread, now)), input.cursor, input.limit);
     return { environmentId: await this.environmentId(), page };
+  }
+
+  async threadsOverview(input: {
+    readonly projectId?: string;
+    readonly includeArchived: boolean;
+    readonly query?: string;
+    readonly runningLimit: number;
+  }): Promise<ThreadsOverview> {
+    const shell = await this.client.getShell();
+    const now = Date.now();
+    const filtered = shell.threads.filter((thread) => {
+      if (input.projectId !== undefined && thread.projectId !== input.projectId) return false;
+      if (!matchesQuery(input.query, thread.title, thread.branch, thread.id)) return false;
+      return input.includeArchived || !thread.archivedAt;
+    });
+    const counts: Record<ThreadStatus, number> = { open: 0, snoozed: 0, settled: 0, archived: 0 };
+    for (const thread of filtered) {
+      counts[threadStatus(thread, now)] += 1;
+    }
+    const running = filtered.filter(isThreadRunning).map((thread) => threadSummary(thread, now));
+    return {
+      environmentId: await this.environmentId(),
+      total: filtered.length,
+      counts,
+      runningCount: running.length,
+      running: running.slice(0, input.runningLimit),
+    };
   }
 
   async threadGet(threadId: string): Promise<{ readonly environmentId: string; readonly thread: ThreadDetail }> {
@@ -1081,10 +1136,17 @@ function threadSummary(thread: ThreadShell, now = Date.now()): ThreadSummary {
     worktreePath: thread.worktreePath ?? null,
     latestTurn: thread.latestTurn ?? null,
     sessionStatus: typeof session?.status === "string" ? session.status : null,
+    sessionUpdatedAt: typeof session?.updatedAt === "string" ? session.updatedAt : null,
     status: threadStatus(thread, now),
+    statusReason: threadStatusReason(thread, now),
+    activity: threadActivity(thread),
+    isRunning: isThreadRunning(thread),
+    hasConflictingSignals: hasConflictingSignals(thread),
     settledOverride: thread.settledOverride ?? null,
     settledAt: thread.settledAt ?? null,
     snoozedUntil: thread.snoozedUntil ?? null,
+    snoozedAt: thread.snoozedAt ?? null,
+    latestUserMessageAt: thread.latestUserMessageAt ?? null,
     pinnedAt: thread.pinnedAt ?? null,
     hasActionableProposedPlan: thread.hasActionableProposedPlan ?? false,
     backgroundLiveness: thread.backgroundLiveness ?? null,

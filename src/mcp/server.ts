@@ -88,10 +88,17 @@ const threadSummaryOutput = z
     worktreePath: z.string().nullable(),
     latestTurn: latestTurnOutput.nullable(),
     sessionStatus: z.string().nullable(),
+    sessionUpdatedAt: z.string().nullable(),
     status: z.enum(["open", "snoozed", "settled", "archived"]),
+    statusReason: z.string(),
+    activity: z.enum(["running", "starting", "awaiting_approval", "awaiting_input", "failed", "idle"]),
+    isRunning: z.boolean(),
+    hasConflictingSignals: z.boolean(),
     settledOverride: z.enum(["settled", "active"]).nullable(),
     settledAt: z.string().nullable(),
     snoozedUntil: z.string().nullable(),
+    snoozedAt: z.string().nullable(),
+    latestUserMessageAt: z.string().nullable(),
     pinnedAt: z.string().nullable(),
     hasActionableProposedPlan: z.boolean(),
     backgroundLiveness: z.enum(["working", "monitoring"]).nullable(),
@@ -169,6 +176,21 @@ const threadsListOutputSchema = {
       total: z.number(),
     })
     .passthrough(),
+};
+
+const threadsOverviewOutputSchema = {
+  environmentId: z.string(),
+  total: z.number(),
+  counts: z
+    .object({
+      open: z.number(),
+      snoozed: z.number(),
+      settled: z.number(),
+      archived: z.number(),
+    })
+    .passthrough(),
+  runningCount: z.number(),
+  running: z.array(threadSummaryOutput),
 };
 
 const threadCreateOutputSchema = {
@@ -310,12 +332,14 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_threads_list",
     {
       title: "List T3 threads",
-      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters server-backed open, snoozed, settled, or archived state; UI-local inactivity/PR auto-settle rules are unavailable. Open includes pinned work and is not synonymous with running. Without a specific status, includeArchived controls archive visibility.",
+      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters server-backed open, snoozed, settled, or archived state; UI-local inactivity/PR auto-settle rules are unavailable. Open includes pinned work and is not synonymous with running: use onlyRunning or sessionStatus to find running work, or isRunning/activity in the result. Without a specific status, includeArchived controls archive visibility.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
         query,
         status: z.enum(["all", "open", "snoozed", "settled", "archived"]).optional(),
+        onlyRunning: z.boolean().optional(),
+        sessionStatus: z.string().trim().min(1).max(100).optional(),
         cursor,
         limit,
       },
@@ -323,6 +347,23 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async (args) => runTool(() => gateway.threadsList(args)),
+  );
+
+  server.registerTool(
+    "t3_threads_overview",
+    {
+      title: "Summarize T3 threads",
+      description: "Return counts by lifecycle status and the currently running threads in one call, for questions like 'what about the threads'. Filters combine before counting; running lists full thread summaries capped by runningLimit.",
+      inputSchema: {
+        projectId: z.string().trim().min(1).optional(),
+        includeArchived: z.boolean().default(false),
+        query,
+        runningLimit: z.number().int().min(1).max(50).default(10),
+      },
+      outputSchema: threadsOverviewOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.threadsOverview(args)),
   );
 
   server.registerTool(

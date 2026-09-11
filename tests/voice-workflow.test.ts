@@ -116,4 +116,58 @@ describe("voice discovery and control", () => {
     expect(thread.messages.map((message) => message.text)).toEqual(["Previous result", "Now check the tests"]);
     await expect(gateway.threadSend({ threadId: thread.id, message: "More work", idempotencyKey: "busy" })).rejects.toMatchObject({ code: "thread_busy" });
   });
+
+  it("exposes running state, activity, reason, and timestamps on summaries", async () => {
+    const { fake, gateway } = await setup();
+    fake.addThread({
+      id: "odd",
+      projectId: "p",
+      title: "Photo journey",
+      branch: "journey-timeline",
+      session: { status: "running", updatedAt: "2026-09-11T06:53:00.000Z" },
+      latestTurn: { turnId: "turn-odd", state: "completed", requestedAt: "2026-09-11T06:50:00.000Z", completedAt: "2026-09-11T06:52:00.000Z" },
+      snoozedAt: "2026-09-10T12:00:00.000Z",
+      latestUserMessageAt: "2026-09-11T06:50:00.000Z",
+    });
+    const result = await gateway.threadsList({ includeArchived: false, limit: 10 });
+    expect(result.page.items[0]).toMatchObject({
+      id: "odd",
+      status: "open",
+      isRunning: true,
+      activity: "running",
+      hasConflictingSignals: true,
+      sessionUpdatedAt: "2026-09-11T06:53:00.000Z",
+      snoozedAt: "2026-09-10T12:00:00.000Z",
+      latestUserMessageAt: "2026-09-11T06:50:00.000Z",
+    });
+    expect(result.page.items[0]?.statusReason).toContain("session is running");
+  });
+
+  it("filters running threads server-side by activity or session status", async () => {
+    const { fake, gateway } = await setup();
+    fake.addThread({ id: "running", projectId: "p", title: "work", session: { status: "running" } });
+    fake.addThread({ id: "idle", projectId: "p", title: "work", session: { status: "stopped" } });
+    fake.addThread({ id: "starting", projectId: "p", title: "work", session: { status: "starting" } });
+    expect((await gateway.threadsList({ includeArchived: false, onlyRunning: true, limit: 10 })).page.items.map((item) => item.id).sort())
+      .toEqual(["running", "starting"]);
+    expect((await gateway.threadsList({ includeArchived: false, sessionStatus: "running", limit: 10 })).page.items.map((item) => item.id))
+      .toEqual(["running"]);
+    expect((await gateway.threadsList({ includeArchived: false, onlyRunning: true, sessionStatus: "starting", limit: 10 })).page.items.map((item) => item.id))
+      .toEqual(["starting"]);
+  });
+
+  it("summarizes lifecycle counts and running threads in one overview call", async () => {
+    const { fake, gateway } = await setup();
+    fake.addThread({ id: "run-1", projectId: "p", title: "work", session: { status: "running" } });
+    fake.addThread({ id: "idle-1", projectId: "p", title: "work", session: { status: "stopped" } });
+    fake.addThread({ id: "snoozed-1", projectId: "p", title: "work", snoozedUntil: "2099-01-01T00:00:00Z" });
+    fake.addThread({ id: "settled-1", projectId: "p", title: "work", settledOverride: "settled" });
+    const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 10 });
+    expect(overview.total).toBe(4);
+    expect(overview.counts).toMatchObject({ open: 2, snoozed: 1, settled: 1, archived: 0 });
+    expect(overview.runningCount).toBe(1);
+    expect(overview.running.map((item) => item.id)).toEqual(["run-1"]);
+    const scoped = await gateway.threadsOverview({ projectId: "missing", includeArchived: false, runningLimit: 10 });
+    expect(scoped).toMatchObject({ total: 0, runningCount: 0 });
+  });
 });

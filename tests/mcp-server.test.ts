@@ -55,6 +55,7 @@ describe("MCP tool contract", () => {
       "t3_thread_messages",
       "t3_thread_send",
       "t3_threads_list",
+      "t3_threads_overview",
     ]);
     expect(names).not.toContain("t3_call_rpc");
     expect(names).not.toContain("t3_terminal_write");
@@ -84,6 +85,16 @@ describe("MCP tool contract", () => {
     const found = await client.callTool({ name: "t3_threads_list", arguments: { query: "LOGIN", status: "open", projectId: "voice-project" } });
     expect(found.isError).not.toBe(true);
     expect(found.structuredContent).toMatchObject({ page: { total: 1, items: [{ id: "voice-thread", status: "open" }] } });
+    const runningOnly = await client.callTool({ name: "t3_threads_list", arguments: { onlyRunning: true } });
+    expect(runningOnly.isError).not.toBe(true);
+    expect(runningOnly.structuredContent).toMatchObject({ page: { total: 1, items: [{ id: "voice-thread", isRunning: true }] } });
+    const overview = await client.callTool({ name: "t3_threads_overview", arguments: {} });
+    expect(overview.isError).not.toBe(true);
+    expect(overview.structuredContent).toMatchObject({
+      total: 2,
+      counts: { open: 1, settled: 1 },
+      runningCount: 1,
+    });
     const stopped = await client.callTool({ name: "t3_thread_interrupt", arguments: {
       threadId: "voice-thread", expectedTurnId: "voice-turn", idempotencyKey: "voice-stop",
     } });
