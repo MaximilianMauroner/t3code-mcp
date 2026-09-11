@@ -1,19 +1,21 @@
 # t3-code-mcp
 
-Use GPTVoice tool calls to work with T3 Code hands-free while on the go, especially from a phone. The goal is to ask what an agent is doing, give it a task, hear the result, and respond when it needs input without opening the T3 interface.
+An MCP gateway that lets MCP clients interact with T3 Code agents: find projects and threads, start tasks, check progress, retrieve results, and respond to requests for input.
 
-This repository provides the MCP gateway for that workflow. GPTVoice handles listening, conversation, tool calls, and spoken responses. The gateway connects those tool calls to one configured T3 Code environment, where projects, threads, agent sessions, workspaces, and execution live.
+It connects to one configured T3 Code environment and supports local stdio and remote Streamable HTTP connections for desktop assistants, hosted clients, and custom integrations.
+
+The original idea was to pair it with GPTVoice's tool calls to start tasks and get agent updates by voice while on the go.
 
 ```mermaid
 flowchart LR
-    User[You on your phone] <-->|Voice| Voice[GPTVoice]
-    Voice <-->|MCP tool calls through a reachable endpoint or tunnel| Gateway[t3-code-mcp]
+    User[You] <--> Client[Any compatible MCP client]
+    Client <-->|MCP over stdio or Streamable HTTP| Gateway[t3-code-mcp]
     Gateway <-->|Authenticated HTTP| T3[T3 Code and its coding agents]
 ```
 
-## The intended voice workflow
+## Example workflow
 
-| What you say | Tools the voice client uses |
+| Request | Tools the client uses |
 | --- | --- |
 | “Find my website project.” | `t3_projects_list` with `query` |
 | “What about the threads?” | `t3_threads_overview` for counts plus running threads |
@@ -29,9 +31,9 @@ flowchart LR
 | “Follow up and ask it to run the tests.” | `t3_thread_send` on the existing idle thread |
 | “Archive that thread.” | `t3_thread_archive` |
 
-The client should resolve project and thread names to IDs, keep those IDs and returned run handles in conversation context, and speak short summaries. It should ask for clarification when a name or action is ambiguous. These are client responsibilities; the gateway returns structured results and does not generate speech or manage conversation context.
+The client should resolve project and thread names to IDs, keep those IDs and returned run handles in conversation context, and present concise summaries. It should ask for clarification when a name or action is ambiguous. These are client responsibilities; the gateway returns structured results and does not manage the client interface or conversation context.
 
-A task can keep running in T3 after the phone disconnects. To check it later, the client calls the same gateway with the saved `runId`. If that handle is unavailable, it can still find the thread and read its latest state and messages. The gateway has no run-list tool.
+A task can keep running in T3 after the client disconnects. To check it later, the client calls the same gateway with the saved `runId`. If that handle is unavailable, it can still find the thread and read its latest state and messages. The gateway has no run-list tool.
 
 ## Find and check on existing work
 
@@ -66,32 +68,37 @@ The gateway uses T3’s authenticated HTTP orchestration API. The recorded integ
 - Stateless Streamable HTTP at `/mcp`, plus stdio for clients that launch a local process.
 - A `setup` command that renders host systemd/tunnel files from explicit flags without secrets, and a read-only `doctor` command for the gateway-to-client chain.
 
-The automated tests exercise the gateway and MCP boundary. They do not establish that the complete GPTVoice phone experience works. That acceptance check still needs to be performed with the intended voice client and its tool connection.
+The automated tests exercise the gateway and MCP boundary. Verify the complete integration with your chosen MCP client using the connection check below.
 
-## Connect GPTVoice
+## Connect an MCP client
 
-Run the gateway on an always-available machine that can reach T3. Configure the voice client's MCP connection, or its tool backend, to reach the gateway. A localhost URL on the gateway machine is not reachable from a phone or a hosted tool runner; use the tunnel deployment below or another authenticated, reachable route.
+Run the gateway on a machine that can reach T3, then choose the connection your client supports:
 
-For a direct Streamable HTTP connection, use `/mcp` and the header `Authorization: Bearer <MCP_BEARER_TOKEN>`. The included tunnel launcher supplies this header on the local gateway connection. Client-side connection setup depends on GPTVoice's supported tool integration; this repository does not contain a GPTVoice app, client adapter, or setup UI. Tool-call support alone does not establish compatibility with this MCP transport and authentication scheme.
+| Setup | How to connect |
+| --- | --- |
+| Local MCP client | Launch `node dist/cli.js serve` with `MCP_TRANSPORT=stdio` and the required T3 environment variables. |
+| Remote MCP client | Run with `MCP_TRANSPORT=http` and connect to a reachable `/mcp` endpoint using `Authorization: Bearer <MCP_BEARER_TOKEN>`. |
+
+The gateway can run alongside T3 or on another machine that can reach its HTTP API. For remote access, use the included tunnel deployment or an authenticated route through your own network or HTTPS reverse proxy. A localhost URL on the gateway machine is not reachable from a remote client or hosted tool runner. The included tunnel launcher supplies the bearer header on the local gateway connection.
+
+Configure the connection in your MCP client's settings. The client must support the selected transport and, for direct HTTP connections, bearer authentication; custom tool backends can provide an adapter where needed.
 
 For the first end-to-end check:
 
-1. Start the gateway with `MCP_READ_ONLY=true` and connect the voice client.
-2. Ask it to report connection status, list projects, and summarize an existing thread. Confirm that it uses tool results from the intended environment.
+1. Start the gateway with `MCP_READ_ONLY=true` and connect the MCP client.
+2. Request connection status, list projects, and summarize an existing thread. Confirm that the results come from the intended environment.
 3. Set `MCP_READ_ONLY=false` and restart when ready to exercise control tools. The T3 token also needs `orchestration:operate`.
-4. Ask it to create a disposable thread, start a small task, report progress, and read back the result.
-5. Disconnect and reconnect the voice client, then inspect the same thread or saved run handle. Check interruption and pending-action responses when applicable.
+4. Create a disposable thread, start a small task, check progress, and retrieve the result.
+5. Disconnect and reconnect the client, then inspect the same thread or saved run handle. Check interruption and pending-action responses when applicable.
 
-Success means completing that loop by voice on the phone, with clear spoken feedback about accepted work, completion, requests for input, and connection failures.
+Verify that the client clearly reports accepted work, completion, requests for input, and connection failures.
 
-## Official OpenAI documentation
+## Integration references
 
-- [Realtime with tools](https://developers.openai.com/api/docs/guides/realtime-mcp): function tools, remote MCP configuration, approvals, and the event flow needed to continue a voice response after tools finish.
-- [Getting started with the Realtime API](https://developers.openai.com/api/docs/guides/realtime): building speech-to-speech clients and choosing a connection transport.
 - [MCP and Connectors](https://developers.openai.com/api/docs/guides/tools-connectors-mcp): connecting remote MCP servers through the Responses API, including tool filtering and authorization.
-- [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels): tunnel setup, runtime credentials, workspace associations, and connecting supported OpenAI products to a private MCP server.
+- [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels): the optional tunnel deployment used below.
 
-These describe the OpenAI integration options. The gateway itself does not call the Realtime or Responses API. GPTVoice's use of those options and the complete phone workflow must be verified in the target client.
+These references describe OpenAI-specific integration options. Other MCP clients can connect using the transports above; consult your client's documentation for its configuration format.
 
 ## Run the gateway
 
@@ -104,7 +111,7 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` and set `T3_ACCESS_TOKEN` and a separate random `MCP_BEARER_TOKEN`. For the remote voice workflow, set `MCP_TRANSPORT=http`; use `MCP_READ_ONLY=true` for the initial connection check. Start with:
+Edit `.env` and set `T3_ACCESS_TOKEN` and a separate random `MCP_BEARER_TOKEN`. For a remote MCP connection, set `MCP_TRANSPORT=http`; use `MCP_READ_ONLY=true` for the initial connection check. Start with:
 
 ```sh
 node --env-file=.env dist/cli.js serve
@@ -135,7 +142,7 @@ A mutation can return `accepted`, `rejected`, or `uncertain`. Accepted means T3 
 
 Preserve `T3_MCP_DATA_DIR` across gateway restarts. Run one gateway process per journal directory; the JSON journal is not a shared database for multiple active gateway processes. Reconnecting MCP clients use that same gateway and journal.
 
-`t3_run_wait` polls for a relevant change, with a tool timeout parameter of 1–30 seconds. It can return before completion, and a T3 request can extend the elapsed wait. Timing out or losing the client connection does not cancel the T3 run. The client must call again for further updates; there are no push notifications or background spoken alerts.
+`t3_run_wait` polls for a relevant change, with a tool timeout parameter of 1–30 seconds. It can return before completion, and a T3 request can extend the elapsed wait. Timing out or losing the client connection does not cancel the T3 run. The client must call again for further updates; there are no push notifications.
 
 ## Current limits
 
@@ -147,7 +154,7 @@ There are no terminal tools, managed command jobs, direct file/Git inspection to
 
 ## Auto-start on Linux
 
-The gateway supports two remote routes: the included [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) option, and any MCP host that can launch a local process (stdio) or reach authenticated Streamable HTTP at `/mcp`. The tunnel is one deployment choice; general MCP-host compatibility is separate and depends on the client's supported tool integration.
+Deployment options include the provided [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) option, and any MCP host that can launch a local process (stdio) or reach authenticated Streamable HTTP at `/mcp`. The tunnel is one deployment choice; general MCP-host compatibility is separate and depends on the client's supported tool integration.
 
 Render host-specific units with `setup` instead of editing committed paths. `deploy/systemd/*` are templates with placeholder IDs and paths:
 
@@ -200,7 +207,7 @@ node --env-file=.env dist/cli.js smoke
 node --env-file=.env dist/cli.js spike
 ```
 
-`doctor` checks config, journal writability, T3 identity/scopes/expiry, effective access, freshness, build fingerprint, MCP discovery, a harmless overview call, and tunnel readiness without mutation. `smoke` calls status plus the bounded overview path the voice client uses and validates highlight/excerpt bounds. After every interface deployment, run `smoke`, restart gateway then tunnel, force fresh client discovery, compare the discovered `toolSchemaFingerprint`, and invoke status plus overview from the actual voice client ("What's running and does anything need me?").
+`doctor` checks config, journal writability, T3 identity/scopes/expiry, effective access, freshness, build fingerprint, MCP discovery, a harmless overview call, and tunnel readiness without mutation. `smoke` calls status plus the bounded overview path MCP clients use and validates highlight/excerpt bounds. After every interface deployment, run `smoke`, restart gateway then tunnel, force fresh client discovery, compare the discovered `toolSchemaFingerprint`, and invoke status plus overview from your MCP client ("What's running and does anything need me?").
 
 `spike` also lists up to five projects. Its optional mutation path requires `T3_SPIKE_ENABLE_MUTATIONS=true`, `T3_SPIKE_CONFIRM=I_UNDERSTAND`, `T3_SPIKE_PROJECT_ID`, and `T3_SPIKE_PROMPT`. Optional `T3_SPIKE_THREAD_TITLE` and `T3_SPIKE_IDEMPOTENCY_KEY` customize the thread title and retry-key prefix. This path creates a thread and submits a prompt; it does not archive the thread afterward.
 
@@ -212,4 +219,4 @@ T3_LIVE_PROJECT_ID='remote-project-id' \
 pnpm test:live
 ```
 
-Set `T3_LIVE_HTTP_BASE_URL` and `T3_LIVE_ENVIRONMENT_ID` for another environment. If no project ID is supplied, the test uses the first listed project. `test:live` sets `T3_LIVE_TESTS=1`; the test still skips without a token. This verifies the T3 integration, while the phone acceptance workflow above verifies the product goal.
+Set `T3_LIVE_HTTP_BASE_URL` and `T3_LIVE_ENVIRONMENT_ID` for another environment. If no project ID is supplied, the test uses the first listed project. `test:live` sets `T3_LIVE_TESTS=1`; the test still skips without a token. This verifies the T3 integration, while the client connection check above verifies the complete workflow.
