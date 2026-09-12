@@ -486,7 +486,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_connection_status",
     {
       title: "T3 connection status",
-      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. Compare toolSchemaFingerprint after every deployment; rediscover tools when it changes.",
+      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. toolSchemaFingerprint changes when the tool set or output shapes change, which makes cached tool definitions stale.",
       inputSchema: {},
       outputSchema: connectionStatusOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -565,7 +565,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_threads_list",
     {
       title: "List T3 threads",
-      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters lifecycle (open/snoozed/settled/archived); use activity/onlyRunning/sessionStatus for execution, never overload status with running. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page; full transcripts need t3_thread_messages.",
+      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters lifecycle (open/snoozed/settled/archived) only; activity/onlyRunning/sessionStatus filter execution, and running is not a lifecycle value. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page and excludes full transcripts, which come from t3_thread_messages.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
@@ -607,7 +607,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_providers_list",
     {
       title: "List T3 provider options",
-      description: "Read-only discovery of model selections observed in this environment: distinct instanceId/provider/model labels, per-project defaults, and thread usage. Use before t3_thread_create when a project has no default model.",
+      description: "Read-only discovery of model selections observed in this environment: distinct instanceId/provider/model labels, per-project defaults, and thread usage. These are the selections valid for new threads in projects without a default model.",
       inputSchema: {},
       outputSchema: providersListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -620,7 +620,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Create a T3 thread",
       description:
-        "Create a thread in an existing T3 project. Call t3_providers_list first when the project has no default model. Returns the T3-accepted modelSelection, branch, and worktree; check the mutation status for acceptance.",
+        "Create a thread in an existing T3 project. modelSelection is required when the project has no default model. Returns the T3-accepted modelSelection, branch, and worktree, plus a mutation status for acceptance.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -672,7 +672,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Send a T3 thread message",
       description:
-        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads return thread_busy with the active turn/session and valid next actions. Uncertain results return the durable operation handle: reconcile with t3_run_get, never resubmit with a fresh key. Never reuse an idempotencyKey for different input.",
+        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads return thread_busy with the active turn/session and valid next actions. Uncertain results carry a durable operation handle for status lookup. Each idempotencyKey maps to one input.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         message: z.string().min(1).max(120_000),
@@ -731,7 +731,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_thread_interrupt",
     {
       title: "Interrupt work in an existing T3 thread",
-      description: "Request stopping the active turn in a thread, including one started outside this gateway. Read the thread first and supply observedTarget.turnId as expectedTurnId. Returns acceptance plus post-dispatch verification (interrupted/still_running/target_changed/not_running/inconsistent/unknown). Acceptance alone never confirms a stop; poll t3_thread_get. Stale observations return turn_changed/thread_not_running. T3 interrupts by provider session without an atomic turn condition.",
+      description: "Request stopping the active turn in a thread, including one started outside this gateway. expectedTurnId is the observedTarget.turnId from a current thread read. Returns acceptance plus post-dispatch verification (interrupted/still_running/target_changed/not_running/inconsistent/unknown). Acceptance records dispatch and is not a confirmed stop. Stale observations return turn_changed/thread_not_running. T3 interrupts by provider session without an atomic turn condition.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         expectedTurnId: z.string().trim().min(1),
@@ -821,7 +821,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Settle a T3 thread",
       description:
-        "Mark a thread done. Clears snooze and pin. Blocked while the thread is running, has a pending approval, or has a queued turn start; interrupt or respond first.",
+        "Mark a thread done. Clears snooze and pin. Blocked while the thread is running, has a pending approval, or has a queued turn start.",
       inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
       outputSchema: threadSettleOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
