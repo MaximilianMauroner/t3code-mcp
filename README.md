@@ -11,14 +11,14 @@ flowchart LR
     User[You] <--> Client[Any compatible MCP client]
     Client <-->|MCP over stdio or Streamable HTTP| Gateway[t3-code-mcp]
     Gateway <-->|Authenticated HTTP| T3[T3 Code and its coding agents]
-    Gateway -->|Read-only Git status and diff| Workspace[T3-selected workspace]
+    Gateway -->|Read-only Git status and revision comparison| Workspace[T3-selected workspace]
 ```
 
 ## What you can do
 
 - Find projects and threads, inspect progress, and retrieve agent responses.
-- Inspect structured Git status and bounded staged or unstaged diffs in T3-selected workspaces.
-- Create threads, start tasks, respond to input requests, and interrupt work.
+- Inspect structured Git status, bounded uncommitted diffs, and committed base-to-head comparisons in T3-selected workspaces.
+- Start recoverable one-call tasks, find them after reconnecting, respond to input requests, and interrupt work.
 - Snooze, settle, reopen, and archive threads.
 - Connect through local stdio or authenticated Streamable HTTP.
 
@@ -26,7 +26,7 @@ The gateway uses T3's authenticated HTTP orchestration API. The recorded integra
 
 ## Security
 
-**Write access lets a client control your T3 coding agent with that agent's machine permissions.** New threads default to `full-access`, and the client can answer approval requests without independent human verification. Read-only access still exposes thread content and project information.
+**Write access lets a client control your T3 coding agent with that agent's machine permissions.** Low-level new threads default to `full-access`; the composite task-start tool requires the caller to choose a runtime mode explicitly. The client can answer approval requests without independent human verification. Read-only access still exposes thread content and project information.
 
 Start with `MCP_READ_ONLY=true`, connect only trusted clients, and review the [security and access risks](docs/security.md) before enabling remote access or control tools.
 

@@ -25,8 +25,8 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function git(cwd: string, ...args: string[]): Promise<void> {
-  await execute("git", args, { cwd });
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  return (await execute("git", args, { cwd })).stdout;
 }
 
 async function connect(fake: FakeT3): Promise<Client> {
@@ -99,6 +99,36 @@ describe("Git MCP tools", () => {
       truncation: { truncated: false },
     });
     expect((diff.structuredContent as { patch: string }).patch).toContain("thread worktree change");
+  });
+
+  it("returns committed base-to-head changes through the bounded compare tool", async () => {
+    const repository = await mkdtemp(join(tmpdir(), "t3-git-compare-"));
+    directories.push(repository);
+    await git(repository, "init", "-b", "main");
+    await git(repository, "config", "user.name", "T3 Test");
+    await git(repository, "config", "user.email", "t3@example.test");
+    await writeFile(join(repository, "file.txt"), "initial\n");
+    await git(repository, "add", ".");
+    await git(repository, "commit", "-m", "initial");
+    const base = (await git(repository, "rev-parse", "HEAD")).trim();
+    await writeFile(join(repository, "file.txt"), "committed\n");
+    await git(repository, "commit", "-am", "change");
+
+    const fake = new FakeT3();
+    fake.addProject({ id: "project-compare", workspaceRoot: repository });
+    const client = await connect(fake);
+    const result = await client.callTool({
+      name: "t3_git_compare",
+      arguments: { projectId: "project-compare", baseRevision: base, headRevision: "HEAD" },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      comparison: { requestedBase: base, requestedHead: "HEAD" },
+      attribution: { quality: "clean_baseline" },
+      truncation: { truncated: false },
+    });
+    expect((result.structuredContent as { patch: string }).patch).toContain("+committed");
   });
 
   it("rejects relative, missing, non-Git, and mismatched T3 workspace identities", async () => {

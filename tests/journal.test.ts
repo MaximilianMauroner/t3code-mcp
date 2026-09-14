@@ -98,7 +98,7 @@ describe("OperationJournal", () => {
 
     expect(record).toMatchObject({ status: "accepted", t3Sequence: 42 });
     expect(statMode.mode & 0o777).toBe(0o600);
-    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 1, operations: expect.any(Array) });
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 2, operations: expect.any(Array), tasks: expect.any(Array) });
   });
 
   it("fails closed on malformed or structurally invalid journals", async () => {
@@ -108,6 +108,45 @@ describe("OperationJournal", () => {
     await writeFile(path, JSON.stringify({ operations: [{ status: "accepted" }] }));
 
     await expect(new OperationJournal(path).init()).rejects.toThrow("invalid operation");
+
+    await writeFile(path, JSON.stringify({
+      version: 2,
+      operations: [],
+      tasks: [{
+        taskRef: "task-bad",
+        idempotencyKey: "bad",
+        payloadHash: "hash",
+        projectId: "project",
+        title: "bad",
+        runtimeMode: "approval-required",
+        threadIdempotencyKey: "bad:thread",
+        runIdempotencyKey: "bad:turn",
+        stage: "prepared",
+        threadId: 42,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }],
+    }));
+    await expect(new OperationJournal(path).init()).rejects.toThrow("invalid task");
+  });
+
+  it("loads a version-one operation journal and upgrades it when a task is added", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "t3-code-mcp-journal-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "operations.json");
+    await writeFile(path, JSON.stringify({ version: 1, operations: [] }));
+    const journal = new OperationJournal(path);
+
+    const task = await journal.beginTask({
+      idempotencyKey: "legacy-upgrade",
+      payloadHash: hashPayload({ instruction: "not persisted" }),
+      projectId: "project-1",
+      title: "Legacy upgrade",
+      runtimeMode: "approval-required",
+    });
+
+    expect(task.record.taskRef).toMatch(/^task_/);
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 2, tasks: [{ title: "Legacy upgrade" }] });
   });
 
   it("rejects an idempotency key reused across operation kinds", async () => {

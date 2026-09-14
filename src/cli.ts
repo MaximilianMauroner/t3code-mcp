@@ -44,7 +44,8 @@ async function main(): Promise<void> {
       return;
     }
     case "doctor": {
-      const result = await runDoctor(gateway, config);
+      const hostToolNames = parseHostToolNames(process.env.MCP_HOST_TOOL_NAMES_JSON);
+      const result = await runDoctor(gateway, config, { ...(hostToolNames === undefined ? {} : { hostToolNames }) });
       console.log(JSON.stringify(result, null, 2));
       if (!result.ok) process.exitCode = 1;
       return;
@@ -101,6 +102,15 @@ async function main(): Promise<void> {
     default:
       throw new Error(`Unknown command ${command}. Use serve, status, doctor, smoke, spike, or setup.`);
   }
+}
+
+function parseHostToolNames(raw: string | undefined): ReadonlyArray<string> | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string" || value.trim() === "")) {
+    throw new Error("MCP_HOST_TOOL_NAMES_JSON must be a JSON array of non-empty tool names captured from the actual host.");
+  }
+  return parsed;
 }
 
 main().catch((error: unknown) => {

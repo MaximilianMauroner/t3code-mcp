@@ -1,8 +1,10 @@
 import { access, constants, stat } from "node:fs/promises";
 import type { GatewayConfig } from "./config.js";
-import { toolSchemaFingerprint } from "./contract.js";
+import { TOOL_NAMES, toolSchemaFingerprint } from "./contract.js";
 import type { T3Gateway } from "./gateway.js";
 import { createMcpServer } from "./mcp/server.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 export interface DoctorCheck {
   readonly name: string;
@@ -13,6 +15,20 @@ export interface DoctorCheck {
 export interface DoctorResult {
   readonly ok: boolean;
   readonly checks: ReadonlyArray<DoctorCheck>;
+  readonly manifest: CapabilityManifest | null;
+}
+
+export interface CapabilityManifest {
+  readonly gatewayVersion: string;
+  readonly gatewayCommit: string;
+  readonly toolSchemaFingerprint: string;
+  readonly declaredOperations: ReadonlyArray<string>;
+  readonly locallyDiscoveredOperations: ReadonlyArray<string>;
+  readonly callableOperations: ReadonlyArray<string>;
+  readonly disabledOperations: ReadonlyArray<{ readonly operation: string; readonly reasonCode: string }>;
+  readonly effectiveAccessMode: "read-only" | "read-write";
+  readonly upstreamScopes: ReadonlyArray<string>;
+  readonly hostDiscoveredOperations: ReadonlyArray<string> | null;
 }
 
 async function canWrite(dir: string): Promise<boolean> {
@@ -27,9 +43,10 @@ async function canWrite(dir: string): Promise<boolean> {
 export async function runDoctor(
   gateway: T3Gateway,
   config: GatewayConfig,
-  options: { readonly tunnelHealthUrl?: string } = {},
+  options: { readonly tunnelHealthUrl?: string; readonly hostToolNames?: ReadonlyArray<string> } = {},
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
+  let manifest: CapabilityManifest | null = null;
   checks.push({
     name: "config",
     ok: true,
@@ -83,6 +100,18 @@ export async function runDoctor(
       detail: `version=${status.gatewayVersion} commit=${status.gatewayCommit} fingerprint=${status.toolSchemaFingerprint}`,
     });
     fingerprintOk = status.toolSchemaFingerprint === toolSchemaFingerprint();
+    manifest = {
+      gatewayVersion: status.gatewayVersion,
+      gatewayCommit: status.gatewayCommit,
+      toolSchemaFingerprint: status.toolSchemaFingerprint,
+      declaredOperations: [...TOOL_NAMES],
+      locallyDiscoveredOperations: [],
+      callableOperations: [...status.callableOperations],
+      disabledOperations: status.disabledOperations.map(({ operation, reasonCode }) => ({ operation, reasonCode })),
+      effectiveAccessMode: status.effectiveAccessMode,
+      upstreamScopes: [...status.upstreamScopes],
+      hostDiscoveredOperations: options.hostToolNames ? [...options.hostToolNames].sort() : null,
+    };
     void fingerprintOk;
   } catch (error) {
     checks.push({
@@ -93,20 +122,40 @@ export async function runDoctor(
   }
 
   try {
-    // MCP discovery without mutation: construct the server and verify the contract.
+    // MCP discovery without mutation: exercise a real tools/list exchange against this build.
     const server = createMcpServer(gateway);
-    void server;
-    const { TOOL_NAMES } = await import("./contract.js");
+    const client = new Client({ name: "t3-code-mcp-doctor", version: "1.0.0" }, { capabilities: {} });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const discovered = (await client.listTools()).tools.map((tool) => tool.name).sort();
+    await client.close();
+    await server.close();
+    const expected = [...TOOL_NAMES].sort();
+    const localMatch = JSON.stringify(discovered) === JSON.stringify(expected);
+    if (manifest) manifest = { ...manifest, locallyDiscoveredOperations: discovered };
     checks.push({
       name: "mcp_discovery",
-      ok: true,
-      detail: `tools=${TOOL_NAMES.length} fingerprint=${toolSchemaFingerprint()}`,
+      ok: localMatch,
+      detail: `declared=${expected.length} discovered=${discovered.length} fingerprint=${toolSchemaFingerprint()}`,
     });
   } catch (error) {
     checks.push({
       name: "mcp_discovery",
       ok: false,
       detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (options.hostToolNames) {
+    const expected = [...TOOL_NAMES].sort();
+    const observed = [...new Set(options.hostToolNames)].sort();
+    const missing = expected.filter((name) => !observed.includes(name));
+    const unexpected = observed.filter((name) => !expected.includes(name as (typeof TOOL_NAMES)[number]));
+    checks.push({
+      name: "host_discovery",
+      ok: missing.length === 0 && unexpected.length === 0,
+      detail: `observed=${observed.length} missing=[${missing.join(",")}] unexpected=[${unexpected.join(",")}]`,
     });
   }
 
@@ -143,5 +192,5 @@ export async function runDoctor(
   }
 
   const ok = checks.filter((c) => c.name !== "tunnel").every((c) => c.ok);
-  return { ok, checks };
+  return { ok, checks, manifest };
 }

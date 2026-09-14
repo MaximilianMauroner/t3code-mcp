@@ -132,6 +132,40 @@ describe("GitInspector", () => {
     expect(await readFile(join(directory, "tracked.txt"))).toEqual(trackedBefore);
   });
 
+  it("compares resolved commits and reports dirty-worktree attribution separately", async () => {
+    const directory = await repository();
+    const base = (await git(directory, "rev-parse", "HEAD")).trim();
+    await writeFile(join(directory, "tracked.txt"), "committed change\n");
+    await git(directory, "commit", "-am", "committed change");
+    const head = (await git(directory, "rev-parse", "HEAD")).trim();
+    const inspector = new GitInspector();
+
+    const clean = await inspector.compare(selection(directory), base, "HEAD", ["tracked.txt"], 100_000);
+    expect(clean.comparison).toEqual({ requestedBase: base, requestedHead: "HEAD", baseCommit: base, headCommit: head });
+    expect(clean.patch).toContain("+committed change");
+    expect(clean.attribution.quality).toBe("clean_baseline");
+
+    await writeFile(join(directory, "tracked.txt"), `${"large committed line\n".repeat(5_000)}`);
+    await git(directory, "commit", "-am", "large commit");
+    const truncated = await inspector.compare(selection(directory), base, "HEAD", [], 1_024);
+    expect(truncated.truncation).toMatchObject({
+      truncated: true,
+      reason: "byte_limit",
+      capturedBytes: 1_024,
+      omittedBytes: expect.any(Number),
+    });
+
+    await writeFile(join(directory, "untracked.txt"), "not committed\n");
+    const dirty = await inspector.compare(selection(directory), base, head, [], 100_000);
+    expect(dirty.attribution.quality).toBe("working_tree_dirty");
+    expect(dirty.patch).not.toContain("not committed");
+
+    for (const revision of ["--output=x", "HEAD..main", "HEAD value", "missing-ref"] as const) {
+      await expect(inspector.compare(selection(directory), revision, "HEAD", [], 100_000))
+        .rejects.toMatchObject({ code: revision === "missing-ref" ? "git_revision_not_found" : "invalid_git_revision" });
+    }
+  });
+
   it("reports exact status and diff truncation metadata", async () => {
     const directory = await repository();
     for (let index = 0; index < 8; index += 1) {

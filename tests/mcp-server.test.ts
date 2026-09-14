@@ -41,6 +41,7 @@ describe("MCP tool contract", () => {
 
     expect(names).toEqual([
       "t3_connection_status",
+      "t3_git_compare",
       "t3_git_diff",
       "t3_git_status",
       "t3_pending_action_respond",
@@ -48,9 +49,13 @@ describe("MCP tool contract", () => {
       "t3_project_create",
       "t3_projects_list",
       "t3_providers_list",
+      "t3_result_get",
       "t3_run_get",
       "t3_run_interrupt",
       "t3_run_wait",
+      "t3_task_get",
+      "t3_task_start",
+      "t3_tasks_list",
       "t3_thread_archive",
       "t3_thread_create",
       "t3_thread_get",
@@ -80,6 +85,34 @@ describe("MCP tool contract", () => {
       page: { items: [{ id: "project-mcp", title: "MCP project" }] },
     });
     expect(result.content).toBeTruthy();
+  });
+
+  it("starts and recovers a composite task through MCP", async () => {
+    const { fake, client } = await connectedClient();
+    fake.addProject({ id: "project-task-mcp", title: "Task MCP project" });
+    const started = await client.callTool({
+      name: "t3_task_start",
+      arguments: {
+        projectId: "project-task-mcp",
+        title: "MCP task",
+        instruction: "Report status only.",
+        runtimeMode: "approval-required",
+        idempotencyKey: "mcp-task-key",
+      },
+    });
+    expect(started.isError).not.toBe(true);
+    expect(started.structuredContent).toMatchObject({ stage: "run_accepted", title: "MCP task" });
+    const taskRef = (started.structuredContent as { taskRef: string }).taskRef;
+    const recovered = await client.callTool({ name: "t3_task_get", arguments: { taskRef } });
+    expect(recovered.isError).not.toBe(true);
+    expect(recovered.structuredContent).toMatchObject({ task: { taskRef, run: { runStatus: "running" } } });
+    const result = await client.callTool({ name: "t3_result_get", arguments: { taskRef } });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      task: { taskRef },
+      evidence: { taskStateSource: "t3_observed", git: null },
+      limitations: [expect.stringContaining("baseline")],
+    });
   });
 
   it("finds open threads and interrupts the observed external turn through MCP", async () => {

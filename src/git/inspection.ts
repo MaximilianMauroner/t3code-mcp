@@ -99,6 +99,25 @@ export interface GitDiffResult {
   };
 }
 
+export interface GitCompareResult {
+  readonly environmentId: string;
+  readonly observedAt: string;
+  readonly workspace: GitWorkspaceIdentity;
+  readonly comparison: {
+    readonly requestedBase: string;
+    readonly requestedHead: string;
+    readonly baseCommit: string;
+    readonly headCommit: string;
+  };
+  readonly paths: ReadonlyArray<string>;
+  readonly patch: string;
+  readonly attribution: {
+    readonly quality: "clean_baseline" | "working_tree_dirty";
+    readonly detail: string;
+  };
+  readonly truncation: GitDiffResult["truncation"];
+}
+
 export class GitInspectionError extends Error {
   override readonly name = "GitInspectionError";
 
@@ -262,6 +281,64 @@ export class GitInspector {
     };
   }
 
+  async compare(
+    selection: GitWorkspaceSelection,
+    baseRevision: string,
+    headRevision: string,
+    paths: ReadonlyArray<string>,
+    maxBytes: number,
+  ): Promise<GitCompareResult> {
+    const workspace = await this.identifyWorkspace(selection);
+    for (const candidate of paths) validatePathFilter(candidate);
+    validateRevision(baseRevision);
+    validateRevision(headRevision);
+    const baseCommit = await resolveCommit(workspace.resolvedPath, baseRevision);
+    const headCommit = await resolveCommit(workspace.resolvedPath, headRevision);
+    const dirty = await hasWorkingTreeChanges(workspace.resolvedPath);
+    const chunks: Buffer[] = [];
+    let capturedBytes = 0;
+    let totalBytes = 0;
+    await runGit(workspace.resolvedPath, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--find-renames",
+      "--find-copies",
+      baseCommit,
+      headCommit,
+      ...(paths.length > 0 ? ["--", ...paths] : []),
+    ], (chunk) => {
+      totalBytes += chunk.length;
+      const remaining = maxBytes - capturedBytes;
+      if (remaining > 0) {
+        const captured = chunk.subarray(0, remaining);
+        chunks.push(captured);
+        capturedBytes += captured.length;
+      }
+    });
+    const truncated = totalBytes > capturedBytes;
+    return {
+      environmentId: selection.environmentId,
+      observedAt: new Date().toISOString(),
+      workspace,
+      comparison: { requestedBase: baseRevision, requestedHead: headRevision, baseCommit, headCommit },
+      paths: [...paths],
+      patch: Buffer.concat(chunks).toString("utf8"),
+      attribution: dirty
+        ? { quality: "working_tree_dirty", detail: "The committed comparison is exact, but uncommitted workspace changes require separate status/diff inspection and cannot be attributed to this task automatically." }
+        : { quality: "clean_baseline", detail: "The working tree was clean when this comparison was observed." },
+      truncation: {
+        truncated,
+        reason: truncated ? "byte_limit" : null,
+        maxBytes,
+        capturedBytes,
+        totalBytes,
+        omittedBytes: totalBytes - capturedBytes,
+      },
+    };
+  }
+
   private async identifyWorkspace(selection: GitWorkspaceSelection): Promise<GitWorkspaceIdentity> {
     let resolvedPath: string;
     try {
@@ -304,6 +381,39 @@ export class GitInspector {
     const [repositoryRoot, gitDirectory, gitCommonDirectory] = lines as [string, string, string];
     return { ...selection, resolvedPath, repositoryRoot, gitDirectory, gitCommonDirectory };
   }
+}
+
+function validateRevision(revision: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/@{}~^:+-]{0,199}$/.test(revision) || revision.includes("..")) {
+    throw new GitInspectionError("invalid_git_revision", "Git revisions must be explicit names or object IDs without ranges, whitespace, or option-like prefixes.");
+  }
+}
+
+async function resolveCommit(workspace: string, revision: string): Promise<string> {
+  let output = "";
+  try {
+    await runGit(workspace, ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`], (chunk) => {
+      output += chunk.toString("utf8");
+    });
+  } catch (error) {
+    if (error instanceof GitInspectionError && error.code === "git_command_failed") {
+      throw new GitInspectionError("git_revision_not_found", `Git revision ${JSON.stringify(revision)} does not resolve to a commit in the selected workspace.`);
+    }
+    throw error;
+  }
+  const commit = output.trim();
+  if (!/^[0-9a-f]{40,64}$/i.test(commit)) {
+    throw new GitInspectionError("git_revision_invalid", `Git returned an invalid commit identity for revision ${JSON.stringify(revision)}.`);
+  }
+  return commit;
+}
+
+async function hasWorkingTreeChanges(workspace: string): Promise<boolean> {
+  let outputBytes = 0;
+  await runGit(workspace, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], (chunk) => {
+    outputBytes += chunk.length;
+  });
+  return outputBytes > 0;
 }
 
 function category<T>(items: T[], count: number): GitCategory<T> {

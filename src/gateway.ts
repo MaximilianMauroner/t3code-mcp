@@ -30,6 +30,8 @@ import {
   hashPayload,
   type OperationKind,
   type OperationRecord,
+  type TaskRecord,
+  type TaskStage,
 } from "./operations/journal.js";
 import {
   type InteractionMode,
@@ -62,6 +64,7 @@ import {
   GitInspector,
   type GitDiffMode,
   type GitDiffResult,
+  type GitCompareResult,
   type GitStatusResult,
   type GitWorkspaceSelection,
 } from "./git/inspection.js";
@@ -162,6 +165,21 @@ export interface ThreadSummary {
   readonly updatedAt: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
+  readonly failure: FailureInfo | null;
+}
+
+export type FailureCategory = "quota" | "rate_limit" | "auth_billing" | "provider_internal" | "unknown";
+
+export interface FailureInfo {
+  readonly category: FailureCategory;
+  readonly code: string | null;
+  readonly message: string;
+  readonly provider: string | null;
+  readonly model: string;
+  readonly turnId: string | null;
+  readonly resetAt: string | null;
+  readonly retryAfter: string | null;
+  readonly source: "t3_session";
 }
 
 export interface OverviewHighlight extends ThreadSummary {
@@ -282,6 +300,7 @@ export interface RunResult {
   };
   readonly timedOut?: boolean;
   readonly error?: string;
+  readonly failure: FailureInfo | null;
 }
 
 export interface PendingActionsResult {
@@ -458,6 +477,72 @@ export interface GitDiffInput extends GitTargetInput {
   readonly maxBytes: number;
 }
 
+export interface GitCompareInput extends GitTargetInput {
+  readonly baseRevision: string;
+  readonly headRevision: string;
+  readonly paths: ReadonlyArray<string>;
+  readonly maxBytes: number;
+}
+
+export interface TaskStartInput extends MutationCommonInput {
+  readonly projectId: string;
+  readonly title: string;
+  readonly instruction: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly modelSelection?: ModelSelection;
+  readonly interactionMode?: InteractionMode;
+  readonly branch?: string | null;
+  readonly worktreePath?: string | null;
+}
+
+export interface TaskSummary {
+  readonly taskRef: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly stage: TaskStage;
+  readonly threadId: string | null;
+  readonly runId: string | null;
+  readonly messageId: string | null;
+  readonly threadOperationId: string | null;
+  readonly runOperationId: string | null;
+  readonly baselineRevision: string | null;
+  readonly baselineAttribution: "clean" | "dirty" | "unavailable";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly nextAction: string;
+  readonly lastError: string | null;
+}
+
+export interface TaskDetail extends TaskSummary {
+  readonly thread: ThreadDetail | null;
+  readonly run: RunResult | null;
+}
+
+export interface TasksListResult {
+  readonly environmentId: string;
+  readonly observedAt: string;
+  readonly page: Page<TaskSummary>;
+}
+
+export interface ResultPackage {
+  readonly environmentId: string;
+  readonly observedAt: string;
+  readonly task: TaskDetail;
+  readonly evidence: {
+    readonly taskStateSource: "t3_observed" | "gateway_journal";
+    readonly git: {
+      readonly source: "git_observed";
+      readonly baselineRevision: string;
+      readonly status: GitStatusResult;
+      readonly committed: GitCompareResult;
+      readonly staged: GitDiffResult;
+      readonly unstaged: GitDiffResult;
+    } | null;
+  };
+  readonly limitations: ReadonlyArray<string>;
+}
+
 const GATEWAY_OPERATIONS: ReadonlyArray<string> = [...TOOL_NAMES];
 
 const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
@@ -472,6 +557,7 @@ const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
   "t3_thread_unsnooze",
   "t3_thread_settle",
   "t3_thread_unsettle",
+  "t3_task_start",
 ]);
 
 export class GatewayError extends Error {
@@ -591,6 +677,172 @@ export class T3Gateway {
     } catch (error) {
       throw asGatewayGitError(error);
     }
+  }
+
+  async gitCompare(input: GitCompareInput): Promise<GitCompareResult> {
+    const selection = await this.resolveGitWorkspace(input);
+    try {
+      return await this.gitInspector.compare(
+        selection,
+        input.baseRevision,
+        input.headRevision,
+        input.paths,
+        input.maxBytes,
+      );
+    } catch (error) {
+      throw asGatewayGitError(error);
+    }
+  }
+
+  async taskStart(input: TaskStartInput): Promise<TaskDetail> {
+    await this.requireOperationScope();
+    const payloadHash = hashPayload({
+      projectId: input.projectId,
+      title: input.title,
+      instruction: input.instruction,
+      runtimeMode: input.runtimeMode,
+      modelSelection: input.modelSelection ?? null,
+      interactionMode: input.interactionMode ?? "default",
+      branch: input.branch ?? null,
+      worktreePath: input.worktreePath ?? null,
+    });
+    let task = (await this.journal.beginTask({
+      idempotencyKey: input.idempotencyKey,
+      payloadHash,
+      projectId: input.projectId,
+      title: input.title,
+      runtimeMode: input.runtimeMode,
+    })).record;
+
+    try {
+      const created = await this.threadCreate({
+        projectId: input.projectId,
+        title: input.title,
+        modelSelection: input.modelSelection,
+        runtimeMode: input.runtimeMode,
+        interactionMode: input.interactionMode,
+        branch: input.branch,
+        worktreePath: input.worktreePath,
+        idempotencyKey: task.threadIdempotencyKey,
+      });
+      task = await this.journal.updateTask(task.taskRef, {
+        threadId: created.threadId,
+        threadOperationId: created.operationId,
+        stage: created.status === "accepted"
+          ? "thread_created"
+          : created.status === "uncertain"
+            ? "thread_create_uncertain"
+            : "rejected",
+        lastError: created.status === "accepted" ? null : created.reason,
+      });
+      if (created.status !== "accepted") return this.taskDetail(task, false);
+
+      if (task.baselineAttribution === undefined) {
+        try {
+          const status = await this.gitStatus({ projectId: input.projectId, threadId: created.threadId, maxEntries: 1 });
+          task = await this.journal.updateTask(task.taskRef, {
+            baselineAttribution: status.clean ? "clean" : "dirty",
+            ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
+          });
+        } catch {
+          task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
+        }
+      }
+
+      const sent = await this.threadSend({
+        threadId: created.threadId,
+        message: input.instruction,
+        modelSelection: input.modelSelection,
+        runtimeMode: input.runtimeMode,
+        interactionMode: input.interactionMode,
+        titleSeed: input.title,
+        idempotencyKey: task.runIdempotencyKey,
+      });
+      task = await this.journal.updateTask(task.taskRef, {
+        runId: sent.runId,
+        messageId: sent.messageId,
+        runOperationId: sent.operationId,
+        stage: sent.status === "accepted"
+          ? "run_accepted"
+          : sent.status === "uncertain"
+            ? "dispatch_uncertain"
+            : "dispatch_rejected",
+        lastError: sent.status === "accepted" ? null : sent.reason,
+      });
+      return this.taskDetail(task, false);
+    } catch (error) {
+      if (error instanceof GatewayError && ["project_not_found", "model_selection_required", "thread_busy"].includes(error.code)) {
+        task = await this.journal.updateTask(task.taskRef, { stage: "rejected", lastError: error.message });
+        return this.taskDetail(task, false);
+      }
+      throw error;
+    }
+  }
+
+  async taskGet(taskRef: string): Promise<{ readonly environmentId: string; readonly observedAt: string; readonly task: TaskDetail }> {
+    const record = await this.journal.getTaskByRef(taskRef);
+    if (!record) throw new GatewayError("task_not_found", `Task ${taskRef} was not found in the gateway journal.`);
+    return {
+      environmentId: await this.knownEnvironmentId(),
+      observedAt: new Date().toISOString(),
+      task: await this.taskDetail(record),
+    };
+  }
+
+  async tasksList(input: { readonly projectId?: string; readonly query?: string; readonly cursor?: string; readonly limit: number }): Promise<TasksListResult> {
+    const records = await this.journal.listTasks();
+    const filtered = records
+      .filter((task) => input.projectId === undefined || task.projectId === input.projectId)
+      .filter((task) => matchesQuery(input.query, task.title, task.taskRef, task.threadId))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.taskRef.localeCompare(b.taskRef));
+    const recordPage = paginate(filtered, input.cursor, input.limit);
+    const summaries = await Promise.all(recordPage.items.map((task) => this.taskSummary(task)));
+    return {
+      environmentId: await this.knownEnvironmentId(),
+      observedAt: new Date().toISOString(),
+      page: { ...recordPage, items: summaries },
+    };
+  }
+
+  async resultGet(input: { readonly taskRef: string; readonly paths: ReadonlyArray<string>; readonly maxBytes: number }): Promise<ResultPackage> {
+    const { task } = await this.taskGet(input.taskRef);
+    const observedAt = new Date().toISOString();
+    const limitations: string[] = [];
+    let git: ResultPackage["evidence"]["git"] = null;
+    if (task.threadId === null) {
+      limitations.push("The task has no proven T3 thread, so workspace evidence is unavailable.");
+    } else if (task.baselineRevision === null) {
+      limitations.push("The gateway could not capture a Git baseline after T3 accepted the workspace.");
+    } else {
+      try {
+        const target = { projectId: task.projectId, threadId: task.threadId };
+        const [status, committed, staged, unstaged] = await Promise.all([
+          this.gitStatus({ ...target, maxEntries: 100 }),
+          this.gitCompare({ ...target, baseRevision: task.baselineRevision, headRevision: "HEAD", paths: input.paths, maxBytes: input.maxBytes }),
+          this.gitDiff({ ...target, mode: "staged", paths: input.paths, maxBytes: input.maxBytes }),
+          this.gitDiff({ ...target, mode: "unstaged", paths: input.paths, maxBytes: input.maxBytes }),
+        ]);
+        git = { source: "git_observed", baselineRevision: task.baselineRevision, status, committed, staged, unstaged };
+        if (task.baselineAttribution !== "clean") {
+          limitations.push("The captured baseline workspace was not clean, so task attribution is incomplete.");
+        }
+        if (!status.clean) {
+          limitations.push("The current workspace has uncommitted or untracked changes; inspect staged, unstaged, and status evidence separately.");
+        }
+      } catch (error) {
+        limitations.push(`Git evidence is unavailable: ${safeErrorMessage(error)}`);
+      }
+    }
+    if (task.run?.latestResponse) {
+      limitations.push("The assistant response is agent-reported output; it is not independent command verification.");
+    }
+    return {
+      environmentId: await this.knownEnvironmentId(),
+      observedAt,
+      task,
+      evidence: { taskStateSource: task.thread === null ? "gateway_journal" : "t3_observed", git },
+      limitations,
+    };
   }
 
   async threadsList(input: {
@@ -916,6 +1168,22 @@ export class T3Gateway {
     }
     await this.requireOperationScope();
     const snapshot = await this.client.getThread(input.threadId);
+    // Another caller with the same idempotency key may have created the
+    // operation while this caller was fetching the thread. Recheck before
+    // treating the winner's newly-started turn as unrelated busy work.
+    const concurrent = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (concurrent) {
+      const begun = await this.journal.begin({
+        kind: "thread.turn.start",
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: hashPayload(payload),
+        projectId: concurrent.projectId ?? snapshot.thread.projectId,
+        threadId: input.threadId,
+        runId: concurrent.runId ?? `run_${randomUUID()}`,
+        messageId: concurrent.messageId ?? `user:msg_${randomUUID().replaceAll("-", "")}`,
+      });
+      return this.threadSendResult(await this.reconcile(begun.record));
+    }
     if (threadIsBusy(snapshot.thread)) {
       const now = Date.now();
       const observation = observeThread(snapshot.thread, now);
@@ -1672,6 +1940,7 @@ export class T3Gateway {
         threadQuality: observation.quality,
         threadWarning: observation.warning,
         latestResponse: latestAssistant(thread.messages, turnId),
+        failure: runStatus === "failed" ? failureInfo(thread, turnId) : null,
         pendingActions: {
           approvals: thread.hasPendingApprovals ?? false,
           userInput: thread.hasPendingUserInput ?? false,
@@ -1696,6 +1965,7 @@ export class T3Gateway {
         threadQuality: null,
         threadWarning: null,
         latestResponse: null,
+        failure: null,
         pendingActions: { approvals: false, userInput: false },
         error: safeErrorMessage(error),
       };
@@ -1788,7 +2058,7 @@ export class T3Gateway {
       try {
         const snapshot = await this.client.getThread(summary.id);
         const latest = latestAssistant(snapshot.thread.messages, snapshot.thread.latestTurn?.turnId ?? null)
-          ?? latestAssistant(snapshot.thread.messages, null);
+          ?? (summary.failure === null ? latestAssistant(snapshot.thread.messages, null, true) : null);
         const excerpt = latest ? truncateExcerpt(latest.text, excerptChars) : null;
         results.push({ ...summary, latestResponseExcerpt: excerpt });
       } catch {
@@ -1902,6 +2172,117 @@ export class T3Gateway {
       providerTurnId: null,
       nextAction: "Use t3_run_get or t3_run_wait.",
     };
+  }
+
+  private async taskSummary(record: TaskRecord, shouldReconcile = true): Promise<TaskSummary> {
+    const storedThreadOperation = await this.journal.getByIdempotencyKey(record.threadIdempotencyKey);
+    const storedRunOperation = await this.journal.getByIdempotencyKey(record.runIdempotencyKey);
+    const threadOperation = shouldReconcile && storedThreadOperation && (storedThreadOperation.status === "prepared" || storedThreadOperation.status === "uncertain")
+      ? await this.reconcile(storedThreadOperation)
+      : storedThreadOperation;
+    const runOperation = shouldReconcile && storedRunOperation && (storedRunOperation.status === "prepared" || storedRunOperation.status === "uncertain")
+      ? await this.reconcile(storedRunOperation)
+      : storedRunOperation;
+    const stage = taskStageFromOperations(record.stage, threadOperation, runOperation);
+    const threadId = record.threadId ?? threadOperation?.threadId ?? null;
+    const runId = record.runId ?? runOperation?.runId ?? null;
+    const messageId = record.messageId ?? runOperation?.messageId ?? null;
+    const threadOperationId = record.threadOperationId ?? threadOperation?.operationId ?? null;
+    const runOperationId = record.runOperationId ?? runOperation?.operationId ?? null;
+    const lastError = stage === "run_accepted" || stage === "thread_created"
+      ? null
+      : record.lastError ?? runOperation?.lastError ?? threadOperation?.lastError ?? null;
+    let current = record;
+    if (shouldReconcile && (
+      stage !== record.stage ||
+      (threadId !== null && record.threadId !== threadId) ||
+      (runId !== null && record.runId !== runId) ||
+      (messageId !== null && record.messageId !== messageId) ||
+      (threadOperationId !== null && record.threadOperationId !== threadOperationId) ||
+      (runOperationId !== null && record.runOperationId !== runOperationId) ||
+      (record.lastError ?? null) !== lastError
+    )) {
+      current = await this.journal.updateTask(record.taskRef, {
+        stage,
+        ...(threadId === null ? {} : { threadId }),
+        ...(runId === null ? {} : { runId }),
+        ...(messageId === null ? {} : { messageId }),
+        ...(threadOperationId === null ? {} : { threadOperationId }),
+        ...(runOperationId === null ? {} : { runOperationId }),
+        lastError,
+      });
+    }
+    return {
+      taskRef: current.taskRef,
+      projectId: current.projectId,
+      title: current.title,
+      runtimeMode: current.runtimeMode,
+      stage,
+      threadId,
+      runId,
+      messageId,
+      threadOperationId,
+      runOperationId,
+      baselineRevision: current.baselineRevision ?? null,
+      baselineAttribution: current.baselineAttribution ?? "unavailable",
+      createdAt: current.createdAt,
+      updatedAt: current.updatedAt,
+      nextAction: taskNextAction(stage, current.taskRef),
+      lastError,
+    };
+  }
+
+  private async taskDetail(record: TaskRecord, shouldReconcile = true): Promise<TaskDetail> {
+    const summary = await this.taskSummary(record, shouldReconcile);
+    let thread: ThreadDetail | null = null;
+    let run: RunResult | null = null;
+    if (summary.threadId !== null) {
+      try {
+        thread = (await this.threadGet(summary.threadId)).thread;
+      } catch {
+        // Composite state remains useful while T3 is disconnected or creation is uncertain.
+      }
+    }
+    if (summary.runId !== null) {
+      try {
+        run = await this.runGet(summary.runId);
+      } catch {
+        // The child operation may not yet be durable enough to observe as a run.
+      }
+    }
+    return { ...summary, thread, run };
+  }
+}
+
+function taskStageFromOperations(
+  fallback: TaskStage,
+  threadOperation: OperationRecord | null,
+  runOperation: OperationRecord | null,
+): TaskStage {
+  if (runOperation?.status === "accepted") return "run_accepted";
+  if (runOperation?.status === "uncertain" || runOperation?.status === "prepared") return "dispatch_uncertain";
+  if (runOperation?.status === "rejected") return "dispatch_rejected";
+  if (threadOperation?.status === "accepted") return "thread_created";
+  if (threadOperation?.status === "uncertain" || threadOperation?.status === "prepared") return "thread_create_uncertain";
+  if (threadOperation?.status === "rejected") return "rejected";
+  return fallback;
+}
+
+function taskNextAction(stage: TaskStage, taskRef: string): string {
+  switch (stage) {
+    case "run_accepted":
+      return `Use t3_task_get with taskRef ${taskRef} to inspect current work.`;
+    case "thread_created":
+      return "Retry t3_task_start with the same idempotency key and identical original input to dispatch the initial instruction.";
+    case "dispatch_rejected":
+      return "The initial dispatch was definitively rejected. Inspect the thread, correct the cause, then use t3_thread_send with a new idempotency key or start a replacement task.";
+    case "thread_create_uncertain":
+    case "dispatch_uncertain":
+      return `Use t3_task_get with taskRef ${taskRef} to reconcile; do not start a replacement task.`;
+    case "prepared":
+      return "Retry t3_task_start with the same idempotency key and identical original input.";
+    case "rejected":
+      return "Correct the reported input or permission problem, then start a new task with a new idempotency key.";
   }
 }
 
@@ -2131,6 +2512,7 @@ function threadSummary(
     updatedAt: thread.updatedAt ?? null,
     hasPendingApprovals: thread.hasPendingApprovals ?? false,
     hasPendingUserInput: thread.hasPendingUserInput ?? false,
+    failure: observation.execution === "failed" ? failureInfo(thread) : null,
   };
 }
 
@@ -2145,7 +2527,13 @@ function threadDetail(
   return {
     ...threadSummary(source, projectTitle, environmentId, now),
     // Latest response is bounded to the observed turn; full history needs t3_thread_messages.
-    latestResponse: latestAssistant(thread.messages, thread.latestTurn?.turnId ?? null),
+    latestResponse: latestAssistant(
+      thread.messages,
+      thread.latestTurn?.turnId ?? null,
+      thread.latestTurn === null || thread.latestTurn === undefined
+        ? asRecord(thread.session)?.status !== "error"
+        : false,
+    ),
     messageCount: thread.messages.length,
     activityCount: thread.activities.length,
     checkpointCount: thread.checkpoints.length,
@@ -2153,11 +2541,61 @@ function threadDetail(
   };
 }
 
-function latestAssistant(messages: ReadonlyArray<Message>, turnId: string | null): Message | null {
+function latestAssistant(
+  messages: ReadonlyArray<Message>,
+  turnId: string | null,
+  allowUnboundFallback = false,
+): Message | null {
+  if (turnId === null) {
+    return allowUnboundFallback ? messages.filter((message) => message.role === "assistant").at(-1) ?? null : null;
+  }
   const candidates = messages.filter(
-    (message) => message.role === "assistant" && (turnId === null || message.turnId === turnId),
+    (message) => message.role === "assistant" && message.turnId === turnId,
   );
   return candidates.at(-1) ?? null;
+}
+
+function failureInfo(thread: ThreadShell, expectedTurnId?: string | null): FailureInfo | null {
+  const session = asRecord(thread.session);
+  const failed = session?.status === "error" || thread.latestTurn?.state === "error";
+  if (!failed) return null;
+  const sourceTurnId = typeof session?.activeTurnId === "string"
+    ? session.activeTurnId
+    : thread.latestTurn?.turnId ?? null;
+  if (expectedTurnId && sourceTurnId !== expectedTurnId) return null;
+  const rawMessage = typeof session?.lastError === "string" && session.lastError.trim().length > 0
+    ? session.lastError
+    : "T3 reported that the provider turn failed without an error message.";
+  const rawCategory = session?.failureCategory;
+  const category: FailureCategory = rawCategory === "quota" || rawCategory === "rate_limit" ||
+    rawCategory === "auth_billing" || rawCategory === "provider_internal"
+    ? rawCategory
+    : "unknown";
+  return {
+    category,
+    code: typeof session?.failureCode === "string" ? sanitizeFailureText(session.failureCode, 200) : null,
+    message: sanitizeFailureText(rawMessage, 2_000),
+    provider: typeof session?.providerName === "string"
+      ? sanitizeFailureText(session.providerName, 200)
+      : thread.modelSelection.provider ?? thread.modelSelection.instanceId ?? null,
+    model: thread.modelSelection.model,
+    turnId: sourceTurnId,
+    resetAt: typeof session?.resetAt === "string" && Number.isFinite(Date.parse(session.resetAt))
+      ? new Date(Date.parse(session.resetAt)).toISOString()
+      : null,
+    retryAfter: typeof session?.retryAfter === "string" || typeof session?.retryAfter === "number"
+      ? sanitizeFailureText(String(session.retryAfter), 200)
+      : null,
+    source: "t3_session",
+  };
+}
+
+function sanitizeFailureText(value: string, maxLength: number): string {
+  return value
+    .replace(/Bearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
+    .replace(/\b(api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .slice(0, maxLength);
 }
 
 function threadIsBusy(thread: Thread): boolean {

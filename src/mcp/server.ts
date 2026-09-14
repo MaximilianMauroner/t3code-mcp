@@ -7,7 +7,9 @@ import {
   T3Gateway,
   type PendingActionRespondInput,
   type GitDiffInput,
+  type GitCompareInput,
   type ProjectCreateInput,
+  type TaskStartInput,
   type ThreadCreateInput,
   type ThreadSendInput,
 } from "../gateway.js";
@@ -87,6 +89,18 @@ const observedTargetOutput = z
   })
   .passthrough();
 
+const failureOutput = z.object({
+  category: z.enum(["quota", "rate_limit", "auth_billing", "provider_internal", "unknown"]),
+  code: z.string().nullable(),
+  message: z.string(),
+  provider: z.string().nullable(),
+  model: z.string(),
+  turnId: z.string().nullable(),
+  resetAt: z.string().nullable(),
+  retryAfter: z.string().nullable(),
+  source: z.literal("t3_session"),
+}).passthrough();
+
 const threadSummaryOutput = z
   .object({
     id: z.string(),
@@ -124,6 +138,7 @@ const threadSummaryOutput = z
     updatedAt: z.string().nullable(),
     hasPendingApprovals: z.boolean(),
     hasPendingUserInput: z.boolean(),
+    failure: failureOutput.nullable(),
   })
   .passthrough();
 
@@ -286,6 +301,32 @@ const gitDiffOutputSchema = {
   }),
 };
 
+const gitCompareOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  workspace: gitWorkspaceOutput,
+  comparison: z.object({
+    requestedBase: z.string(),
+    requestedHead: z.string(),
+    baseCommit: z.string(),
+    headCommit: z.string(),
+  }),
+  paths: z.array(z.string()),
+  patch: z.string(),
+  attribution: z.object({
+    quality: z.enum(["clean_baseline", "working_tree_dirty"]),
+    detail: z.string(),
+  }),
+  truncation: z.object({
+    truncated: z.boolean(),
+    reason: z.enum(["byte_limit"]).nullable(),
+    maxBytes: z.number(),
+    capturedBytes: z.number(),
+    totalBytes: z.number(),
+    omittedBytes: z.number(),
+  }),
+};
+
 const projectCreateOutputSchema = {
   ...mutationResultShape,
   projectId: z.string(),
@@ -410,6 +451,76 @@ const runResultOutputSchema = {
     .passthrough(),
   timedOut: z.boolean().optional(),
   error: z.string().optional(),
+  failure: failureOutput.nullable(),
+};
+
+const taskStageOutput = z.enum([
+  "prepared",
+  "thread_create_uncertain",
+  "thread_created",
+  "dispatch_rejected",
+  "dispatch_uncertain",
+  "run_accepted",
+  "rejected",
+]);
+
+const taskSummaryOutput = z.object({
+  taskRef: z.string(),
+  projectId: z.string(),
+  title: z.string(),
+  runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]),
+  stage: taskStageOutput,
+  threadId: z.string().nullable(),
+  runId: z.string().nullable(),
+  messageId: z.string().nullable(),
+  threadOperationId: z.string().nullable(),
+  runOperationId: z.string().nullable(),
+  baselineRevision: z.string().nullable(),
+  baselineAttribution: z.enum(["clean", "dirty", "unavailable"]),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  nextAction: z.string(),
+  lastError: z.string().nullable(),
+}).passthrough();
+
+const taskDetailOutput = taskSummaryOutput.extend({
+  thread: threadDetailOutput.nullable(),
+  run: z.object(runResultOutputSchema).passthrough().nullable(),
+});
+
+const taskGetOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  task: taskDetailOutput,
+};
+
+const tasksListOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  page: z.object({
+    items: z.array(taskSummaryOutput),
+    nextCursor: z.string().nullable(),
+    hasMore: z.boolean(),
+    total: z.number(),
+  }).passthrough(),
+};
+
+const resultPackageOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  task: taskDetailOutput,
+  evidence: z.object({
+    taskStateSource: z.enum(["t3_observed", "gateway_journal"]),
+    git: z.object({
+      source: z.literal("git_observed"),
+      baselineRevision: z.string(),
+      status: z.object(gitStatusOutputSchema).passthrough(),
+      committed: z.object(gitCompareOutputSchema).passthrough(),
+      staged: z.object(gitDiffOutputSchema).passthrough(),
+      unstaged: z.object(gitDiffOutputSchema).passthrough(),
+    }).passthrough().nullable(),
+  }).passthrough(),
+  limitations: z.array(z.string()),
 };
 
 const threadInterruptOutputSchema = {
@@ -477,6 +588,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       instructions:
         "This gateway controls one configured remote T3 Code environment. T3 remains authoritative for projects, threads, messages, runs, and workspaces. Mutation tools return after T3 accepts command intent; poll a returned runId with t3_run_get or t3_run_wait. " +
+        "Prefer t3_task_start for a new assignment so creation and initial dispatch are recoverable; use t3_tasks_list/t3_task_get after reconnect and t3_result_get for task-bound review evidence. " +
         "Name-based resolution: zero results need a broader retry, one exact candidate may be selected, multiple candidates need clarification with project/title/branch/activity. " +
         "Interruptions are non-atomic: T3 interrupts by provider session, so always carry observedTarget (environmentId/threadId/turnId/observedAt) and verify with t3_thread_get.",
     },
@@ -562,6 +674,26 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
   );
 
   server.registerTool(
+    "t3_git_compare",
+    {
+      title: "Compare T3 workspace Git revisions",
+      description:
+        "Read a bounded committed patch between two explicit revisions in a T3-selected project workspace or thread worktree. Revisions are resolved to commit IDs before diffing; ranges and option-like values are rejected. Dirty workspace attribution is reported separately because uncommitted changes are not part of this comparison.",
+      inputSchema: {
+        projectId: z.string().trim().min(1),
+        threadId: z.string().trim().min(1).optional(),
+        baseRevision: z.string().trim().min(1).max(200),
+        headRevision: z.string().trim().min(1).max(200).default("HEAD"),
+        paths: z.array(z.string().min(1).max(4096)).max(100).default([]),
+        maxBytes: z.number().int().min(1_024).max(1_000_000).default(100_000),
+      },
+      outputSchema: gitCompareOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.gitCompare(args satisfies GitCompareInput)),
+  );
+
+  server.registerTool(
     "t3_threads_list",
     {
       title: "List T3 threads",
@@ -635,6 +767,77 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (args) => runTool(() => gateway.threadCreate(args satisfies ThreadCreateInput)),
+  );
+
+  server.registerTool(
+    "t3_task_start",
+    {
+      title: "Start a recoverable T3 task",
+      description:
+        "Create one T3 thread and dispatch its initial instruction as a recoverable composite operation. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never advances past uncertain thread creation and never stores the instruction text in its journal.",
+      inputSchema: {
+        projectId: z.string().trim().min(1),
+        title: z.string().trim().min(1).max(200),
+        instruction: z.string().min(1).max(120_000),
+        runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]),
+        modelSelection: modelSelection.optional(),
+        interactionMode: z.enum(["default", "plan"]).optional(),
+        branch: z.string().trim().min(1).nullable().optional(),
+        worktreePath: z.string().trim().min(1).nullable().optional(),
+        idempotencyKey,
+      },
+      outputSchema: taskDetailOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.taskStart(args satisfies TaskStartInput)),
+  );
+
+  server.registerTool(
+    "t3_task_get",
+    {
+      title: "Get a recoverable T3 task",
+      description:
+        "Find a journaled composite task by taskRef and enrich it with fresh T3 thread/run state when available. Partial or uncertain stages remain explicit and never trigger a replacement dispatch.",
+      inputSchema: { taskRef: z.string().trim().min(1) },
+      outputSchema: taskGetOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ taskRef }) => runTool(() => gateway.taskGet(taskRef)),
+  );
+
+  server.registerTool(
+    "t3_tasks_list",
+    {
+      title: "List recoverable T3 tasks",
+      description:
+        "List bounded task-start receipts stored by this gateway, optionally filtered by exact project or title/task/thread substring. Use t3_task_get for fresh thread and run detail.",
+      inputSchema: {
+        projectId: z.string().trim().min(1).optional(),
+        query,
+        cursor,
+        limit,
+      },
+      outputSchema: tasksListOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.tasksList(args)),
+  );
+
+  server.registerTool(
+    "t3_result_get",
+    {
+      title: "Get an inspectable T3 task result",
+      description:
+        "Compose one task's fresh T3 state with Git-observed committed, staged, unstaged, untracked, and conflict evidence from its captured baseline. Agent responses remain labeled by an explicit limitation and unavailable evidence is reported rather than inferred.",
+      inputSchema: {
+        taskRef: z.string().trim().min(1),
+        paths: z.array(z.string().min(1).max(4096)).max(100).default([]),
+        maxBytes: z.number().int().min(1_024).max(1_000_000).default(100_000),
+      },
+      outputSchema: resultPackageOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (args) => runTool(() => gateway.resultGet(args)),
   );
 
   server.registerTool(

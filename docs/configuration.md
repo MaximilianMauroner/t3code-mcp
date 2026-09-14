@@ -33,6 +33,7 @@ The default HTTP address is `http://127.0.0.1:8787/mcp`. `/healthz` reports that
 | `MCP_BEARER_TOKEN` | Required to serve authenticated `/mcp` requests over HTTP |
 | `MCP_READ_ONLY` | Reject mutations when `true`; code default is `false` |
 | `MCP_HOST`, `MCP_PORT` | HTTP listener; `127.0.0.1`, `8787` |
+| `MCP_HOST_TOOL_NAMES_JSON` | Optional `doctor`-only JSON array captured from the actual MCP host for end-to-end tool discovery comparison |
 | `T3_ENVIRONMENT_ID` | Optional expected environment ID for identity checks |
 | `T3_ENVIRONMENT_LABEL` | Optional fallback label when discovery is unavailable |
 | `T3_MCP_DATA_DIR` | Operation journal directory; `./data` |

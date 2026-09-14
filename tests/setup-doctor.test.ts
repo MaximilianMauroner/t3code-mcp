@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runDoctor } from "../src/doctor.js";
+import { TOOL_NAMES } from "../src/contract.js";
 import { parseSetupArgs, renderSetup } from "../src/setup.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
 import { FakeT3 } from "./support/fake-t3.js";
@@ -69,7 +70,32 @@ describe("read-only doctor", () => {
     expect(names).toEqual(expect.arrayContaining(["config", "journal", "t3_identity", "effective_access", "freshness", "build", "mcp_discovery", "overview_read", "tunnel"]));
     expect(result.checks.find((c) => c.name === "t3_identity")?.ok).toBe(true);
     expect(result.checks.find((c) => c.name === "overview_read")?.ok).toBe(true);
+    expect(result.manifest).toMatchObject({
+      declaredOperations: [...TOOL_NAMES],
+      locallyDiscoveredOperations: expect.arrayContaining([...TOOL_NAMES]),
+    });
     expect(fake.dispatches).toHaveLength(0);
+  });
+
+  it("compares a supplied actual-host discovery capture with the gateway contract", async () => {
+    const fake = new FakeT3();
+    fakes.push(fake);
+    await fake.start();
+    const fixture = await gatewayFixture(fake);
+    fixtures.push(fixture);
+    const observed = [...TOOL_NAMES].slice(0, -1);
+
+    const result = await runDoctor(fixture.gateway, fixture.config, {
+      tunnelHealthUrl: "http://127.0.0.1:1/readyz",
+      hostToolNames: observed,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.checks.find((check) => check.name === "host_discovery")).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining(TOOL_NAMES.at(-1)!),
+    });
+    expect(result.manifest?.hostDiscoveredOperations).toEqual([...observed].sort());
   });
 
   it("fails closed when T3 is unreachable", async () => {

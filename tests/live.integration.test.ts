@@ -41,39 +41,33 @@ liveDescribe("live T3 interface acceptance", () => {
       const projectId = process.env.T3_LIVE_PROJECT_ID?.trim() || projects.page.items[0]?.id;
       expect(projectId, "T3_LIVE_PROJECT_ID or at least one remote project is required").toBeTruthy();
 
-      const created = await first.gateway.threadCreate({
+      const task = await first.gateway.taskStart({
         projectId: projectId!,
         title: "t3-code-mcp live Spark acceptance",
+        instruction: "Run the smallest available project check and report only the result. Do not modify files.",
         modelSelection: {
           // Codex Pro provider in the installed T3 environment.
           instanceId: "codex_openai",
           model: "gpt-5.3-codex-spark",
         },
         runtimeMode: "approval-required",
-        idempotencyKey: `live-thread-${Date.now()}`,
+        idempotencyKey: `live-task-${Date.now()}`,
       });
-      expect(created.status).toBe("accepted");
-      threadId = created.threadId;
-
-      const run = await first.gateway.threadSend({
-        threadId,
-        message: "Run the smallest available project check and report only the result. Do not modify files.",
-        modelSelection: {
-          instanceId: "codex_openai",
-          model: "gpt-5.3-codex-spark",
-        },
-        runtimeMode: "approval-required",
-        idempotencyKey: `live-turn-${Date.now()}`,
-      });
-      expect(run.status).toBe("accepted");
-      expect(run.providerTurnId).toBeNull();
+      expect(task.stage).toBe("run_accepted");
+      expect(task.threadId).not.toBeNull();
+      expect(task.runId).not.toBeNull();
+      threadId = task.threadId;
 
       // This second gateway represents a different MCP host after the first has disconnected.
       const second = makeGateway(config);
-      let observed = await second.gateway.runGet(run.runId);
+      const listed = await second.gateway.tasksList({ query: "live Spark acceptance", limit: 10 });
+      expect(listed.page.items.map((item) => item.taskRef)).toContain(task.taskRef);
+      const recovered = await second.gateway.taskGet(task.taskRef);
+      expect(recovered.task).toMatchObject({ threadId: task.threadId, runId: task.runId });
+      let observed = recovered.task.run!;
       const deadline = Date.now() + 120_000;
       while (!isTerminal(observed.runStatus) && Date.now() < deadline) {
-        observed = await second.gateway.runWait(run.runId, 5);
+        observed = await second.gateway.runWait(task.runId!, 5);
       }
 
       expect(["completed", "awaiting_approval", "awaiting_input", "failed", "interrupted"]).toContain(observed.runStatus);
