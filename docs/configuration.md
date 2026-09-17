@@ -36,7 +36,7 @@ The default HTTP address is `http://127.0.0.1:8787/mcp`. `/healthz` reports that
 | `MCP_HOST_TOOL_NAMES_JSON` | Optional `doctor`-only JSON array captured from the actual MCP host for end-to-end tool discovery comparison |
 | `T3_ENVIRONMENT_ID` | Optional expected environment ID for identity checks |
 | `T3_ENVIRONMENT_LABEL` | Optional fallback label when discovery is unavailable |
-| `T3_MCP_DATA_DIR` | Operation journal directory; `./data` |
+| `T3_MCP_DATA_DIR` | Durable operation journal and redacted usage audit directory; `./data` (`operations.json` and `audit.jsonl`) |
 | `T3_STALE_AFTER_MS` | Freshness threshold; `30000` |
 
 ## Connect an MCP client
@@ -68,3 +68,11 @@ Verify that the client clearly reports accepted work, completion, requests for i
 - [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels): the optional [tunnel deployment](deployment.md).
 
 These references describe OpenAI-specific integration options. Other MCP clients can connect using the transports above; consult your client's documentation for its configuration format.
+
+## Review usage
+
+The gateway automatically appends structured usage events to `audit.jsonl` inside `T3_MCP_DATA_DIR`. The file is created with mode `600` and records MCP tool calls, HTTP/stdio transport activity, upstream T3 requests, Git commands, journal transitions, outcomes, and durations. Prompts, message text, patches, answers, and credentials are represented by redacted metadata rather than stored verbatim. The read-only `t3_audit_log` tool provides bounded filtering by time, source, event, operation, and outcome so a later agent can review the gateway's behavior through MCP, including when T3 is disconnected.
+
+The audit trail is best-effort: an unavailable audit filesystem does not block T3 work. Protect the data directory and apply a retention policy appropriate for the host; the file grows over time.
+
+For a compact tool-usage review, call `t3_audit_log` with `{ "source": "mcp", "event": "tool.call", "limit": 100 }`, then request later pages with the returned `nextCursor`. Use `source: "t3"` or `source: "git"` to inspect downstream work.

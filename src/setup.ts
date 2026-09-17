@@ -159,6 +159,7 @@ export async function renderSetup(options: SetupOptions): Promise<{ readonly fil
     `MCP_TRANSPORT=http`,
     `MCP_HOST=${options.host}`,
     `MCP_PORT=${options.port}`,
+    "# This directory also receives audit.jsonl, the append-only redacted usage trail.",
     `T3_MCP_DATA_DIR=${options.dataDir}`,
     "",
     "# OpenAI Secure MCP Tunnel runtime key. This is not an admin key.",

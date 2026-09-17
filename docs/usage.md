@@ -28,6 +28,7 @@
 | “Settle this thread.” / “Mark it done.” | `t3_thread_settle` |
 | “Reopen that thread.” | `t3_thread_unsettle` |
 | “Archive that thread.” | `t3_thread_archive` |
+| “Review how this gateway has been used.” | `t3_audit_log` with filters and pagination |
 
 The client should resolve project and thread names to IDs, keep those IDs and returned run handles in conversation context, and present concise summaries. It should ask for clarification when a name or action is ambiguous. These are client responsibilities; the gateway returns structured results and does not manage the client interface or conversation context.
 
@@ -85,6 +86,7 @@ The gateway uses T3’s authenticated HTTP orchestration API. The recorded integ
 - Task-bound result packages that compose T3 observations with Git-observed committed and uncommitted evidence and explicit provenance.
 - Starting agent turns with typed busy rejection, inspecting runs with shared observation quality, polling for changes, requesting interruption by gateway run handle or observed thread turn with post-dispatch verification, responding to approval or user-input requests, snoozing/settling threads, and archiving threads.
 - Connection status with gateway version/commit/fingerprint (`T3_CODE_MCP_COMMIT` plus package version), observation time, effective access mode with callable/disabled operations and stable reason codes (`gateway_read_only`/`t3_scope_required`), upstream T3 scopes, capabilities, freshness, and credential expiry. Doctor performs a real local MCP `tools/list` exchange and can compare a supplied actual-host capture. Run results also report connection, freshness, thread quality, and turn-bound failures.
+- `t3_audit_log` exposes a bounded, filtered view of the local redacted usage trail. It records the MCP/transport request, each upstream T3 request, each read-only Git subprocess, and durable journal transitions with correlation IDs, timing, outcome, and safe input/output summaries. Prompt, message, patch, answer, and credential values are never written verbatim.
 - A local operation journal for idempotency and reconciliation after uncertain dispatches.
 - Stateless Streamable HTTP at `/mcp`, plus stdio for clients that launch a local process.
 - A `setup` command that renders host systemd/tunnel files from explicit flags without secrets, and a read-only `doctor` command for the gateway-to-client chain.

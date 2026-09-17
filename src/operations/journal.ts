@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { summarizeForAudit, type AuditLog } from "./audit-log.js";
 
 export type OperationStatus = "prepared" | "accepted" | "uncertain" | "rejected";
 
@@ -98,7 +99,10 @@ export class OperationJournal {
   private initialized = false;
   private writing: Promise<void> = Promise.resolve();
 
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly auditLog?: AuditLog,
+  ) {}
 
   async init(): Promise<void> {
     if (this.initialized) {
@@ -138,7 +142,7 @@ export class OperationJournal {
     }
 
     const now = new Date().toISOString();
-    let recovered = false;
+    let recoveredCount = 0;
     for (const [key, entry] of this.entries) {
       if (entry.status === "prepared") {
         this.entries.set(key, {
@@ -147,13 +151,24 @@ export class OperationJournal {
           updatedAt: now,
           lastError: "The gateway stopped before the T3 command outcome was recorded.",
         });
-        recovered = true;
+        recoveredCount += 1;
       }
     }
     this.initialized = true;
-    if (recovered) {
+    if (recoveredCount > 0) {
       await this.persist();
     }
+    await this.auditLog?.record({
+      source: "journal",
+      event: "journal.initialized",
+      outcome: "completed",
+      details: {
+        filePath: this.filePath,
+        operationCount: this.entries.size,
+        taskCount: this.tasks.size,
+        recoveredPreparedOperations: recoveredCount,
+      },
+    });
   }
 
   async begin(input: BeginOperationInput): Promise<{ readonly record: OperationRecord; readonly reused: boolean }> {
@@ -165,6 +180,20 @@ export class OperationJournal {
           `Idempotency key ${input.idempotencyKey} was already used for a different operation.`,
         );
       }
+      await this.auditLog?.record({
+        source: "journal",
+        event: "operation.begin",
+        correlationId: existing.operationId,
+        operation: input.kind,
+        outcome: "reused",
+        details: {
+          operationId: existing.operationId,
+          commandId: existing.commandId,
+          idempotencyKey: input.idempotencyKey,
+          payloadHash: input.payloadHash,
+          status: existing.status,
+        },
+      });
       return { record: existing, reused: true };
     }
 
@@ -187,6 +216,21 @@ export class OperationJournal {
     };
     this.entries.set(input.idempotencyKey, record);
     await this.persist();
+    await this.auditLog?.record({
+      source: "journal",
+      event: "operation.begin",
+      correlationId: record.operationId,
+      operation: input.kind,
+      outcome: "prepared",
+      details: {
+        operationId: record.operationId,
+        commandId: record.commandId,
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: input.payloadHash,
+        projectId: input.projectId,
+        threadId: input.threadId,
+      },
+    });
     return { record, reused: false };
   }
 
@@ -199,6 +243,19 @@ export class OperationJournal {
           `Idempotency key ${input.idempotencyKey} was already used for a different task start.`,
         );
       }
+      await this.auditLog?.record({
+        source: "journal",
+        event: "task.begin",
+        correlationId: existing.taskRef,
+        operation: "task.start",
+        outcome: "reused",
+        details: {
+          taskRef: existing.taskRef,
+          idempotencyKey: input.idempotencyKey,
+          payloadHash: input.payloadHash,
+          stage: existing.stage,
+        },
+      });
       return { record: existing, reused: true };
     }
     const now = new Date().toISOString();
@@ -217,6 +274,21 @@ export class OperationJournal {
     };
     this.tasks.set(record.idempotencyKey, record);
     await this.persist();
+    await this.auditLog?.record({
+      source: "journal",
+      event: "task.begin",
+      correlationId: record.taskRef,
+      operation: "task.start",
+      outcome: "prepared",
+      details: {
+        taskRef: record.taskRef,
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: input.payloadHash,
+        projectId: input.projectId,
+        runtimeMode: input.runtimeMode,
+        stage: record.stage,
+      },
+    });
     return { record, reused: false };
   }
 
@@ -233,6 +305,18 @@ export class OperationJournal {
     const updated: TaskRecord = { ...entry, ...patch, updatedAt: new Date().toISOString() };
     this.tasks.set(updated.idempotencyKey, updated);
     await this.persist();
+    await this.auditLog?.record({
+      source: "journal",
+      event: "task.update",
+      correlationId: updated.taskRef,
+      operation: "task.start",
+      outcome: "completed",
+      details: {
+        taskRef: updated.taskRef,
+        stage: updated.stage,
+        patch: summarizeForAudit(patch),
+      },
+    });
     return updated;
   }
 
@@ -262,6 +346,18 @@ export class OperationJournal {
     };
     this.entries.set(updated.idempotencyKey, updated);
     await this.persist();
+    await this.auditLog?.record({
+      source: "journal",
+      event: "operation.update",
+      correlationId: updated.operationId,
+      operation: updated.kind,
+      outcome: updated.status,
+      details: {
+        operationId: updated.operationId,
+        status: updated.status,
+        patch: summarizeForAudit(patch),
+      },
+    });
     return updated;
   }
 

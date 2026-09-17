@@ -1,5 +1,6 @@
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
+import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { listenHttp } from "../src/mcp/transport.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
@@ -63,7 +64,7 @@ function mcpRequest(id: number, method: string, params: unknown): RequestInit {
 
 describe("Streamable HTTP gateway boundary", () => {
   it("keeps health and routing behavior separate from MCP authentication", async () => {
-    const { baseUrl } = await httpFixture();
+    const { baseUrl, fixture } = await httpFixture();
 
     const health = await request(baseUrl, "/healthz");
     const missing = await request(baseUrl, "/not-found");
@@ -78,6 +79,11 @@ describe("Streamable HTTP gateway boundary", () => {
     expect(unauthorized.status).toBe(401);
     expect(unauthorized.headers.get("www-authenticate")).toBe("Bearer");
     expect(await unauthorized.json()).toEqual({ error: "Unauthorized." });
+
+    const audit = await readFile(`${fixture.config.dataDir}/audit.jsonl`, "utf8");
+    expect(audit).toContain('"source":"transport"');
+    expect(audit).toContain('"authOutcome":"rejected"');
+    expect(audit).not.toContain("gateway-test-token");
   });
 
   it("supports independent stateless MCP clients and never returns T3 credentials", async () => {

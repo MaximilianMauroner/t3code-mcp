@@ -20,6 +20,7 @@ flowchart LR
 - Inspect structured Git status, bounded uncommitted diffs, and committed base-to-head comparisons in T3-selected workspaces.
 - Start recoverable one-call tasks, find them after reconnecting, respond to input requests, and interrupt work.
 - Snooze, settle, reopen, and archive threads.
+- Record redacted tool, transport, upstream, Git, and journal activity for later review through `t3_audit_log`.
 - Connect through local stdio or authenticated Streamable HTTP.
 
 The gateway uses T3's authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment. See [usage and tool behavior](docs/usage.md) for examples, supported tools, and current limits.
@@ -52,6 +53,8 @@ node --env-file=.env dist/cli.js serve
 Connect your MCP client to `http://127.0.0.1:8787/mcp` with `Authorization: Bearer <MCP_BEARER_TOKEN>`. This address is local to the gateway machine; remote clients need an authenticated tunnel or HTTPS proxy. For a local client that launches the process, use `MCP_TRANSPORT=stdio` instead.
 
 Request connection status, list projects, and read an existing thread to verify the connection. Follow the [configuration and client connection guide](docs/configuration.md) for all environment variables and the first write-enabled check.
+
+The gateway writes its append-only redacted usage trail to `audit.jsonl` in `T3_MCP_DATA_DIR`; a future agent can query the bounded history with `t3_audit_log`.
 
 ## Documentation
 

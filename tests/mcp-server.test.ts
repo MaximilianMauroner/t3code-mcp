@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
@@ -17,7 +18,7 @@ afterEach(async () => {
   await Promise.all(fakes.splice(0).map((fake) => fake.close()));
 });
 
-async function connectedClient(): Promise<{ readonly fake: FakeT3; readonly client: Client }> {
+async function connectedClient(): Promise<{ readonly fake: FakeT3; readonly client: Client; readonly fixture: GatewayFixture }> {
   const fake = new FakeT3();
   fakes.push(fake);
   await fake.start();
@@ -30,7 +31,7 @@ async function connectedClient(): Promise<{ readonly fake: FakeT3; readonly clie
   await client.connect(clientTransport);
   clients.push(client);
   servers.push(server);
-  return { fake, client };
+  return { fake, client, fixture };
 }
 
 describe("MCP tool contract", () => {
@@ -40,6 +41,7 @@ describe("MCP tool contract", () => {
     const names = result.tools.map((tool) => tool.name).sort();
 
     expect(names).toEqual([
+      "t3_audit_log",
       "t3_connection_status",
       "t3_git_compare",
       "t3_git_diff",
@@ -85,6 +87,47 @@ describe("MCP tool contract", () => {
       page: { items: [{ id: "project-mcp", title: "MCP project" }] },
     });
     expect(result.content).toBeTruthy();
+  });
+
+  it("records tool usage and exposes the bounded audit trail", async () => {
+    const { fake, client, fixture } = await connectedClient();
+    fake.addProject({ id: "project-audit", title: "Audit project" });
+    fake.addThread({ id: "thread-audit", projectId: "project-audit" });
+
+    const result = await client.callTool({
+      name: "t3_projects_list",
+      arguments: { query: "Audit", limit: 10 },
+    });
+    expect(result.isError).not.toBe(true);
+
+    const sent = await client.callTool({
+      name: "t3_thread_send",
+      arguments: {
+        threadId: "thread-audit",
+        message: "private audit prompt should not be persisted",
+        idempotencyKey: "audit-send",
+      },
+    });
+    expect(sent.isError).not.toBe(true);
+
+    const raw = await readFile(`${fixture.config.dataDir}/audit.jsonl`, "utf8");
+    expect(raw).toContain('"event":"tool.call"');
+    expect(raw).toContain('"operation":"t3_projects_list"');
+    expect(raw).toContain('"event":"upstream.request"');
+    expect(raw).not.toContain(fake.accessToken);
+    expect(raw).not.toContain("private audit prompt should not be persisted");
+
+    const reviewed = await client.callTool({
+      name: "t3_audit_log",
+      arguments: { source: "mcp", operation: "t3_projects_list", limit: 10 },
+    });
+    expect(reviewed.isError).not.toBe(true);
+    expect(reviewed.structuredContent).toMatchObject({
+      page: { total: 2, items: expect.arrayContaining([
+        expect.objectContaining({ event: "tool.call", operation: "t3_projects_list" }),
+        expect.objectContaining({ event: "tool.result", operation: "t3_projects_list" }),
+      ]) },
+    });
   });
 
   it("starts and recovers a composite task through MCP", async () => {

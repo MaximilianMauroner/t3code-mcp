@@ -10,7 +10,7 @@ pnpm test
 pnpm typecheck:test
 ```
 
-The default suite uses disposable local T3 fakes, disposable Git repositories/worktrees, and no real credentials. It covers the HTTP boundary, gateway operations, composite task concurrency/recovery, journal migration and idempotency, MCP schemas and errors, HTTP authentication, stateless clients, body limits, message truncation, stale state, turn-bound failure reporting, uncertain dispatch reconciliation, T3-grounded Git workspace selection, staged/unstaged and committed revision diffs, literal path/revision validation, explicit truncation, renames, binary changes, conflicts, and missing/non-Git paths.
+The default suite uses disposable local T3 fakes, disposable Git repositories/worktrees, and no real credentials. It covers the HTTP boundary, gateway operations, composite task concurrency/recovery, journal migration and idempotency, MCP schemas and errors, HTTP authentication, stateless clients, body limits, message truncation, stale state, turn-bound failure reporting, uncertain dispatch reconciliation, T3-grounded Git workspace selection, staged/unstaged and committed revision diffs, literal path/revision validation, explicit truncation, renames, binary changes, conflicts, missing/non-Git paths, and audit persistence/redaction/filtering.
 
 For a read-only connection diagnostic:
 

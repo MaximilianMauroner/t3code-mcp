@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { GATEWAY_VERSION } from "../contract.js";
+import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
 import {
   GatewayError,
   T3Gateway,
@@ -27,6 +29,8 @@ const idempotencyKey = z.string().trim().min(1).max(200);
 const query = z.string().trim().min(1).max(200).optional();
 const cursor = z.string().regex(/^\d+$/).optional();
 const limit = z.number().int().min(1).max(100).default(50);
+const auditFilter = z.string().trim().min(1).max(200).optional();
+const auditSource = z.enum(["transport", "mcp", "t3", "git", "journal", "system"]);
 
 const modelSelectionOutput = z
   .object({
@@ -199,6 +203,37 @@ const connectionStatusOutputSchema = {
   gatewayOperations: z.array(z.string()),
   sessionExpiresAt: z.string().nullable(),
   error: z.string().optional(),
+};
+
+const auditEventOutput = z
+  .object({
+    version: z.literal(1),
+    eventId: z.string(),
+    timestamp: z.string(),
+    processId: z.number().int(),
+    source: auditSource,
+    event: z.string(),
+    correlationId: z.string().optional(),
+    operation: z.string().optional(),
+    outcome: z.string().optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    details: z.record(z.string(), z.unknown()).optional(),
+  })
+  .passthrough();
+
+const auditLogOutputSchema = {
+  environmentId: z.string(),
+  observedAt: z.string(),
+  auditError: z.string().nullable(),
+  page: z
+    .object({
+      items: z.array(auditEventOutput),
+      nextCursor: z.string().nullable(),
+      hasMore: z.boolean(),
+      total: z.number().int().nonnegative(),
+      invalidLines: z.number().int().nonnegative(),
+    })
+    .passthrough(),
 };
 
 const projectsListOutputSchema = {
@@ -583,6 +618,7 @@ const threadSettleOutputSchema = {
 };
 
 export function createMcpServer(gateway: T3Gateway): McpServer {
+  const auditLog = gateway.audit;
   const server = new McpServer(
     { name: "t3-code-mcp", version: GATEWAY_VERSION },
     {
@@ -590,7 +626,8 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
         "This gateway controls one configured remote T3 Code environment. T3 remains authoritative for projects, threads, messages, runs, and workspaces. Mutation tools return after T3 accepts command intent; poll a returned runId with t3_run_get or t3_run_wait. " +
         "Prefer t3_task_start for a new assignment so creation and initial dispatch are recoverable; use t3_tasks_list/t3_task_get after reconnect and t3_result_get for task-bound review evidence. " +
         "Name-based resolution: zero results need a broader retry, one exact candidate may be selected, multiple candidates need clarification with project/title/branch/activity. " +
-        "Interruptions are non-atomic: T3 interrupts by provider session, so always carry observedTarget (environmentId/threadId/turnId/observedAt) and verify with t3_thread_get.",
+        "Interruptions are non-atomic: T3 interrupts by provider session, so always carry observedTarget (environmentId/threadId/turnId/observedAt) and verify with t3_thread_get. " +
+        "Usage is recorded in a local redacted audit trail; use t3_audit_log to inspect tool calls, upstream requests, Git commands, outcomes, and timings.",
     },
   );
 
@@ -603,7 +640,29 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: connectionStatusOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async () => runTool(() => gateway.connectionStatus()),
+    async () => runTool(auditLog, "t3_connection_status", {}, () => gateway.connectionStatus()),
+  );
+
+  server.registerTool(
+    "t3_audit_log",
+    {
+      title: "Review gateway usage audit log",
+      description:
+        "Read a bounded, filtered page of the gateway's local usage audit trail. It includes MCP calls, transport requests, upstream T3 requests, Git commands, and durable operation transitions with timings and outcomes. Prompts, message text, patches, answers, and credentials are represented by redacted metadata rather than their values.",
+      inputSchema: {
+        since: auditFilter,
+        until: auditFilter,
+        source: auditSource.optional(),
+        event: auditFilter,
+        operation: auditFilter,
+        outcome: auditFilter,
+        cursor,
+        limit,
+      },
+      outputSchema: auditLogOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (args) => runTool(auditLog, "t3_audit_log", args, () => gateway.auditQuery(args)),
   );
 
   server.registerTool(
@@ -615,7 +674,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: projectsListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.projectsList(args)),
+    async (args) => runTool(auditLog, "t3_projects_list", args, () => gateway.projectsList(args)),
   );
 
   server.registerTool(
@@ -634,7 +693,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: projectCreateOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.projectCreate(args satisfies ProjectCreateInput)),
+    async (args) => runTool(auditLog, "t3_project_create", args, () => gateway.projectCreate(args satisfies ProjectCreateInput)),
   );
 
   server.registerTool(
@@ -651,7 +710,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: gitStatusOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.gitStatus(args)),
+    async (args) => runTool(auditLog, "t3_git_status", args, () => gateway.gitStatus(args)),
   );
 
   server.registerTool(
@@ -670,7 +729,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: gitDiffOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.gitDiff(args satisfies GitDiffInput)),
+    async (args) => runTool(auditLog, "t3_git_diff", args, () => gateway.gitDiff(args satisfies GitDiffInput)),
   );
 
   server.registerTool(
@@ -690,7 +749,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: gitCompareOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.gitCompare(args satisfies GitCompareInput)),
+    async (args) => runTool(auditLog, "t3_git_compare", args, () => gateway.gitCompare(args satisfies GitCompareInput)),
   );
 
   server.registerTool(
@@ -715,7 +774,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadsListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadsList(args)),
+    async (args) => runTool(auditLog, "t3_threads_list", args, () => gateway.threadsList(args)),
   );
 
   server.registerTool(
@@ -732,7 +791,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadsOverviewOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadsOverview(args)),
+    async (args) => runTool(auditLog, "t3_threads_overview", args, () => gateway.threadsOverview(args)),
   );
 
   server.registerTool(
@@ -744,7 +803,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: providersListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async () => runTool(() => gateway.providersList()),
+    async () => runTool(auditLog, "t3_providers_list", {}, () => gateway.providersList()),
   );
 
   server.registerTool(
@@ -766,7 +825,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadCreateOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadCreate(args satisfies ThreadCreateInput)),
+    async (args) => runTool(auditLog, "t3_thread_create", args, () => gateway.threadCreate(args satisfies ThreadCreateInput)),
   );
 
   server.registerTool(
@@ -789,7 +848,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: taskDetailOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.taskStart(args satisfies TaskStartInput)),
+    async (args) => runTool(auditLog, "t3_task_start", args, () => gateway.taskStart(args satisfies TaskStartInput)),
   );
 
   server.registerTool(
@@ -802,7 +861,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: taskGetOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ taskRef }) => runTool(() => gateway.taskGet(taskRef)),
+    async (args) => runTool(auditLog, "t3_task_get", args, () => gateway.taskGet(args.taskRef)),
   );
 
   server.registerTool(
@@ -820,7 +879,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: tasksListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.tasksList(args)),
+    async (args) => runTool(auditLog, "t3_tasks_list", args, () => gateway.tasksList(args)),
   );
 
   server.registerTool(
@@ -837,7 +896,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: resultPackageOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.resultGet(args)),
+    async (args) => runTool(auditLog, "t3_result_get", args, () => gateway.resultGet(args)),
   );
 
   server.registerTool(
@@ -849,7 +908,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadGetOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ threadId }) => runTool(() => gateway.threadGet(threadId)),
+    async (args) => runTool(auditLog, "t3_thread_get", args, () => gateway.threadGet(args.threadId)),
   );
 
   server.registerTool(
@@ -866,8 +925,8 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadMessagesOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ threadId, cursor: messageCursor, limit: messageLimit, maxChars }) =>
-      runTool(() => gateway.threadMessages(threadId, { cursor: messageCursor, limit: messageLimit, maxChars })),
+    async (args) =>
+      runTool(auditLog, "t3_thread_messages", args, () => gateway.threadMessages(args.threadId, { cursor: args.cursor, limit: args.limit, maxChars: args.maxChars })),
   );
 
   server.registerTool(
@@ -888,7 +947,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadSendOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadSend(args satisfies ThreadSendInput)),
+    async (args) => runTool(auditLog, "t3_thread_send", args, () => gateway.threadSend(args satisfies ThreadSendInput)),
   );
 
   server.registerTool(
@@ -900,7 +959,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: runResultOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ runId }) => runTool(() => gateway.runGet(runId)),
+    async (args) => runTool(auditLog, "t3_run_get", args, () => gateway.runGet(args.runId)),
   );
 
   server.registerTool(
@@ -915,7 +974,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: runResultOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ runId, timeoutSeconds }) => runTool(() => gateway.runWait(runId, timeoutSeconds)),
+    async (args) => runTool(auditLog, "t3_run_wait", args, () => gateway.runWait(args.runId, args.timeoutSeconds)),
   );
 
   server.registerTool(
@@ -927,7 +986,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: mutationResultShape,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.runInterrupt(args)),
+    async (args) => runTool(auditLog, "t3_run_interrupt", args, () => gateway.runInterrupt(args)),
   );
 
   server.registerTool(
@@ -943,7 +1002,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadInterruptOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadInterrupt(args)),
+    async (args) => runTool(auditLog, "t3_thread_interrupt", args, () => gateway.threadInterrupt(args)),
   );
 
   server.registerTool(
@@ -955,7 +1014,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: pendingActionsListOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ threadId }) => runTool(() => gateway.pendingActionsList(threadId)),
+    async (args) => runTool(auditLog, "t3_pending_actions_list", args, () => gateway.pendingActionsList(args.threadId)),
   );
 
   server.registerTool(
@@ -974,7 +1033,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: mutationResultShape,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.pendingActionRespond(args satisfies PendingActionRespondInput)),
+    async (args) => runTool(auditLog, "t3_pending_action_respond", args, () => gateway.pendingActionRespond(args satisfies PendingActionRespondInput)),
   );
 
   server.registerTool(
@@ -986,7 +1045,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: mutationResultShape,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadArchive(args)),
+    async (args) => runTool(auditLog, "t3_thread_archive", args, () => gateway.threadArchive(args)),
   );
 
   server.registerTool(
@@ -1004,7 +1063,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadSnoozeOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadSnooze(args)),
+    async (args) => runTool(auditLog, "t3_thread_snooze", args, () => gateway.threadSnooze(args)),
   );
 
   server.registerTool(
@@ -1016,7 +1075,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: { ...mutationResultShape, threadId: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadUnsnooze(args)),
+    async (args) => runTool(auditLog, "t3_thread_unsnooze", args, () => gateway.threadUnsnooze(args)),
   );
 
   server.registerTool(
@@ -1029,7 +1088,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadSettleOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadSettle(args)),
+    async (args) => runTool(auditLog, "t3_thread_settle", args, () => gateway.threadSettle(args)),
   );
 
   server.registerTool(
@@ -1041,15 +1100,39 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       outputSchema: threadSettleOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(() => gateway.threadUnsettle(args)),
+    async (args) => runTool(auditLog, "t3_thread_unsettle", args, () => gateway.threadUnsettle(args)),
   );
 
   return server;
 }
 
-async function runTool<T extends object>(operation: () => Promise<T>): Promise<CallToolResult> {
+async function runTool<T extends object>(
+  auditLog: AuditLog,
+  toolName: string,
+  input: unknown,
+  operation: () => Promise<T>,
+): Promise<CallToolResult> {
+  const correlationId = `mcp_${randomUUID()}`;
+  const startedAt = Date.now();
+  await auditLog.record({
+    source: "mcp",
+    event: "tool.call",
+    correlationId,
+    operation: toolName,
+    outcome: "started",
+    details: { arguments: summarizeForAudit(input) },
+  });
   try {
     const result = await operation();
+    await auditLog.record({
+      source: "mcp",
+      event: "tool.result",
+      correlationId,
+      operation: toolName,
+      outcome: "completed",
+      durationMs: Date.now() - startedAt,
+      details: { result: summarizeForAudit(result) },
+    });
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       structuredContent: result as Record<string, unknown>,
@@ -1057,6 +1140,15 @@ async function runTool<T extends object>(operation: () => Promise<T>): Promise<C
   } catch (error) {
     const code = error instanceof GatewayError ? error.code : "gateway_error";
     const message = error instanceof Error ? error.message : String(error);
+    await auditLog.record({
+      source: "mcp",
+      event: "tool.result",
+      correlationId,
+      operation: toolName,
+      outcome: "error",
+      durationMs: Date.now() - startedAt,
+      details: { errorCode: code, errorMessage: message },
+    });
     return {
       isError: true,
       content: [{ type: "text", text: JSON.stringify({ error: { code, message } }, null, 2) }],

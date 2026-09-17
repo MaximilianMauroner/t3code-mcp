@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   AuthSessionSchema,
   DescriptorSchema,
@@ -11,6 +12,7 @@ import {
   type ThreadSnapshot,
 } from "./types.js";
 import type { T3Command } from "./commands.js";
+import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
 import { z } from "zod";
 
 export class T3HttpError extends Error {
@@ -65,6 +67,7 @@ export class T3HttpClient {
     private readonly baseUrl: string,
     private readonly accessToken: string,
     private readonly requestTimeoutMs = 15_000,
+    private readonly auditLog?: AuditLog,
   ) {}
 
   telemetry(): T3ConnectionTelemetry {
@@ -142,6 +145,21 @@ export class T3HttpClient {
     const requestUrl = joinUrl(this.baseUrl, path);
     const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
     const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const correlationId = `t3_${randomUUID()}`;
+    const startedAt = Date.now();
+    await this.auditLog?.record({
+      source: "t3",
+      event: "upstream.request",
+      correlationId,
+      operation: `${method} ${path}`,
+      outcome: "started",
+      details: {
+        method,
+        path,
+        authenticated,
+        body: body === undefined ? null : summarizeForAudit(body),
+      },
+    });
     try {
       const response = await fetch(requestUrl, {
         method,
@@ -171,10 +189,32 @@ export class T3HttpClient {
       }
       this.lastSuccessfulAt = Date.now();
       this.lastError = null;
+      await this.auditLog?.record({
+        source: "t3",
+        event: "upstream.response",
+        correlationId,
+        operation: `${method} ${path}`,
+        outcome: "completed",
+        durationMs: Date.now() - startedAt,
+        details: { status: response.status },
+      });
       return parsed.data;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.lastError = message;
+      await this.auditLog?.record({
+        source: "t3",
+        event: "upstream.response",
+        correlationId,
+        operation: `${method} ${path}`,
+        outcome: "error",
+        durationMs: Date.now() - startedAt,
+        details: {
+          status: error instanceof T3HttpError ? error.status : null,
+          code: error instanceof T3HttpError ? error.code : null,
+          error: message,
+        },
+      });
       throw error;
     }
   }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   GATEWAY_COMMIT,
   GATEWAY_VERSION,
@@ -33,6 +33,7 @@ import {
   type TaskRecord,
   type TaskStage,
 } from "./operations/journal.js";
+import { AuditLog, type AuditLogPage, type AuditQueryInput } from "./operations/audit-log.js";
 import {
   type InteractionMode,
   type ProjectCreateCommand,
@@ -525,6 +526,13 @@ export interface TasksListResult {
   readonly page: Page<TaskSummary>;
 }
 
+export interface AuditLogResult {
+  readonly environmentId: string;
+  readonly observedAt: string;
+  readonly auditError: string | null;
+  readonly page: AuditLogPage;
+}
+
 export interface ResultPackage {
   readonly environmentId: string;
   readonly observedAt: string;
@@ -577,7 +585,12 @@ export class T3Gateway {
     private readonly journal: OperationJournal,
     private readonly config: GatewayConfig,
     private readonly gitInspector = new GitInspector(),
+    private readonly auditLog = new AuditLog(join(config.dataDir, "audit.jsonl")),
   ) {}
+
+  get audit(): AuditLog {
+    return this.auditLog;
+  }
 
   async connectionStatus(): Promise<ConnectionStatusResult> {
     let descriptor: Descriptor | null = null;
@@ -646,6 +659,21 @@ export class T3Gateway {
       gatewayOperations: gatewayOps,
       sessionExpiresAt,
       ...(failure === null ? {} : { error: failure }),
+    };
+  }
+
+  async auditQuery(input: AuditQueryInput): Promise<AuditLogResult> {
+    let page: AuditLogPage;
+    try {
+      page = await this.auditLog.query(input);
+    } catch (error) {
+      throw new GatewayError("invalid_audit_filter", safeErrorMessage(error));
+    }
+    return {
+      environmentId: this.client.getCachedDescriptor()?.environmentId ?? this.config.environmentId ?? "unknown",
+      observedAt: new Date().toISOString(),
+      auditError: this.auditLog.diagnosticError,
+      page,
     };
   }
 
@@ -2728,8 +2756,15 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-export function makeGateway(config: GatewayConfig): { readonly gateway: T3Gateway; readonly client: T3HttpClient; readonly journal: OperationJournal } {
-  const client = new T3HttpClient(config.t3HttpBaseUrl, config.t3AccessToken);
-  const journal = new OperationJournal(`${config.dataDir}/operations.json`);
-  return { gateway: new T3Gateway(client, journal, config), client, journal };
+export function makeGateway(config: GatewayConfig): {
+  readonly gateway: T3Gateway;
+  readonly client: T3HttpClient;
+  readonly journal: OperationJournal;
+  readonly auditLog: AuditLog;
+} {
+  const auditLog = new AuditLog(join(config.dataDir, "audit.jsonl"));
+  const client = new T3HttpClient(config.t3HttpBaseUrl, config.t3AccessToken, 15_000, auditLog);
+  const journal = new OperationJournal(join(config.dataDir, "operations.json"), auditLog);
+  const gitInspector = new GitInspector(auditLog);
+  return { gateway: new T3Gateway(client, journal, config, gitInspector, auditLog), client, journal, auditLog };
 }

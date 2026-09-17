@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
 
 const GIT_TIMEOUT_MS = 30_000;
 const STDERR_LIMIT_BYTES = 64 * 1024;
@@ -151,6 +153,8 @@ interface StatusAccumulator {
 }
 
 export class GitInspector {
+  constructor(private readonly auditLog?: AuditLog) {}
+
   async status(selection: GitWorkspaceSelection, itemLimitPerCategory: number): Promise<GitStatusResult> {
     const workspace = await this.identifyWorkspace(selection);
     const accumulator: StatusAccumulator = {
@@ -179,7 +183,7 @@ export class GitInspector {
       parseStatusRecord(record, accumulator, itemLimitPerCategory);
     };
 
-    await runGit(workspace.resolvedPath, [
+    await runGit(this.auditLog, workspace.resolvedPath, [
       "status",
       "--porcelain=v2",
       "--branch",
@@ -250,7 +254,7 @@ export class GitInspector {
       ...(mode === "staged" ? ["--cached"] : []),
       ...(paths.length > 0 ? ["--", ...paths] : []),
     ];
-    await runGit(workspace.resolvedPath, args, (chunk) => {
+    await runGit(this.auditLog, workspace.resolvedPath, args, (chunk) => {
       totalBytes += chunk.length;
       const remaining = maxBytes - capturedBytes;
       if (remaining > 0) {
@@ -292,13 +296,13 @@ export class GitInspector {
     for (const candidate of paths) validatePathFilter(candidate);
     validateRevision(baseRevision);
     validateRevision(headRevision);
-    const baseCommit = await resolveCommit(workspace.resolvedPath, baseRevision);
-    const headCommit = await resolveCommit(workspace.resolvedPath, headRevision);
-    const dirty = await hasWorkingTreeChanges(workspace.resolvedPath);
+    const baseCommit = await resolveCommit(this.auditLog, workspace.resolvedPath, baseRevision);
+    const headCommit = await resolveCommit(this.auditLog, workspace.resolvedPath, headRevision);
+    const dirty = await hasWorkingTreeChanges(this.auditLog, workspace.resolvedPath);
     const chunks: Buffer[] = [];
     let capturedBytes = 0;
     let totalBytes = 0;
-    await runGit(workspace.resolvedPath, [
+    await runGit(this.auditLog, workspace.resolvedPath, [
       "diff",
       "--no-ext-diff",
       "--no-textconv",
@@ -359,7 +363,7 @@ export class GitInspector {
     const lines: string[] = [];
     let pending = "";
     try {
-      await runGit(resolvedPath, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"], (chunk) => {
+      await runGit(this.auditLog, resolvedPath, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"], (chunk) => {
         pending += chunk.toString("utf8");
         let newline = pending.indexOf("\n");
         while (newline >= 0) {
@@ -389,10 +393,10 @@ function validateRevision(revision: string): void {
   }
 }
 
-async function resolveCommit(workspace: string, revision: string): Promise<string> {
+async function resolveCommit(auditLog: AuditLog | undefined, workspace: string, revision: string): Promise<string> {
   let output = "";
   try {
-    await runGit(workspace, ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`], (chunk) => {
+    await runGit(auditLog, workspace, ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`], (chunk) => {
       output += chunk.toString("utf8");
     });
   } catch (error) {
@@ -408,9 +412,9 @@ async function resolveCommit(workspace: string, revision: string): Promise<strin
   return commit;
 }
 
-async function hasWorkingTreeChanges(workspace: string): Promise<boolean> {
+async function hasWorkingTreeChanges(auditLog: AuditLog | undefined, workspace: string): Promise<boolean> {
   let outputBytes = 0;
-  await runGit(workspace, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], (chunk) => {
+  await runGit(auditLog, workspace, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], (chunk) => {
     outputBytes += chunk.length;
   });
   return outputBytes > 0;
@@ -543,6 +547,7 @@ function validatePathFilter(candidate: string): void {
 }
 
 async function runGit(
+  auditLog: AuditLog | undefined,
   cwd: string,
   commandArgs: ReadonlyArray<string>,
   onStdout: (chunk: Buffer) => void,
@@ -562,6 +567,16 @@ async function runGit(
     "-c", "core.untrackedCache=false",
     ...commandArgs,
   ];
+  const correlationId = `git_${randomUUID()}`;
+  const startedAt = Date.now();
+  await auditLog?.record({
+    source: "git",
+    event: "git.command",
+    correlationId,
+    operation: `git ${commandArgs[0] ?? "unknown"}`,
+    outcome: "started",
+    details: { cwd, args: summarizeForAudit(args) },
+  });
 
   return new Promise<GitProcessResult>((resolve, reject) => {
     const child = spawn("git", args, { cwd, env: environment, shell: false, stdio: ["ignore", "pipe", "pipe"] });
@@ -570,11 +585,27 @@ async function runGit(
     let stderrTruncated = false;
     let timedOut = false;
     let stdoutError: unknown = null;
+    let stdoutBytes = 0;
+    let settled = false;
+    const finishAudit = async (outcome: "completed" | "error", details: Record<string, unknown>): Promise<void> => {
+      if (settled) return;
+      settled = true;
+      await auditLog?.record({
+        source: "git",
+        event: "git.result",
+        correlationId,
+        operation: `git ${commandArgs[0] ?? "unknown"}`,
+        outcome,
+        durationMs: Date.now() - startedAt,
+        details,
+      });
+    };
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, GIT_TIMEOUT_MS);
     child.stdout.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
       if (stdoutError !== null) return;
       try {
         onStdout(chunk);
@@ -594,27 +625,59 @@ async function runGit(
     });
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(new GitInspectionError("git_unavailable", `Git could not be started: ${error.message}`));
+      void finishAudit("error", {
+        error: error.message,
+        stdoutBytes,
+        stderrBytes,
+      }).then(() => reject(new GitInspectionError("git_unavailable", `Git could not be started: ${error.message}`)));
     });
     child.on("close", (code, signal) => {
+      if (settled) return;
       clearTimeout(timeout);
       const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
       if (stdoutError !== null) {
-        reject(stdoutError instanceof GitInspectionError
+        void finishAudit("error", {
+          error: stdoutError instanceof Error ? stdoutError.message : String(stdoutError),
+          exitCode: code,
+          signal,
+          stdoutBytes,
+          stderrBytes,
+        }).then(() => reject(stdoutError instanceof GitInspectionError
           ? stdoutError
-          : new GitInspectionError("git_output_invalid", stdoutError instanceof Error ? stdoutError.message : String(stdoutError)));
+          : new GitInspectionError("git_output_invalid", stdoutError instanceof Error ? stdoutError.message : String(stdoutError))));
         return;
       }
       if (timedOut) {
-        reject(new GitInspectionError("git_timeout", `Git inspection exceeded ${GIT_TIMEOUT_MS / 1000} seconds.`));
+        void finishAudit("error", {
+          error: `Git inspection exceeded ${GIT_TIMEOUT_MS / 1000} seconds.`,
+          exitCode: code,
+          signal,
+          stdoutBytes,
+          stderrBytes,
+        }).then(() => reject(new GitInspectionError("git_timeout", `Git inspection exceeded ${GIT_TIMEOUT_MS / 1000} seconds.`)));
         return;
       }
       if (code !== 0) {
         const suffix = stderr.length > 0 ? `: ${stderr}${stderrTruncated ? " [stderr truncated]" : ""}` : "";
-        reject(new GitInspectionError("git_command_failed", `Read-only Git command failed (exit ${code ?? signal ?? "unknown"})${suffix}`));
+        void finishAudit("error", {
+          error: `Git command failed (exit ${code ?? signal ?? "unknown"})`,
+          exitCode: code,
+          signal,
+          stdoutBytes,
+          stderrBytes,
+          stderr,
+          stderrTruncated,
+        }).then(() => reject(new GitInspectionError("git_command_failed", `Read-only Git command failed (exit ${code ?? signal ?? "unknown"})${suffix}`)));
         return;
       }
-      resolve({ stderr, stderrTruncated });
+      void finishAudit("completed", {
+        exitCode: code,
+        signal,
+        stdoutBytes,
+        stderrBytes,
+        stderr,
+        stderrTruncated,
+      }).then(() => resolve({ stderr, stderrTruncated }));
     });
   });
 }
