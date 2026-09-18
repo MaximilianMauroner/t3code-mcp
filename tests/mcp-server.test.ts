@@ -158,6 +158,36 @@ describe("MCP tool contract", () => {
     });
   });
 
+  it("accepts worktree mode with explicit origin selection through MCP", async () => {
+    const { fake, client } = await connectedClient();
+    fake.addProject({ id: "project-worktree-mcp", workspaceRoot: "/remote/worktree-project" });
+    const started = await client.callTool({
+      name: "t3_task_start",
+      arguments: {
+        projectId: "project-worktree-mcp",
+        title: "Origin worktree task",
+        instruction: "Inspect the origin version.",
+        runtimeMode: "approval-required",
+        workspaceMode: "worktree",
+        branch: "main",
+        startFromOrigin: true,
+        idempotencyKey: "mcp-worktree-task-key",
+      },
+    });
+
+    expect(started.isError).not.toBe(true);
+    expect(fake.dispatches[1]?.command).toMatchObject({
+      type: "thread.turn.start",
+      bootstrap: {
+        prepareWorktree: {
+          projectCwd: "/remote/worktree-project",
+          baseBranch: "main",
+          startFromOrigin: true,
+        },
+      },
+    });
+  });
+
   it("finds open threads and interrupts the observed external turn through MCP", async () => {
     const { fake, client } = await connectedClient();
     fake.addThread({ id: "voice-thread", projectId: "voice-project", title: "Login fix",

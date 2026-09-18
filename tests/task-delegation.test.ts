@@ -39,6 +39,59 @@ const taskInput = {
 };
 
 describe("recoverable task delegation", () => {
+  it("starts a managed worktree from the selected origin branch", async () => {
+    const { fake, gateway } = await setup();
+    const input = {
+      ...taskInput,
+      idempotencyKey: "worktree-task-key",
+      workspaceMode: "worktree",
+      branch: "main",
+      startFromOrigin: true,
+    } as const;
+    const started = await gateway.taskStart(input);
+    const retried = await gateway.taskStart(input);
+
+    expect(started.stage).toBe("run_accepted");
+    expect(retried.taskRef).toBe(started.taskRef);
+    expect(fake.dispatches).toHaveLength(2);
+    expect(fake.dispatches[0]?.command).toMatchObject({
+      type: "thread.create",
+      branch: null,
+      worktreePath: null,
+    });
+    expect(fake.dispatches[1]?.command).toMatchObject({
+      type: "thread.turn.start",
+      bootstrap: {
+        prepareWorktree: {
+          projectCwd: "/remote/project-1",
+          baseBranch: "main",
+          startFromOrigin: true,
+          requireWorktree: true,
+        },
+        runSetupScript: true,
+      },
+    });
+    if (fake.dispatches[1]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
+    expect(fake.dispatches[1].command.bootstrap?.prepareWorktree?.branch).toMatch(/^t3code\/[0-9a-f]{8}$/);
+  });
+
+  it("rejects incomplete or conflicting worktree selections before dispatch", async () => {
+    const { fake, gateway } = await setup();
+
+    await expect(gateway.taskStart({ ...taskInput, idempotencyKey: "missing-base", workspaceMode: "worktree" }))
+      .rejects.toMatchObject({ code: "worktree_base_branch_required" });
+    await expect(gateway.taskStart({
+      ...taskInput,
+      idempotencyKey: "managed-path",
+      workspaceMode: "worktree",
+      branch: "main",
+      worktreePath: "/tmp/caller-selected",
+    })).rejects.toMatchObject({ code: "worktree_path_not_allowed" });
+    await expect(gateway.taskStart({ ...taskInput, idempotencyKey: "local-origin", startFromOrigin: false }))
+      .rejects.toMatchObject({ code: "origin_selection_requires_worktree" });
+    expect(fake.dispatches).toHaveLength(0);
+  });
+
   it("starts once, lists by durable reference, and recovers through a fresh gateway", async () => {
     const { fake, fixture, gateway } = await setup();
     const started = await gateway.taskStart(taskInput);

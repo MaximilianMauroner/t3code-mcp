@@ -833,7 +833,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Start a recoverable T3 task",
       description:
-        "Create one T3 thread and dispatch its initial instruction as a recoverable composite operation. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never advances past uncertain thread creation and never stores the instruction text in its journal.",
+        "Create one T3 thread and dispatch its initial instruction as a recoverable composite operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have T3 create a managed worktree from the selected local or origin base branch. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never advances past uncertain thread creation and never stores the instruction text in its journal.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -841,8 +841,10 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
         runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]),
         modelSelection: modelSelection.optional(),
         interactionMode: z.enum(["default", "plan"]).optional(),
+        workspaceMode: z.enum(["local", "worktree"]).optional(),
         branch: z.string().trim().min(1).nullable().optional(),
         worktreePath: z.string().trim().min(1).nullable().optional(),
+        startFromOrigin: z.boolean().optional(),
         idempotencyKey,
       },
       outputSchema: taskDetailOutput,

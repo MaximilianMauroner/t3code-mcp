@@ -42,6 +42,16 @@ export interface ThreadTurnStartCommand {
   readonly titleSeed?: string;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: InteractionMode;
+  readonly bootstrap?: {
+    readonly prepareWorktree?: {
+      readonly projectCwd: string;
+      readonly baseBranch: string;
+      readonly branch?: string;
+      readonly startFromOrigin?: boolean;
+      readonly requireWorktree?: boolean;
+    };
+    readonly runSetupScript?: boolean;
+  };
   readonly createdAt: string;
 }
 

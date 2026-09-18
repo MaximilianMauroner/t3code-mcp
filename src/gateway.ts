@@ -348,6 +348,7 @@ export interface ThreadSendInput extends MutationCommonInput {
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: InteractionMode;
   readonly titleSeed?: string;
+  readonly bootstrap?: ThreadTurnStartCommand["bootstrap"];
 }
 
 export interface ThreadInterruptInput extends MutationCommonInput {
@@ -492,8 +493,10 @@ export interface TaskStartInput extends MutationCommonInput {
   readonly runtimeMode: RuntimeMode;
   readonly modelSelection?: ModelSelection;
   readonly interactionMode?: InteractionMode;
+  readonly workspaceMode?: "local" | "worktree";
   readonly branch?: string | null;
   readonly worktreePath?: string | null;
+  readonly startFromOrigin?: boolean;
 }
 
 export interface TaskSummary {
@@ -724,6 +727,25 @@ export class T3Gateway {
 
   async taskStart(input: TaskStartInput): Promise<TaskDetail> {
     await this.requireOperationScope();
+    const workspaceMode = input.workspaceMode ?? "local";
+    if (workspaceMode === "worktree" && !input.branch) {
+      throw new GatewayError(
+        "worktree_base_branch_required",
+        "workspaceMode=worktree requires branch to select the worktree's base branch.",
+      );
+    }
+    if (workspaceMode === "worktree" && input.worktreePath != null) {
+      throw new GatewayError(
+        "worktree_path_not_allowed",
+        "workspaceMode=worktree creates a T3-managed path; worktreePath must be omitted.",
+      );
+    }
+    if (workspaceMode === "local" && input.startFromOrigin !== undefined) {
+      throw new GatewayError(
+        "origin_selection_requires_worktree",
+        "startFromOrigin is only valid when workspaceMode=worktree.",
+      );
+    }
     const payloadHash = hashPayload({
       projectId: input.projectId,
       title: input.title,
@@ -731,8 +753,10 @@ export class T3Gateway {
       runtimeMode: input.runtimeMode,
       modelSelection: input.modelSelection ?? null,
       interactionMode: input.interactionMode ?? "default",
+      ...(input.workspaceMode === undefined ? {} : { workspaceMode }),
       branch: input.branch ?? null,
       worktreePath: input.worktreePath ?? null,
+      ...(input.startFromOrigin === undefined ? {} : { startFromOrigin: input.startFromOrigin }),
     });
     let task = (await this.journal.beginTask({
       idempotencyKey: input.idempotencyKey,
@@ -749,8 +773,8 @@ export class T3Gateway {
         modelSelection: input.modelSelection,
         runtimeMode: input.runtimeMode,
         interactionMode: input.interactionMode,
-        branch: input.branch,
-        worktreePath: input.worktreePath,
+        branch: workspaceMode === "worktree" ? null : input.branch,
+        worktreePath: workspaceMode === "worktree" ? null : input.worktreePath,
         idempotencyKey: task.threadIdempotencyKey,
       });
       task = await this.journal.updateTask(task.taskRef, {
@@ -765,7 +789,7 @@ export class T3Gateway {
       });
       if (created.status !== "accepted") return this.taskDetail(task, false);
 
-      if (task.baselineAttribution === undefined) {
+      if (workspaceMode === "local" && task.baselineAttribution === undefined) {
         try {
           const status = await this.gitStatus({ projectId: input.projectId, threadId: created.threadId, maxEntries: 1 });
           task = await this.journal.updateTask(task.taskRef, {
@@ -784,6 +808,19 @@ export class T3Gateway {
         runtimeMode: input.runtimeMode,
         interactionMode: input.interactionMode,
         titleSeed: input.title,
+        ...(workspaceMode === "worktree"
+          ? {
+              bootstrap: {
+                prepareWorktree: {
+                  projectCwd: (await this.findProject(input.projectId)).workspaceRoot,
+                  baseBranch: input.branch!,
+                  startFromOrigin: input.startFromOrigin ?? false,
+                  requireWorktree: true,
+                },
+                runSetupScript: true,
+              },
+            }
+          : {}),
         idempotencyKey: task.runIdempotencyKey,
       });
       task = await this.journal.updateTask(task.taskRef, {
@@ -797,6 +834,19 @@ export class T3Gateway {
             : "dispatch_rejected",
         lastError: sent.status === "accepted" ? null : sent.reason,
       });
+      // A managed worktree does not exist until the bootstrap dispatch has
+      // been accepted, so it cannot use the pre-dispatch baseline path above.
+      if (workspaceMode === "worktree" && sent.status === "accepted" && task.baselineAttribution === undefined) {
+        try {
+          const status = await this.gitStatus({ projectId: input.projectId, threadId: created.threadId, maxEntries: 1 });
+          task = await this.journal.updateTask(task.taskRef, {
+            baselineAttribution: status.clean ? "clean" : "dirty",
+            ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
+          });
+        } catch {
+          task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
+        }
+      }
       return this.taskDetail(task, false);
     } catch (error) {
       if (error instanceof GatewayError && ["project_not_found", "model_selection_required", "thread_busy"].includes(error.code)) {
@@ -1180,6 +1230,7 @@ export class T3Gateway {
       runtimeMode: input.runtimeMode ?? null,
       interactionMode: input.interactionMode ?? null,
       titleSeed: input.titleSeed ?? null,
+      ...(input.bootstrap === undefined ? {} : { bootstrap: input.bootstrap }),
     };
     const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
     if (existing) {
@@ -1245,6 +1296,19 @@ export class T3Gateway {
       return this.threadSendResult(reconciled);
     }
 
+    const bootstrap = input.bootstrap?.prepareWorktree !== undefined && input.bootstrap.prepareWorktree.branch === undefined
+      ? {
+          ...input.bootstrap,
+          prepareWorktree: {
+            ...input.bootstrap.prepareWorktree,
+            // Match T3's client convention. Deriving the temporary branch
+            // from the durable command id keeps retries stable without adding
+            // generated state to the caller's idempotency payload.
+            branch: `t3code/${begun.record.commandId.toLowerCase().replaceAll("-", "").slice(0, 8)}`,
+          },
+        }
+      : input.bootstrap;
+
     const command: ThreadTurnStartCommand = {
       type: "thread.turn.start",
       commandId: begun.record.commandId,
@@ -1254,6 +1318,7 @@ export class T3Gateway {
       ...(input.titleSeed === undefined ? {} : { titleSeed: input.titleSeed }),
       runtimeMode: input.runtimeMode ?? snapshot.thread.runtimeMode,
       interactionMode: input.interactionMode ?? snapshot.thread.interactionMode ?? "default",
+      ...(bootstrap === undefined ? {} : { bootstrap }),
       createdAt: new Date().toISOString(),
     };
     const result = await this.dispatchNew(begun.record, command);
