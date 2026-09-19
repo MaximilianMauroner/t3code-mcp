@@ -43,6 +43,16 @@ export interface ThreadTurnStartCommand {
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: InteractionMode;
   readonly bootstrap?: {
+    readonly createThread?: {
+      readonly projectId: string;
+      readonly title: string;
+      readonly modelSelection: ModelSelection;
+      readonly runtimeMode: RuntimeMode;
+      readonly interactionMode: InteractionMode;
+      readonly branch: string | null;
+      readonly worktreePath: string | null;
+      readonly createdAt: string;
+    };
     readonly prepareWorktree?: {
       readonly projectCwd: string;
       readonly baseBranch: string;

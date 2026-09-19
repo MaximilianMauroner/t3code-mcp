@@ -12,8 +12,8 @@ import {
   type GitCompareInput,
   type ProjectCreateInput,
   type TaskStartInput,
-  type ThreadCreateInput,
   type ThreadSendInput,
+  type ThreadStartInput,
 } from "../gateway.js";
 
 const modelSelection = z
@@ -410,19 +410,6 @@ const threadsOverviewOutputSchema = {
   highlights: z.array(overviewHighlightOutput),
 };
 
-const threadCreateOutputSchema = {
-  ...mutationResultShape,
-  projectId: z.string(),
-  threadId: z.string(),
-  modelSelection: modelSelectionOutput.nullable(),
-  workspace: z
-    .object({
-      branch: z.string().nullable(),
-      worktreePath: z.string().nullable(),
-    })
-    .passthrough(),
-};
-
 const threadGetOutputSchema = {
   environmentId: z.string(),
   thread: threadDetailOutput,
@@ -809,23 +796,26 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
   server.registerTool(
     "t3_thread_create",
     {
-      title: "Create a T3 thread",
+      title: "Create and start a T3 thread",
       description:
-        "Create a thread in an existing T3 project. modelSelection is required when the project has no default model. Returns the T3-accepted modelSelection, branch, and worktree, plus a mutation status for acceptance.",
+        "Atomically create a thread and start its required initial message. Set workspaceMode=worktree with branch and optional startFromOrigin to have T3 create a managed worktree before the turn starts. Use t3_thread_send only for follow-up messages on existing threads.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
+        message: z.string().min(1).max(120_000),
         modelSelection: modelSelection.optional(),
-        runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]).optional(),
+        runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]),
         interactionMode: z.enum(["default", "plan"]).optional(),
+        workspaceMode: z.enum(["local", "worktree"]).optional(),
         branch: z.string().trim().min(1).nullable().optional(),
         worktreePath: z.string().trim().min(1).nullable().optional(),
+        startFromOrigin: z.boolean().optional(),
         idempotencyKey,
       },
-      outputSchema: threadCreateOutputSchema,
+      outputSchema: threadSendOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(auditLog, "t3_thread_create", args, () => gateway.threadCreate(args satisfies ThreadCreateInput)),
+    async (args) => runTool(auditLog, "t3_thread_create", args, () => gateway.threadStart(args satisfies ThreadStartInput)),
   );
 
   server.registerTool(
@@ -833,7 +823,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Start a recoverable T3 task",
       description:
-        "Create one T3 thread and dispatch its initial instruction as a recoverable composite operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have T3 create a managed worktree from the selected local or origin base branch. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never advances past uncertain thread creation and never stores the instruction text in its journal.",
+        "Atomically create one T3 thread and dispatch its required initial instruction as a recoverable bootstrap. Set workspaceMode=worktree with branch and optional startFromOrigin to have T3 create a managed worktree from the selected local or origin base branch. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),

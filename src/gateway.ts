@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
   GATEWAY_COMMIT,
@@ -339,6 +340,19 @@ export interface ThreadCreateInput extends MutationCommonInput {
   readonly interactionMode?: InteractionMode;
   readonly branch?: string | null;
   readonly worktreePath?: string | null;
+}
+
+export interface ThreadStartInput extends MutationCommonInput {
+  readonly projectId: string;
+  readonly title: string;
+  readonly message: string;
+  readonly modelSelection?: ModelSelection;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode?: InteractionMode;
+  readonly workspaceMode?: "local" | "worktree";
+  readonly branch?: string | null;
+  readonly worktreePath?: string | null;
+  readonly startFromOrigin?: boolean;
 }
 
 export interface ThreadSendInput extends MutationCommonInput {
@@ -766,6 +780,72 @@ export class T3Gateway {
       runtimeMode: input.runtimeMode,
     })).record;
 
+    // Tasks created by older gateway versions have a separate durable
+    // thread.create child. Continue their two-command recovery path below.
+    // New tasks use the same atomic create+first-message bootstrap exposed by
+    // t3_thread_create, so a successfully created thread can never be empty.
+    const legacyThreadOperation = await this.journal.getByIdempotencyKey(task.threadIdempotencyKey);
+    if (legacyThreadOperation === null) {
+      try {
+        if (workspaceMode === "local" && task.baselineAttribution === undefined) {
+          try {
+            const status = await this.gitStatus({ projectId: input.projectId, maxEntries: 1 });
+            task = await this.journal.updateTask(task.taskRef, {
+              baselineAttribution: status.clean ? "clean" : "dirty",
+              ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
+            });
+          } catch {
+            task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
+          }
+        }
+
+        const started = await this.threadStart({
+          projectId: input.projectId,
+          title: input.title,
+          message: input.instruction,
+          modelSelection: input.modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          workspaceMode,
+          branch: input.branch,
+          worktreePath: input.worktreePath,
+          startFromOrigin: input.startFromOrigin,
+          idempotencyKey: task.runIdempotencyKey,
+        });
+        task = await this.journal.updateTask(task.taskRef, {
+          threadId: started.threadId,
+          runId: started.runId,
+          messageId: started.messageId,
+          threadOperationId: started.operationId,
+          runOperationId: started.operationId,
+          stage: started.status === "accepted"
+            ? "run_accepted"
+            : started.status === "uncertain"
+              ? "dispatch_uncertain"
+              : "dispatch_rejected",
+          lastError: started.status === "accepted" ? null : started.reason,
+        });
+        if (workspaceMode === "worktree" && started.status === "accepted" && task.baselineAttribution === undefined) {
+          try {
+            const status = await this.gitStatus({ projectId: input.projectId, threadId: started.threadId, maxEntries: 1 });
+            task = await this.journal.updateTask(task.taskRef, {
+              baselineAttribution: status.clean ? "clean" : "dirty",
+              ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
+            });
+          } catch {
+            task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
+          }
+        }
+        return this.taskDetail(task, false);
+      } catch (error) {
+        if (error instanceof GatewayError && ["project_not_found", "model_selection_required"].includes(error.code)) {
+          task = await this.journal.updateTask(task.taskRef, { stage: "rejected", lastError: error.message });
+          return this.taskDetail(task, false);
+        }
+        throw error;
+      }
+    }
+
     try {
       const created = await this.threadCreate({
         projectId: input.projectId,
@@ -1183,6 +1263,31 @@ export class T3Gateway {
     }
     await this.requireOperationScope();
     const project = await this.findProject(input.projectId);
+    if (input.worktreePath != null) {
+      try {
+        const workspaceStat = await stat(input.worktreePath);
+        if (!workspaceStat.isDirectory()) {
+          throw new GatewayError(
+            "workspace_not_directory",
+            `The requested thread workspace is not a directory: ${input.worktreePath}`,
+          );
+        }
+      } catch (error) {
+        if (error instanceof GatewayError) throw error;
+        const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : null;
+        if (code === "ENOENT") {
+          throw new GatewayError(
+            "workspace_missing",
+            `The requested thread workspace does not exist: ${input.worktreePath}. ` +
+              "Use t3_task_start with workspaceMode=worktree to have T3 create a managed worktree.",
+          );
+        }
+        throw new GatewayError(
+          "workspace_unreadable",
+          `The requested thread workspace cannot be inspected: ${input.worktreePath}`,
+        );
+      }
+    }
     const modelSelection = input.modelSelection ?? project.defaultModelSelection;
     if (modelSelection === null || modelSelection === undefined) {
       throw new GatewayError(
@@ -1217,6 +1322,119 @@ export class T3Gateway {
     };
     const result = await this.dispatchNew(begun.record, command);
     return this.threadCreateResult(result, input.projectId, modelSelection, command.branch, command.worktreePath);
+  }
+
+  async threadStart(input: ThreadStartInput): Promise<ThreadSendResult> {
+    const workspaceMode = input.workspaceMode ?? "local";
+    if (workspaceMode === "worktree" && !input.branch) {
+      throw new GatewayError(
+        "worktree_base_branch_required",
+        "workspaceMode=worktree requires branch to select the worktree's base branch.",
+      );
+    }
+    if (workspaceMode === "worktree" && input.worktreePath != null) {
+      throw new GatewayError(
+        "worktree_path_not_allowed",
+        "workspaceMode=worktree creates a T3-managed path; worktreePath must be omitted.",
+      );
+    }
+    if (workspaceMode === "local" && input.startFromOrigin !== undefined) {
+      throw new GatewayError(
+        "origin_selection_requires_worktree",
+        "startFromOrigin is only valid when workspaceMode=worktree.",
+      );
+    }
+    const payload = {
+      projectId: input.projectId,
+      title: input.title,
+      message: input.message,
+      modelSelection: input.modelSelection ?? null,
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode ?? "default",
+      workspaceMode,
+      branch: input.branch ?? null,
+      worktreePath: input.worktreePath ?? null,
+      startFromOrigin: input.startFromOrigin ?? false,
+    };
+    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      const begun = await this.journal.begin({
+        kind: "thread.turn.start",
+        idempotencyKey: input.idempotencyKey,
+        payloadHash: hashPayload(payload),
+        projectId: existing.projectId ?? input.projectId,
+        threadId: existing.threadId,
+        runId: existing.runId,
+        messageId: existing.messageId,
+      });
+      return this.threadSendResult(await this.reconcile(begun.record));
+    }
+
+    await this.requireOperationScope();
+    const project = await this.findProject(input.projectId);
+    if (workspaceMode === "local" && input.worktreePath != null) {
+      await this.requireExistingWorkspace(input.worktreePath);
+    }
+    const modelSelection = input.modelSelection ?? project.defaultModelSelection;
+    if (modelSelection === null || modelSelection === undefined) {
+      throw new GatewayError(
+        "model_selection_required",
+        "The project has no default model. Call t3_providers_list to discover available instanceId/model values, then supply modelSelection.",
+      );
+    }
+
+    const threadId = randomUUID();
+    const runId = `run_${randomUUID()}`;
+    const messageId = `user:msg_${randomUUID().replaceAll("-", "")}`;
+    const begun = await this.journal.begin({
+      kind: "thread.turn.start",
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: hashPayload(payload),
+      projectId: input.projectId,
+      threadId,
+      runId,
+      messageId,
+    });
+    if (begun.reused) return this.threadSendResult(await this.reconcile(begun.record));
+
+    const createdAt = new Date().toISOString();
+    const temporaryBranch = `t3code/${begun.record.commandId.toLowerCase().replaceAll("-", "").slice(0, 8)}`;
+    const command: ThreadTurnStartCommand = {
+      type: "thread.turn.start",
+      commandId: begun.record.commandId,
+      threadId,
+      message: { messageId, role: "user", text: input.message, attachments: [] },
+      modelSelection,
+      titleSeed: input.title,
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode ?? "default",
+      bootstrap: {
+        createThread: {
+          projectId: input.projectId,
+          title: input.title,
+          modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode ?? "default",
+          branch: input.branch ?? null,
+          worktreePath: workspaceMode === "worktree" ? null : (input.worktreePath ?? null),
+          createdAt,
+        },
+        ...(workspaceMode === "worktree"
+          ? {
+              prepareWorktree: {
+                projectCwd: project.workspaceRoot,
+                baseBranch: input.branch!,
+                branch: temporaryBranch,
+                startFromOrigin: input.startFromOrigin ?? false,
+                requireWorktree: true,
+              },
+              runSetupScript: true,
+            }
+          : {}),
+      },
+      createdAt,
+    };
+    return this.threadSendResult(await this.dispatchNew(begun.record, command));
   }
 
   async threadSend(input: ThreadSendInput): Promise<ThreadSendResult> {
@@ -2075,6 +2293,26 @@ export class T3Gateway {
       );
     }
     return project;
+  }
+
+  private async requireExistingWorkspace(worktreePath: string): Promise<void> {
+    try {
+      const workspaceStat = await stat(worktreePath);
+      if (!workspaceStat.isDirectory()) {
+        throw new GatewayError("workspace_not_directory", `The requested thread workspace is not a directory: ${worktreePath}`);
+      }
+    } catch (error) {
+      if (error instanceof GatewayError) throw error;
+      const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : null;
+      if (code === "ENOENT") {
+        throw new GatewayError(
+          "workspace_missing",
+          `The requested thread workspace does not exist: ${worktreePath}. ` +
+            "Use workspaceMode=worktree to have T3 create a managed worktree.",
+        );
+      }
+      throw new GatewayError("workspace_unreadable", `The requested thread workspace cannot be inspected: ${worktreePath}`);
+    }
   }
 
   private async resolveGitWorkspace(input: GitTargetInput): Promise<GitWorkspaceSelection> {

@@ -86,17 +86,14 @@ async function main(): Promise<void> {
       }
       const title = process.env.T3_SPIKE_THREAD_TITLE?.trim() || "t3-code-mcp connection spike";
       const keyPrefix = process.env.T3_SPIKE_IDEMPOTENCY_KEY?.trim() || `spike-${Date.now()}`;
-      const thread = await gateway.threadCreate({
+      const run = await gateway.threadStart({
         projectId,
         title,
+        message: prompt,
+        runtimeMode: "full-access",
         idempotencyKey: `${keyPrefix}-thread`,
       });
-      const run = await gateway.threadSend({
-        threadId: thread.threadId,
-        message: prompt,
-        idempotencyKey: `${keyPrefix}-turn`,
-      });
-      console.log(JSON.stringify({ thread, run }, null, 2));
+      console.log(JSON.stringify({ run }, null, 2));
       return;
     }
     default:

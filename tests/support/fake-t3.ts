@@ -276,7 +276,23 @@ export class FakeT3 {
         });
         return;
       case "thread.turn.start": {
+        if (command.bootstrap?.createThread) {
+          this.addThread({
+            id: command.threadId,
+            projectId: command.bootstrap.createThread.projectId,
+            title: command.bootstrap.createThread.title,
+            modelSelection: command.bootstrap.createThread.modelSelection,
+            runtimeMode: command.bootstrap.createThread.runtimeMode,
+            interactionMode: command.bootstrap.createThread.interactionMode,
+            branch: command.bootstrap.createThread.branch,
+            worktreePath: command.bootstrap.createThread.worktreePath,
+          });
+        }
         const thread = this.thread(command.threadId);
+        if (command.bootstrap?.prepareWorktree) {
+          thread.branch = command.bootstrap.prepareWorktree.branch ?? command.bootstrap.prepareWorktree.baseBranch;
+          thread.worktreePath = `/remote/worktrees/${command.threadId}`;
+        }
         const turnId = `turn-${command.message.messageId}`;
         thread.messages.push({
           id: command.message.messageId,

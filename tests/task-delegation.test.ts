@@ -53,15 +53,15 @@ describe("recoverable task delegation", () => {
 
     expect(started.stage).toBe("run_accepted");
     expect(retried.taskRef).toBe(started.taskRef);
-    expect(fake.dispatches).toHaveLength(2);
+    expect(fake.dispatches).toHaveLength(1);
     expect(fake.dispatches[0]?.command).toMatchObject({
-      type: "thread.create",
-      branch: null,
-      worktreePath: null,
-    });
-    expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
       bootstrap: {
+        createThread: {
+          projectId: "project-task",
+          branch: "main",
+          worktreePath: null,
+        },
         prepareWorktree: {
           projectCwd: "/remote/project-1",
           baseBranch: "main",
@@ -71,8 +71,8 @@ describe("recoverable task delegation", () => {
         runSetupScript: true,
       },
     });
-    if (fake.dispatches[1]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
-    expect(fake.dispatches[1].command.bootstrap?.prepareWorktree?.branch).toMatch(/^t3code\/[0-9a-f]{8}$/);
+    if (fake.dispatches[0]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
+    expect(fake.dispatches[0].command.bootstrap?.prepareWorktree?.branch).toMatch(/^t3code\/[0-9a-f]{8}$/);
   });
 
   it("rejects incomplete or conflicting worktree selections before dispatch", async () => {
@@ -105,7 +105,11 @@ describe("recoverable task delegation", () => {
     expect(started.taskRef).toMatch(/^task_/);
     expect(started.threadId).toBeTruthy();
     expect(started.runId).toBeTruthy();
-    expect(fake.dispatches.map((entry) => entry.command.type)).toEqual(["thread.create", "thread.turn.start"]);
+    expect(fake.dispatches.map((entry) => entry.command.type)).toEqual(["thread.turn.start"]);
+    expect(fake.dispatches[0]?.command).toMatchObject({
+      bootstrap: { createThread: { projectId: "project-task" } },
+      message: { text: taskInput.instruction },
+    });
 
     const second = makeGateway(fixture.config).gateway;
     const listed = await second.tasksList({ query: "recoverable", limit: 10 });
@@ -130,7 +134,7 @@ describe("recoverable task delegation", () => {
 
     expect(new Set(attempts.map((task) => task.taskRef))).toEqual(new Set([settled.taskRef]));
     expect(settled.stage).toBe("run_accepted");
-    expect(fake.dispatches.filter((entry) => entry.command.type === "thread.create")).toHaveLength(1);
+    expect(fake.dispatches.filter((entry) => entry.command.type === "thread.create")).toHaveLength(0);
     expect(fake.dispatches.filter((entry) => entry.command.type === "thread.turn.start")).toHaveLength(1);
     await expect(gateway.taskStart({ ...taskInput, instruction: "Different work" }))
       .rejects.toBeInstanceOf(IdempotencyConflictError);
@@ -143,22 +147,15 @@ describe("recoverable task delegation", () => {
       applyBeforeDispatchFailure: true,
     });
 
-    const afterCreate = await gateway.taskStart(taskInput);
-    expect(afterCreate.stage).toBe("thread_create_uncertain");
-    expect(fake.dispatches.map((entry) => entry.command.type)).toEqual(["thread.create"]);
-    const reconciledCreate = await gateway.taskGet(afterCreate.taskRef);
-    expect(reconciledCreate.task).toMatchObject({ stage: "thread_created", lastError: null });
-    expect(fake.dispatches.map((entry) => entry.command.type)).toEqual(["thread.create"]);
-
-    const afterSend = await gateway.taskStart(taskInput);
-    expect(afterSend.stage).toBe("dispatch_uncertain");
-    expect(fake.dispatches.map((entry) => entry.command.type)).toEqual(["thread.create", "thread.turn.start"]);
-    const reconciledSend = await gateway.taskGet(afterCreate.taskRef);
-    expect(reconciledSend.task).toMatchObject({ stage: "run_accepted", lastError: null });
+    const afterStart = await gateway.taskStart(taskInput);
+    expect(afterStart.stage).toBe("dispatch_uncertain");
+    expect(fake.dispatches.map((entry) => entry.command.type)).toEqual(["thread.turn.start"]);
+    const reconciledStart = await gateway.taskGet(afterStart.taskRef);
+    expect(reconciledStart.task).toMatchObject({ stage: "run_accepted", lastError: null });
 
     const recovered = await gateway.taskStart(taskInput);
     expect(recovered.stage).toBe("run_accepted");
-    expect(fake.dispatches.filter((entry) => entry.command.type === "thread.create")).toHaveLength(1);
+    expect(fake.dispatches.filter((entry) => entry.command.type === "thread.create")).toHaveLength(0);
     expect(fake.dispatches.filter((entry) => entry.command.type === "thread.turn.start")).toHaveLength(1);
   });
 

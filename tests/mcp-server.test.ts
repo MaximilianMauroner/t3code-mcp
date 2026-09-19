@@ -176,9 +176,10 @@ describe("MCP tool contract", () => {
     });
 
     expect(started.isError).not.toBe(true);
-    expect(fake.dispatches[1]?.command).toMatchObject({
+    expect(fake.dispatches[0]?.command).toMatchObject({
       type: "thread.turn.start",
       bootstrap: {
+        createThread: { projectId: "project-worktree-mcp" },
         prepareWorktree: {
           projectCwd: "/remote/worktree-project",
           baseBranch: "main",
@@ -227,12 +228,55 @@ describe("MCP tool contract", () => {
     const result = await client.callTool({ name: "t3_thread_create", arguments: {
       projectId: "missing-project",
       title: "will fail",
+      message: "Start work.",
+      runtimeMode: "approval-required",
       idempotencyKey: "mcp-error-key",
     } });
 
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({ error: { code: "project_not_found" } });
     expect(result.content).toBeTruthy();
+  });
+
+  it("creates a thread only together with its initial message", async () => {
+    const { fake, client } = await connectedClient();
+    fake.addProject({ id: "atomic-create-project", workspaceRoot: "/remote/atomic" });
+
+    const missingMessage = await client.callTool({ name: "t3_thread_create", arguments: {
+      projectId: "atomic-create-project",
+      title: "No empty threads",
+      runtimeMode: "approval-required",
+      idempotencyKey: "atomic-missing-message",
+    } });
+    expect(missingMessage.isError).toBe(true);
+    expect(fake.dispatches).toHaveLength(0);
+
+    const created = await client.callTool({ name: "t3_thread_create", arguments: {
+      projectId: "atomic-create-project",
+      title: "Atomic worktree thread",
+      message: "Inspect the project.",
+      runtimeMode: "approval-required",
+      workspaceMode: "worktree",
+      branch: "main",
+      startFromOrigin: true,
+      idempotencyKey: "atomic-create",
+    } });
+    expect(created.isError).not.toBe(true);
+    expect(created.structuredContent).toMatchObject({
+      status: "accepted",
+      projectId: "atomic-create-project",
+      runId: expect.stringMatching(/^run_/),
+      messageId: expect.stringMatching(/^user:msg_/),
+    });
+    expect(fake.dispatches).toHaveLength(1);
+    expect(fake.dispatches[0]?.command).toMatchObject({
+      type: "thread.turn.start",
+      message: { text: "Inspect the project." },
+      bootstrap: {
+        createThread: { projectId: "atomic-create-project", title: "Atomic worktree thread" },
+        prepareWorktree: { baseBranch: "main", startFromOrigin: true },
+      },
+    });
   });
 
   it("rejects invalid tool arguments at the protocol boundary", async () => {

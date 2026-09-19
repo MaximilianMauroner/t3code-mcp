@@ -27,7 +27,7 @@ The gateway uses T3's authenticated HTTP orchestration API. The recorded integra
 
 ## Security
 
-**Write access lets a client control your T3 coding agent with that agent's machine permissions.** Low-level new threads default to `full-access`; the composite task-start tool requires the caller to choose a runtime mode explicitly. The client can answer approval requests without independent human verification. Read-only access still exposes thread content and project information.
+**Write access lets a client control your T3 coding agent with that agent's machine permissions.** Both thread creation and composite task start require the caller to choose a runtime mode explicitly. The client can answer approval requests without independent human verification. Read-only access still exposes thread content and project information.
 
 Start with `MCP_READ_ONLY=true`, connect only trusted clients, and review the [security and access risks](docs/security.md) before enabling remote access or control tools.
 

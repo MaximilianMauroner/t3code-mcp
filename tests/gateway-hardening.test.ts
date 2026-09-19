@@ -147,7 +147,6 @@ describe("gateway mutation and recovery hardening", () => {
       runtimeMode: "approval-required",
       interactionMode: "plan",
       branch: "investigation-branch",
-      worktreePath: "/remote/new-project-worktree",
       idempotencyKey: "thread-create-1",
     });
 
@@ -161,7 +160,7 @@ describe("gateway mutation and recovery hardening", () => {
       status: "accepted",
       projectId: projectResult.projectId,
       threadId: expect.any(String),
-      workspace: { branch: "investigation-branch", worktreePath: "/remote/new-project-worktree" },
+      workspace: { branch: "investigation-branch", worktreePath: null },
     });
     expect(fake.dispatches.map(({ command }) => command.type)).toEqual(["project.create", "thread.create"]);
     expect(fake.dispatches[0]?.command).toMatchObject({
@@ -175,6 +174,23 @@ describe("gateway mutation and recovery hardening", () => {
       interactionMode: "plan",
       modelSelection: { instanceId: "codex_openai", model: "gpt-5.3-codex-spark" },
     });
+  });
+
+  it("rejects a missing low-level thread workspace before persisting it", async () => {
+    const { fake, fixture } = await setup();
+    fake.addProject({ id: "missing-workspace-project" });
+
+    await expect(fixture.gateway.threadCreate({
+      projectId: "missing-workspace-project",
+      title: "broken workspace",
+      branch: "feature/missing",
+      worktreePath: "/definitely/missing/t3-worktree",
+      idempotencyKey: "missing-thread-workspace",
+    })).rejects.toMatchObject({
+      code: "workspace_missing",
+      message: expect.stringContaining("workspaceMode=worktree"),
+    });
+    expect(fake.dispatches).toHaveLength(0);
   });
 
   it("rejects thread creation without a discovered/default model", async () => {
