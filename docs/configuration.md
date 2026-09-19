@@ -37,6 +37,7 @@ The default HTTP address is `http://127.0.0.1:8787/mcp`. `/healthz` reports that
 | `T3_ENVIRONMENT_ID` | Optional expected environment ID for identity checks |
 | `T3_ENVIRONMENT_LABEL` | Optional fallback label when discovery is unavailable |
 | `T3_MCP_DATA_DIR` | Durable operation journal and redacted usage audit directory; `./data` (`operations.json` and `audit.jsonl`) |
+| `T3_MCP_WORKTREE_ROOT` | Optional absolute root for gateway-created isolated worktrees; by default a hidden sibling directory beside each project workspace |
 | `T3_STALE_AFTER_MS` | Freshness threshold; `30000` |
 
 ## Connect an MCP client

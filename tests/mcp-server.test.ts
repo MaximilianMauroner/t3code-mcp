@@ -1,4 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,12 +14,15 @@ const fakes: FakeT3[] = [];
 const fixtures: GatewayFixture[] = [];
 const clients: Client[] = [];
 const servers: Array<{ close: () => Promise<void> }> = [];
+const directories: string[] = [];
+const execute = promisify(execFile);
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close().catch(() => undefined)));
   await Promise.all(servers.splice(0).map((server) => server.close().catch(() => undefined)));
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
   await Promise.all(fakes.splice(0).map((fake) => fake.close()));
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
 async function connectedClient(): Promise<{ readonly fake: FakeT3; readonly client: Client; readonly fixture: GatewayFixture }> {
@@ -160,7 +167,8 @@ describe("MCP tool contract", () => {
 
   it("accepts worktree mode with explicit origin selection through MCP", async () => {
     const { fake, client } = await connectedClient();
-    fake.addProject({ id: "project-worktree-mcp", workspaceRoot: "/remote/worktree-project" });
+    const repository = await createRepositoryWithOrigin();
+    fake.addProject({ id: "project-worktree-mcp", workspaceRoot: repository });
     const started = await client.callTool({
       name: "t3_task_start",
       arguments: {
@@ -179,19 +187,14 @@ describe("MCP tool contract", () => {
     expect(fake.dispatches[0]?.command).toMatchObject({
       type: "thread.create",
       projectId: "project-worktree-mcp",
-      branch: null,
-      worktreePath: null,
+      branch: expect.stringMatching(/^t3code\/mcp-[0-9a-f]+$/),
+      worktreePath: expect.stringContaining(".t3-code-mcp-worktrees"),
     });
     expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
-      bootstrap: {
-        prepareWorktree: {
-          projectCwd: "/remote/worktree-project",
-          baseBranch: "main",
-          startFromOrigin: true,
-        },
-      },
     });
+    if (fake.dispatches[1]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
+    expect(fake.dispatches[1].command.bootstrap).toBeUndefined();
   });
 
   it("finds open threads and interrupts the observed external turn through MCP", async () => {
@@ -245,7 +248,8 @@ describe("MCP tool contract", () => {
 
   it("creates a thread only together with its initial message", async () => {
     const { fake, client } = await connectedClient();
-    fake.addProject({ id: "wrapped-create-project", workspaceRoot: "/remote/wrapped" });
+    const repository = await createRepositoryWithOrigin();
+    fake.addProject({ id: "wrapped-create-project", workspaceRoot: repository });
 
     const missingMessage = await client.callTool({ name: "t3_thread_create", arguments: {
       projectId: "wrapped-create-project",
@@ -278,16 +282,15 @@ describe("MCP tool contract", () => {
       type: "thread.create",
       projectId: "wrapped-create-project",
       title: "Wrapped worktree thread",
-      branch: null,
-      worktreePath: null,
+      branch: expect.stringMatching(/^t3code\/mcp-[0-9a-f]+$/),
+      worktreePath: expect.stringContaining(".t3-code-mcp-worktrees"),
     });
     expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
       message: { text: "Inspect the project." },
-      bootstrap: {
-        prepareWorktree: { baseBranch: "main", startFromOrigin: true },
-      },
     });
+    if (fake.dispatches[1]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
+    expect(fake.dispatches[1].command.bootstrap).toBeUndefined();
   });
 
   it("rejects invalid tool arguments at the protocol boundary", async () => {
@@ -333,3 +336,20 @@ describe("MCP tool contract", () => {
     expect(fake.dispatches).toHaveLength(0);
   });
 });
+
+async function createRepositoryWithOrigin(): Promise<string> {
+  const parent = await mkdtemp(join(tmpdir(), "t3-mcp-worktree-repository-"));
+  directories.push(parent);
+  const origin = join(parent, "origin.git");
+  const repository = join(parent, "workspace");
+  await execute("git", ["init", "--bare", origin]);
+  await execute("git", ["clone", origin, repository]);
+  await execute("git", ["config", "user.name", "T3 Test"], { cwd: repository });
+  await execute("git", ["config", "user.email", "t3@example.test"], { cwd: repository });
+  await execute("git", ["checkout", "-b", "main"], { cwd: repository });
+  await writeFile(join(repository, "file.txt"), "initial\n");
+  await execute("git", ["add", "."], { cwd: repository });
+  await execute("git", ["commit", "-m", "initial"], { cwd: repository });
+  await execute("git", ["push", "-u", "origin", "main"], { cwd: repository });
+  return repository;
+}

@@ -106,6 +106,7 @@ async function makeGateway(port: number, readOnly: boolean): Promise<T3Gateway> 
     environmentId: null,
     environmentLabel: null,
     dataDir: directory,
+    worktreeRoot: null,
     staleAfterMs: 30_000,
   };
   return new T3Gateway(

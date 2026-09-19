@@ -10,6 +10,7 @@ export interface GatewayConfig {
   readonly environmentId: string | null;
   readonly environmentLabel: string | null;
   readonly dataDir: string;
+  readonly worktreeRoot: string | null;
   readonly staleAfterMs: number;
 }
 
@@ -52,6 +53,7 @@ function boolean(value: string | undefined, fallback: boolean, name: string): bo
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const baseUrl = required(env.T3_HTTP_BASE_URL ?? "http://127.0.0.1:3773", "T3_HTTP_BASE_URL");
+  const configuredWorktreeRoot = optional(env.T3_MCP_WORKTREE_ROOT);
   let parsedBaseUrl: URL;
   try {
     parsedBaseUrl = new URL(baseUrl);
@@ -72,6 +74,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     environmentId: optional(env.T3_ENVIRONMENT_ID),
     environmentLabel: optional(env.T3_ENVIRONMENT_LABEL),
     dataDir: resolve(env.T3_MCP_DATA_DIR?.trim() || "./data"),
+    worktreeRoot: configuredWorktreeRoot === null ? null : resolve(configuredWorktreeRoot),
     staleAfterMs: integer(env.T3_STALE_AFTER_MS, 30_000, "T3_STALE_AFTER_MS"),
   };
 }

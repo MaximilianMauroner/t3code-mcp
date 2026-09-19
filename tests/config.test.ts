@@ -18,6 +18,7 @@ describe("loadConfig", () => {
     expect(config.port).toBe(8787);
     expect(config.staleAfterMs).toBe(30_000);
     expect(config.dataDir).toContain("data");
+    expect(config.worktreeRoot).toBeNull();
   });
 
   it("accepts explicit booleans, ports, environment identity, and data directory", () => {
@@ -29,6 +30,7 @@ describe("loadConfig", () => {
       T3_ENVIRONMENT_ID: "env-1",
       T3_ENVIRONMENT_LABEL: "remote",
       T3_MCP_DATA_DIR: "/tmp/t3-code-mcp-test-data",
+      T3_MCP_WORKTREE_ROOT: "/tmp/t3-code-mcp-worktrees",
       T3_STALE_AFTER_MS: "2500",
     });
 
@@ -39,6 +41,7 @@ describe("loadConfig", () => {
       environmentId: "env-1",
       environmentLabel: "remote",
       dataDir: "/tmp/t3-code-mcp-test-data",
+      worktreeRoot: "/tmp/t3-code-mcp-worktrees",
       staleAfterMs: 2500,
     });
   });
@@ -60,10 +63,12 @@ describe("loadConfig", () => {
       MCP_BEARER_TOKEN: "  ",
       T3_ENVIRONMENT_ID: "  ",
       T3_ENVIRONMENT_LABEL: "  ",
+      T3_MCP_WORKTREE_ROOT: "  ",
     });
 
     expect(config.mcpBearerToken).toBeNull();
     expect(config.environmentId).toBeNull();
     expect(config.environmentLabel).toBeNull();
+    expect(config.worktreeRoot).toBeNull();
   });
 });

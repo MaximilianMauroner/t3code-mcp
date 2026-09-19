@@ -54,7 +54,13 @@ describe("recoverable task delegation", () => {
   });
 
   it("starts a managed worktree from the selected origin branch", async () => {
+    const repository = await createRepositoryWithOrigin();
+    const originHead = (await execute("git", ["rev-parse", "refs/remotes/origin/main"], { cwd: repository })).stdout.trim();
+    await writeFile(join(repository, "local-only.txt"), "not on origin\n");
+    await execute("git", ["add", "."], { cwd: repository });
+    await execute("git", ["commit", "-m", "local only"], { cwd: repository });
     const { fake, gateway } = await setup();
+    fake.projects[0]!.workspaceRoot = repository;
     const input = {
       ...taskInput,
       idempotencyKey: "worktree-task-key",
@@ -70,23 +76,18 @@ describe("recoverable task delegation", () => {
     expect(fake.dispatches).toHaveLength(2);
     expect(fake.dispatches[0]?.command).toMatchObject({
       type: "thread.create",
-      branch: null,
-      worktreePath: null,
+      branch: expect.stringMatching(/^t3code\/mcp-[0-9a-f]+$/),
+      worktreePath: expect.stringContaining(".t3-code-mcp-worktrees"),
     });
     expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
-      bootstrap: {
-        prepareWorktree: {
-          projectCwd: "/remote/project-1",
-          baseBranch: "main",
-          startFromOrigin: true,
-          requireWorktree: true,
-        },
-        runSetupScript: true,
-      },
     });
     if (fake.dispatches[1]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
-    expect(fake.dispatches[1].command.bootstrap?.prepareWorktree?.branch).toMatch(/^t3code\/[0-9a-f]{8}$/);
+    expect(fake.dispatches[1].command.bootstrap).toBeUndefined();
+    const created = fake.dispatches[0]!.command;
+    if (created.type !== "thread.create" || created.worktreePath === null) throw new Error("expected explicit worktree");
+    expect((await execute("git", ["branch", "--show-current"], { cwd: created.worktreePath })).stdout.trim()).toBe(created.branch);
+    expect((await execute("git", ["rev-parse", "HEAD"], { cwd: created.worktreePath })).stdout.trim()).toBe(originHead);
   });
 
   it("rejects incomplete or conflicting worktree selections before dispatch", async () => {
@@ -104,6 +105,25 @@ describe("recoverable task delegation", () => {
     await expect(gateway.taskStart({ ...taskInput, idempotencyKey: "local-origin", startFromOrigin: false }))
       .rejects.toMatchObject({ code: "origin_selection_requires_worktree" });
     expect(fake.dispatches).toHaveLength(0);
+  });
+
+  it("fails before creating a T3 thread when the worktree base cannot be resolved", async () => {
+    const repository = await createRepositoryWithOrigin();
+    const { fake, gateway } = await setup();
+    fake.projects[0]!.workspaceRoot = repository;
+
+    const result = await gateway.taskStart({
+      ...taskInput,
+      idempotencyKey: "missing-worktree-base",
+      workspaceMode: "worktree",
+      branch: "does-not-exist",
+      startFromOrigin: true,
+    });
+
+    expect(result).toMatchObject({ stage: "rejected", thread: null, run: null });
+    expect(result.lastError).toContain("rev-parse failed");
+    expect(fake.dispatches).toHaveLength(0);
+    expect(fake.threads).toHaveLength(0);
   });
 
   it("starts once, lists by durable reference, and recovers through a fresh gateway", async () => {
@@ -231,3 +251,20 @@ describe("recoverable task delegation", () => {
     expect(result.limitations).toEqual(expect.arrayContaining([expect.stringContaining("uncommitted")]));
   });
 });
+
+async function createRepositoryWithOrigin(): Promise<string> {
+  const parent = await mkdtemp(join(tmpdir(), "t3-task-worktree-repository-"));
+  directories.push(parent);
+  const origin = join(parent, "origin.git");
+  const repository = join(parent, "workspace");
+  await execute("git", ["init", "--bare", origin]);
+  await execute("git", ["clone", origin, repository]);
+  await execute("git", ["config", "user.name", "T3 Test"], { cwd: repository });
+  await execute("git", ["config", "user.email", "t3@example.test"], { cwd: repository });
+  await execute("git", ["checkout", "-b", "main"], { cwd: repository });
+  await writeFile(join(repository, "file.txt"), "initial\n");
+  await execute("git", ["add", "."], { cwd: repository });
+  await execute("git", ["commit", "-m", "initial"], { cwd: repository });
+  await execute("git", ["push", "-u", "origin", "main"], { cwd: repository });
+  return repository;
+}

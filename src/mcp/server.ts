@@ -798,7 +798,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Create and start a T3 thread",
       description:
-        "Create a thread and start its required initial message as one MCP operation. The gateway safely sequences T3's ordinary thread.create and thread.turn.start commands and never sends if creation is uncertain. Set workspaceMode=worktree with branch and optional startFromOrigin to have T3 create a managed worktree before the turn starts. Use t3_thread_send only for follow-up messages on existing threads.",
+        "Create a thread and start its required initial message as one MCP operation. The gateway safely sequences T3's ordinary thread.create and thread.turn.start commands and never sends if creation is uncertain. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree and attach it to the T3 thread before the turn starts. Use t3_thread_send only for follow-up messages on existing threads.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -823,7 +823,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Start a recoverable T3 task",
       description:
-        "Create one T3 thread and dispatch its required initial instruction as a recoverable two-command operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have T3 create a managed worktree from the selected local or origin base branch. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.",
+        "Create one T3 thread and dispatch its required initial instruction as a recoverable two-command operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree from the selected local or origin base branch and attach it through ordinary HTTP thread creation. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.",
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),

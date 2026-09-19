@@ -161,6 +161,8 @@ export async function renderSetup(options: SetupOptions): Promise<{ readonly fil
     `MCP_PORT=${options.port}`,
     "# This directory also receives audit.jsonl, the append-only redacted usage trail.",
     `T3_MCP_DATA_DIR=${options.dataDir}`,
+    "# Optional absolute root for gateway-created isolated Git worktrees.",
+    `T3_MCP_WORKTREE_ROOT=`,
     "",
     "# OpenAI Secure MCP Tunnel runtime key. This is not an admin key.",
     `CONTROL_PLANE_API_KEY=`,

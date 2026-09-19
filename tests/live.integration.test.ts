@@ -28,6 +28,7 @@ liveDescribe("live T3 interface acceptance", () => {
       environmentId: process.env.T3_LIVE_ENVIRONMENT_ID?.trim() || null,
       environmentLabel: null,
       dataDir: directory,
+      worktreeRoot: process.env.T3_MCP_WORKTREE_ROOT?.trim() || null,
       staleAfterMs: 30_000,
     };
     const first = makeGateway(config);

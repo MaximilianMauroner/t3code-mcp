@@ -29,6 +29,7 @@ export async function gatewayFixture(fake: FakeT3, overrides: Partial<GatewayCon
     environmentId: null,
     environmentLabel: null,
     dataDir: directory,
+    worktreeRoot: null,
     staleAfterMs: 30_000,
     ...overrides,
   };

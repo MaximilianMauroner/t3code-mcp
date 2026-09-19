@@ -70,6 +70,7 @@ import {
   type GitStatusResult,
   type GitWorkspaceSelection,
 } from "./git/inspection.js";
+import { GitWorktreeManager } from "./git/worktree-manager.js";
 
 export type ConnectionStatus = "connected" | "disconnected";
 export type StateFreshness = "fresh" | "stale" | "unknown";
@@ -342,6 +343,14 @@ export interface ThreadCreateInput extends MutationCommonInput {
   readonly worktreePath?: string | null;
 }
 
+interface ManagedThreadCreateInput extends ThreadCreateInput {
+  /** Internal: prepare an explicit worktree before the ordinary HTTP create. */
+  readonly managedWorktree?: {
+    readonly baseBranch: string;
+    readonly startFromOrigin: boolean;
+  };
+}
+
 export interface ThreadStartInput extends MutationCommonInput {
   readonly projectId: string;
   readonly title: string;
@@ -603,6 +612,7 @@ export class T3Gateway {
     private readonly config: GatewayConfig,
     private readonly gitInspector = new GitInspector(),
     private readonly auditLog = new AuditLog(join(config.dataDir, "audit.jsonl")),
+    private readonly gitWorktrees = new GitWorktreeManager(config.worktreeRoot, auditLog),
   ) {}
 
   get audit(): AuditLog {
@@ -751,7 +761,7 @@ export class T3Gateway {
     if (workspaceMode === "worktree" && input.worktreePath != null) {
       throw new GatewayError(
         "worktree_path_not_allowed",
-        "workspaceMode=worktree creates a T3-managed path; worktreePath must be omitted.",
+        "workspaceMode=worktree creates a gateway-managed path; worktreePath must be omitted.",
       );
     }
     if (workspaceMode === "local" && input.startFromOrigin !== undefined) {
@@ -800,6 +810,9 @@ export class T3Gateway {
         interactionMode: input.interactionMode,
         branch: workspaceMode === "worktree" ? null : input.branch,
         worktreePath: workspaceMode === "worktree" ? null : input.worktreePath,
+        ...(workspaceMode === "worktree"
+          ? { managedWorktree: { baseBranch: input.branch!, startFromOrigin: input.startFromOrigin ?? false } }
+          : {}),
         idempotencyKey: task.threadIdempotencyKey,
       });
       task = await this.journal.updateTask(task.taskRef, {
@@ -814,7 +827,7 @@ export class T3Gateway {
       });
       if (created.status !== "accepted") return this.taskDetail(task, false);
 
-      if (workspaceMode === "local" && task.baselineAttribution === undefined) {
+      if (task.baselineAttribution === undefined) {
         try {
           const status = await this.gitStatus({ projectId: input.projectId, threadId: created.threadId, maxEntries: 1 });
           task = await this.journal.updateTask(task.taskRef, {
@@ -833,19 +846,6 @@ export class T3Gateway {
         runtimeMode: input.runtimeMode,
         interactionMode: input.interactionMode,
         titleSeed: input.title,
-        ...(workspaceMode === "worktree"
-          ? {
-              bootstrap: {
-                prepareWorktree: {
-                  projectCwd: (await this.findProject(input.projectId)).workspaceRoot,
-                  baseBranch: input.branch!,
-                  startFromOrigin: input.startFromOrigin ?? false,
-                  requireWorktree: true,
-                },
-                runSetupScript: true,
-              },
-            }
-          : {}),
         idempotencyKey: task.runIdempotencyKey,
       });
       task = await this.journal.updateTask(task.taskRef, {
@@ -859,19 +859,6 @@ export class T3Gateway {
             : "dispatch_rejected",
         lastError: sent.status === "accepted" ? null : sent.reason,
       });
-      // A managed worktree does not exist until the bootstrap dispatch has
-      // been accepted, so it cannot use the pre-dispatch baseline path above.
-      if (workspaceMode === "worktree" && sent.status === "accepted" && task.baselineAttribution === undefined) {
-        try {
-          const status = await this.gitStatus({ projectId: input.projectId, threadId: created.threadId, maxEntries: 1 });
-          task = await this.journal.updateTask(task.taskRef, {
-            baselineAttribution: status.clean ? "clean" : "dirty",
-            ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
-          });
-        } catch {
-          task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
-        }
-      }
       return this.taskDetail(task, false);
     } catch (error) {
       if (error instanceof GatewayError && ["project_not_found", "model_selection_required", "thread_busy"].includes(error.code)) {
@@ -1175,7 +1162,7 @@ export class T3Gateway {
     return this.projectCreateResult(result, input.workspaceRoot);
   }
 
-  async threadCreate(input: ThreadCreateInput): Promise<ThreadCreateResult> {
+  async threadCreate(input: ManagedThreadCreateInput): Promise<ThreadCreateResult> {
     const payload = {
       projectId: input.projectId,
       title: input.title,
@@ -1184,6 +1171,7 @@ export class T3Gateway {
       interactionMode: input.interactionMode ?? "default",
       branch: input.branch ?? null,
       worktreePath: input.worktreePath ?? null,
+      managedWorktree: input.managedWorktree ?? null,
     } satisfies Record<string, unknown>;
     if (this.config.readOnly) {
       await this.requireOperationScope();
@@ -1224,7 +1212,7 @@ export class T3Gateway {
           throw new GatewayError(
             "workspace_missing",
             `The requested thread workspace does not exist: ${input.worktreePath}. ` +
-              "Use t3_task_start with workspaceMode=worktree to have T3 create a managed worktree.",
+              "Use t3_task_start with workspaceMode=worktree to have the gateway create an isolated worktree.",
           );
         }
         throw new GatewayError(
@@ -1252,6 +1240,27 @@ export class T3Gateway {
       const reconciled = await this.reconcile(begun.record);
       return this.threadCreateResult(reconciled, input.projectId, modelSelection, input.branch ?? null, input.worktreePath ?? null);
     }
+    let selectedBranch = input.branch ?? null;
+    let selectedWorktreePath = input.worktreePath ?? null;
+    if (input.managedWorktree !== undefined) {
+      try {
+        const worktree = await this.gitWorktrees.prepare({
+          projectId: input.projectId,
+          projectWorkspaceRoot: project.workspaceRoot,
+          baseBranch: input.managedWorktree.baseBranch,
+          startFromOrigin: input.managedWorktree.startFromOrigin,
+          operationKey: begun.record.commandId,
+        });
+        selectedBranch = worktree.branch;
+        selectedWorktreePath = worktree.path;
+      } catch (error) {
+        const rejected = await this.journal.update(begun.record.operationId, {
+          status: "rejected",
+          lastError: safeErrorMessage(error),
+        });
+        return this.threadCreateResult(rejected, input.projectId, modelSelection, selectedBranch, selectedWorktreePath);
+      }
+    }
     const command: ThreadCreateCommand = {
       type: "thread.create",
       commandId: begun.record.commandId,
@@ -1261,12 +1270,12 @@ export class T3Gateway {
       modelSelection,
       runtimeMode: input.runtimeMode ?? "full-access",
       interactionMode: input.interactionMode ?? "default",
-      branch: input.branch ?? null,
-      worktreePath: input.worktreePath ?? null,
+      branch: selectedBranch,
+      worktreePath: selectedWorktreePath,
       createdAt: new Date().toISOString(),
     };
     const result = await this.dispatchNew(begun.record, command);
-    return this.threadCreateResult(result, input.projectId, modelSelection, command.branch, command.worktreePath);
+    return this.threadCreateResult(result, input.projectId, modelSelection, selectedBranch, selectedWorktreePath);
   }
 
   async threadStart(input: ThreadStartInput): Promise<ThreadSendResult> {
@@ -1280,7 +1289,7 @@ export class T3Gateway {
     if (workspaceMode === "worktree" && input.worktreePath != null) {
       throw new GatewayError(
         "worktree_path_not_allowed",
-        "workspaceMode=worktree creates a T3-managed path; worktreePath must be omitted.",
+        "workspaceMode=worktree creates a gateway-managed path; worktreePath must be omitted.",
       );
     }
     if (workspaceMode === "local" && input.startFromOrigin !== undefined) {
@@ -1322,6 +1331,9 @@ export class T3Gateway {
       interactionMode: input.interactionMode,
       branch: workspaceMode === "worktree" ? null : input.branch,
       worktreePath: workspaceMode === "worktree" ? null : input.worktreePath,
+      ...(workspaceMode === "worktree"
+        ? { managedWorktree: { baseBranch: input.branch!, startFromOrigin: input.startFromOrigin ?? false } }
+        : {}),
       idempotencyKey: `${input.idempotencyKey}:thread`,
     });
     if (created.status !== "accepted") {
@@ -1339,19 +1351,6 @@ export class T3Gateway {
       runtimeMode: input.runtimeMode,
       interactionMode: input.interactionMode,
       titleSeed: input.title,
-      ...(workspaceMode === "worktree"
-        ? {
-            bootstrap: {
-              prepareWorktree: {
-                projectCwd: (await this.findProject(input.projectId)).workspaceRoot,
-                baseBranch: input.branch!,
-                startFromOrigin: input.startFromOrigin ?? false,
-                requireWorktree: true,
-              },
-              runSetupScript: true,
-            },
-          }
-        : {}),
       idempotencyKey: `${input.idempotencyKey}:turn`,
     });
   }
@@ -2227,7 +2226,7 @@ export class T3Gateway {
         throw new GatewayError(
           "workspace_missing",
           `The requested thread workspace does not exist: ${worktreePath}. ` +
-            "Use workspaceMode=worktree to have T3 create a managed worktree.",
+            "Use workspaceMode=worktree to have the gateway create an isolated worktree.",
         );
       }
       throw new GatewayError("workspace_unreadable", `The requested thread workspace cannot be inspected: ${worktreePath}`);
@@ -2988,5 +2987,6 @@ export function makeGateway(config: GatewayConfig): {
   const client = new T3HttpClient(config.t3HttpBaseUrl, config.t3AccessToken, 15_000, auditLog);
   const journal = new OperationJournal(join(config.dataDir, "operations.json"), auditLog);
   const gitInspector = new GitInspector(auditLog);
-  return { gateway: new T3Gateway(client, journal, config, gitInspector, auditLog), client, journal, auditLog };
+  const gitWorktrees = new GitWorktreeManager(config.worktreeRoot, auditLog);
+  return { gateway: new T3Gateway(client, journal, config, gitInspector, auditLog, gitWorktrees), client, journal, auditLog };
 }
