@@ -780,70 +780,15 @@ export class T3Gateway {
       runtimeMode: input.runtimeMode,
     })).record;
 
-    // Tasks created by older gateway versions have a separate durable
-    // thread.create child. Continue their two-command recovery path below.
-    // New tasks use the same atomic create+first-message bootstrap exposed by
-    // t3_thread_create, so a successfully created thread can never be empty.
-    const legacyThreadOperation = await this.journal.getByIdempotencyKey(task.threadIdempotencyKey);
-    if (legacyThreadOperation === null) {
-      try {
-        if (workspaceMode === "local" && task.baselineAttribution === undefined) {
-          try {
-            const status = await this.gitStatus({ projectId: input.projectId, maxEntries: 1 });
-            task = await this.journal.updateTask(task.taskRef, {
-              baselineAttribution: status.clean ? "clean" : "dirty",
-              ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
-            });
-          } catch {
-            task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
-          }
-        }
-
-        const started = await this.threadStart({
-          projectId: input.projectId,
-          title: input.title,
-          message: input.instruction,
-          modelSelection: input.modelSelection,
-          runtimeMode: input.runtimeMode,
-          interactionMode: input.interactionMode,
-          workspaceMode,
-          branch: input.branch,
-          worktreePath: input.worktreePath,
-          startFromOrigin: input.startFromOrigin,
-          idempotencyKey: task.runIdempotencyKey,
-        });
-        task = await this.journal.updateTask(task.taskRef, {
-          threadId: started.threadId,
-          runId: started.runId,
-          messageId: started.messageId,
-          threadOperationId: started.operationId,
-          runOperationId: started.operationId,
-          stage: started.status === "accepted"
-            ? "run_accepted"
-            : started.status === "uncertain"
-              ? "dispatch_uncertain"
-              : "dispatch_rejected",
-          lastError: started.status === "accepted" ? null : started.reason,
-        });
-        if (workspaceMode === "worktree" && started.status === "accepted" && task.baselineAttribution === undefined) {
-          try {
-            const status = await this.gitStatus({ projectId: input.projectId, threadId: started.threadId, maxEntries: 1 });
-            task = await this.journal.updateTask(task.taskRef, {
-              baselineAttribution: status.clean ? "clean" : "dirty",
-              ...(status.branch.headCommit === null ? {} : { baselineRevision: status.branch.headCommit }),
-            });
-          } catch {
-            task = await this.journal.updateTask(task.taskRef, { baselineAttribution: "unavailable" });
-          }
-        }
-        return this.taskDetail(task, false);
-      } catch (error) {
-        if (error instanceof GatewayError && ["project_not_found", "model_selection_required"].includes(error.code)) {
-          task = await this.journal.updateTask(task.taskRef, { stage: "rejected", lastError: error.message });
-          return this.taskDetail(task, false);
-        }
-        throw error;
-      }
+    // Preserve receipts created by the short-lived atomic-bootstrap version.
+    // Those operations must be reconciled in place rather than replaced with
+    // a second thread under the same task key.
+    const [existingThreadOperation, existingRunOperation] = await Promise.all([
+      this.journal.getByIdempotencyKey(task.threadIdempotencyKey),
+      this.journal.getByIdempotencyKey(task.runIdempotencyKey),
+    ]);
+    if (existingThreadOperation === null && existingRunOperation !== null) {
+      return this.taskDetail(task);
     }
 
     try {
@@ -1344,7 +1289,7 @@ export class T3Gateway {
         "startFromOrigin is only valid when workspaceMode=worktree.",
       );
     }
-    const payload = {
+    const legacyPayload = {
       projectId: input.projectId,
       title: input.title,
       message: input.message,
@@ -1356,85 +1301,59 @@ export class T3Gateway {
       worktreePath: input.worktreePath ?? null,
       startFromOrigin: input.startFromOrigin ?? false,
     };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
+    const legacyOperation = await this.journal.getByIdempotencyKey(input.idempotencyKey);
+    if (legacyOperation !== null) {
       const begun = await this.journal.begin({
         kind: "thread.turn.start",
         idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        projectId: existing.projectId ?? input.projectId,
-        threadId: existing.threadId,
-        runId: existing.runId,
-        messageId: existing.messageId,
+        payloadHash: hashPayload(legacyPayload),
+        projectId: legacyOperation.projectId ?? input.projectId,
+        threadId: legacyOperation.threadId,
+        runId: legacyOperation.runId,
+        messageId: legacyOperation.messageId,
       });
       return this.threadSendResult(await this.reconcile(begun.record));
     }
-
-    await this.requireOperationScope();
-    const project = await this.findProject(input.projectId);
-    if (workspaceMode === "local" && input.worktreePath != null) {
-      await this.requireExistingWorkspace(input.worktreePath);
-    }
-    const modelSelection = input.modelSelection ?? project.defaultModelSelection;
-    if (modelSelection === null || modelSelection === undefined) {
+    const created = await this.threadCreate({
+      projectId: input.projectId,
+      title: input.title,
+      modelSelection: input.modelSelection,
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode,
+      branch: workspaceMode === "worktree" ? null : input.branch,
+      worktreePath: workspaceMode === "worktree" ? null : input.worktreePath,
+      idempotencyKey: `${input.idempotencyKey}:thread`,
+    });
+    if (created.status !== "accepted") {
       throw new GatewayError(
-        "model_selection_required",
-        "The project has no default model. Call t3_providers_list to discover available instanceId/model values, then supply modelSelection.",
+        created.status === "uncertain" ? "thread_create_uncertain" : "thread_create_rejected",
+        `Initial message was not sent because thread creation was ${created.status}. ` +
+          `Thread ${created.threadId}; operation ${created.operationId}. ${created.reason}`,
       );
     }
 
-    const threadId = randomUUID();
-    const runId = `run_${randomUUID()}`;
-    const messageId = `user:msg_${randomUUID().replaceAll("-", "")}`;
-    const begun = await this.journal.begin({
-      kind: "thread.turn.start",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      projectId: input.projectId,
-      threadId,
-      runId,
-      messageId,
-    });
-    if (begun.reused) return this.threadSendResult(await this.reconcile(begun.record));
-
-    const createdAt = new Date().toISOString();
-    const temporaryBranch = `t3code/${begun.record.commandId.toLowerCase().replaceAll("-", "").slice(0, 8)}`;
-    const command: ThreadTurnStartCommand = {
-      type: "thread.turn.start",
-      commandId: begun.record.commandId,
-      threadId,
-      message: { messageId, role: "user", text: input.message, attachments: [] },
-      modelSelection,
-      titleSeed: input.title,
+    return this.threadSend({
+      threadId: created.threadId,
+      message: input.message,
+      modelSelection: input.modelSelection,
       runtimeMode: input.runtimeMode,
-      interactionMode: input.interactionMode ?? "default",
-      bootstrap: {
-        createThread: {
-          projectId: input.projectId,
-          title: input.title,
-          modelSelection,
-          runtimeMode: input.runtimeMode,
-          interactionMode: input.interactionMode ?? "default",
-          branch: input.branch ?? null,
-          worktreePath: workspaceMode === "worktree" ? null : (input.worktreePath ?? null),
-          createdAt,
-        },
-        ...(workspaceMode === "worktree"
-          ? {
+      interactionMode: input.interactionMode,
+      titleSeed: input.title,
+      ...(workspaceMode === "worktree"
+        ? {
+            bootstrap: {
               prepareWorktree: {
-                projectCwd: project.workspaceRoot,
+                projectCwd: (await this.findProject(input.projectId)).workspaceRoot,
                 baseBranch: input.branch!,
-                branch: temporaryBranch,
                 startFromOrigin: input.startFromOrigin ?? false,
                 requireWorktree: true,
               },
               runSetupScript: true,
-            }
-          : {}),
-      },
-      createdAt,
-    };
-    return this.threadSendResult(await this.dispatchNew(begun.record, command));
+            },
+          }
+        : {}),
+      idempotencyKey: `${input.idempotencyKey}:turn`,
+    });
   }
 
   async threadSend(input: ThreadSendInput): Promise<ThreadSendResult> {

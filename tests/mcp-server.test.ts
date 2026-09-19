@@ -177,9 +177,14 @@ describe("MCP tool contract", () => {
 
     expect(started.isError).not.toBe(true);
     expect(fake.dispatches[0]?.command).toMatchObject({
+      type: "thread.create",
+      projectId: "project-worktree-mcp",
+      branch: null,
+      worktreePath: null,
+    });
+    expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
       bootstrap: {
-        createThread: { projectId: "project-worktree-mcp" },
         prepareWorktree: {
           projectCwd: "/remote/worktree-project",
           baseBranch: "main",
@@ -240,40 +245,46 @@ describe("MCP tool contract", () => {
 
   it("creates a thread only together with its initial message", async () => {
     const { fake, client } = await connectedClient();
-    fake.addProject({ id: "atomic-create-project", workspaceRoot: "/remote/atomic" });
+    fake.addProject({ id: "wrapped-create-project", workspaceRoot: "/remote/wrapped" });
 
     const missingMessage = await client.callTool({ name: "t3_thread_create", arguments: {
-      projectId: "atomic-create-project",
+      projectId: "wrapped-create-project",
       title: "No empty threads",
       runtimeMode: "approval-required",
-      idempotencyKey: "atomic-missing-message",
+      idempotencyKey: "wrapped-missing-message",
     } });
     expect(missingMessage.isError).toBe(true);
     expect(fake.dispatches).toHaveLength(0);
 
     const created = await client.callTool({ name: "t3_thread_create", arguments: {
-      projectId: "atomic-create-project",
-      title: "Atomic worktree thread",
+      projectId: "wrapped-create-project",
+      title: "Wrapped worktree thread",
       message: "Inspect the project.",
       runtimeMode: "approval-required",
       workspaceMode: "worktree",
       branch: "main",
       startFromOrigin: true,
-      idempotencyKey: "atomic-create",
+      idempotencyKey: "wrapped-create",
     } });
     expect(created.isError).not.toBe(true);
     expect(created.structuredContent).toMatchObject({
       status: "accepted",
-      projectId: "atomic-create-project",
+      projectId: "wrapped-create-project",
       runId: expect.stringMatching(/^run_/),
       messageId: expect.stringMatching(/^user:msg_/),
     });
-    expect(fake.dispatches).toHaveLength(1);
+    expect(fake.dispatches).toHaveLength(2);
     expect(fake.dispatches[0]?.command).toMatchObject({
+      type: "thread.create",
+      projectId: "wrapped-create-project",
+      title: "Wrapped worktree thread",
+      branch: null,
+      worktreePath: null,
+    });
+    expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
       message: { text: "Inspect the project." },
       bootstrap: {
-        createThread: { projectId: "atomic-create-project", title: "Atomic worktree thread" },
         prepareWorktree: { baseBranch: "main", startFromOrigin: true },
       },
     });
