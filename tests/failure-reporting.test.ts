@@ -192,7 +192,7 @@ describe("structured provider failures", () => {
   });
 
   it("binds a session-only failure to its active turn", async () => {
-    const { fixture, thread, run } = await setup(false);
+    const { fixture, thread, run } = await setup();
     const turnId = thread.latestTurn!.turnId;
     thread.latestTurn = null;
     thread.session = { status: "error", activeTurnId: turnId, lastError: "Session failed before turn projection" };
@@ -202,8 +202,9 @@ describe("structured provider failures", () => {
     expect((await fixture.gateway.threadGet(thread.id)).thread.failure?.turnId).toBe(turnId);
     thread.session = { status: "ready", activeTurnId: null, lastError: null };
     const restarted = makeGateway(fixture.config).gateway;
-    expect((await restarted.threadGet(thread.id)).thread.failure?.message)
-      .toBe("Session failed before turn projection");
+    const detail = (await restarted.threadGet(thread.id)).thread;
+    expect(detail.failure?.message).toBe("Session failed before turn projection");
+    expect(detail.latestResponse).toBeNull();
     expect((await restarted.runGet(run.runId)).failure?.turnId).toBe(turnId);
   });
 

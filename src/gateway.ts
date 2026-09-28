@@ -1098,7 +1098,13 @@ export class T3Gateway {
       const retained = latestUserTurnId
         ? await this.journal.getFailureByTurnId(threadId, latestUserTurnId)
         : null;
-      if (retained !== null) detail = { ...detail, failure: retained };
+      if (retained !== null) {
+        detail = {
+          ...detail,
+          failure: retained,
+          latestResponse: latestAssistant(snapshot.thread.messages, retained.turnId),
+        };
+      }
     }
     return {
       environmentId,
