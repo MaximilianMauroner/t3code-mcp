@@ -1090,11 +1090,19 @@ export class T3Gateway {
     const environmentId = await this.environmentId();
     const summary = shell.threads.find((thread) => thread.id === threadId);
     const projectTitle = shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ?? null;
+    let detail = await this.withRetainedFailure(
+      threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now()),
+    );
+    if (detail.failure === null && snapshot.thread.latestTurn == null) {
+      const latestUserTurnId = snapshot.thread.messages.filter((message) => message.role === "user").at(-1)?.turnId;
+      const retained = latestUserTurnId
+        ? await this.journal.getFailureByTurnId(threadId, latestUserTurnId)
+        : null;
+      if (retained !== null) detail = { ...detail, failure: retained };
+    }
     return {
       environmentId,
-      thread: await this.withRetainedFailure(
-        threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now()),
-      ),
+      thread: detail,
     };
   }
 
@@ -2134,9 +2142,10 @@ export class T3Gateway {
   }
 
   private async withRetainedFailure<T extends ThreadSummary>(summary: T): Promise<T> {
-    if (summary.latestTurn?.state !== "error" || summary.failure === null) return summary;
+    if (summary.failure === null || summary.failure.turnId === null ||
+      (summary.latestTurn !== null && summary.latestTurn.state !== "error")) return summary;
     const retained = await this.journal.retainTerminalFailure(
-      summary.id, summary.latestTurn.turnId, summary.failure,
+      summary.id, summary.failure.turnId, summary.failure,
     );
     return { ...summary, failure: retained };
   }
@@ -2160,19 +2169,24 @@ export class T3Gateway {
       }
       const latestTurn = thread.latestTurn ?? null;
       const sameTurn = latestTurn !== null && turnId !== null && latestTurn.turnId === turnId;
+      const matchingSessionFailure = latestTurn === null && turnId !== null
+        ? failureInfo(thread, turnId)
+        : null;
       const observedRunStatus =
         record.status === "rejected"
           ? "failed"
-          : record.status === "uncertain" && message === null && latestTurn === null
-            ? "unknown"
-            : sameTurn
+          : matchingSessionFailure !== null
+              ? "failed"
+              : record.status === "uncertain" && message === null && latestTurn === null
+                ? "unknown"
+              : sameTurn
               ? latestTurnToRunStatus(latestTurn, thread)
               : message?.role === "assistant"
                 ? "completed"
                 : "accepted";
       const observedFailure = observedRunStatus === "failed" && sameTurn
         ? failureInfo(thread, turnId)
-        : null;
+        : matchingSessionFailure;
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
       const failure = turnId !== null && (observedFailure !== null || priorFailure !== null)
         ? await this.journal.retainTerminalFailure(
@@ -2207,14 +2221,19 @@ export class T3Gateway {
     } catch (error) {
       const telemetry = this.client.telemetry();
       const observedAt = new Date().toISOString();
+      const latestRecord = await this.journal.getByOperationId(record.operationId).catch(() => null) ?? record;
+      const retainedFailure = latestRecord.threadId && latestRecord.turnId
+        ? await this.journal.getFailureByTurnId(latestRecord.threadId, latestRecord.turnId).catch(() => null)
+        : null;
+      const failure = retainedFailure ?? latestRecord.terminalFailure ?? null;
       return {
         environmentId: await this.environmentId().catch(() => this.config.environmentId ?? "unknown"),
         operationId: record.operationId,
         projectId: record.projectId ?? null,
         threadId: record.threadId ?? null,
         runId: record.runId,
-        t3TurnId: record.turnId ?? null,
-        runStatus: record.terminalRunStatus ?? "unknown",
+        t3TurnId: latestRecord.turnId ?? null,
+        runStatus: latestRecord.terminalRunStatus === "failed" || failure !== null ? "failed" : "unknown",
         providerTurnId: null,
         connectionStatus: "disconnected",
         stateFreshness: freshness(telemetry.lastSnapshotAt, this.config.staleAfterMs),
@@ -2223,7 +2242,7 @@ export class T3Gateway {
         threadQuality: null,
         threadWarning: null,
         latestResponse: null,
-        failure: record.terminalRunStatus === "failed" ? record.terminalFailure ?? null : null,
+        failure,
         pendingActions: { approvals: false, userInput: false },
         error: sanitizeFailureText(safeErrorMessage(error), 2_000),
       };
@@ -2838,7 +2857,8 @@ function failureInfo(thread: ThreadShell, expectedTurnId?: string | null): Failu
   const failed = thread.latestTurn?.state === "error" ||
     (thread.latestTurn == null && session?.status === "error");
   if (!failed) return null;
-  const sourceTurnId = thread.latestTurn?.turnId ?? null;
+  const sourceTurnId = thread.latestTurn?.turnId ??
+    (typeof session?.activeTurnId === "string" ? session.activeTurnId : null);
   if (expectedTurnId && sourceTurnId !== expectedTurnId) return null;
   const sessionMatchesTurn = sourceTurnId !== null &&
     (session?.activeTurnId === sourceTurnId ||

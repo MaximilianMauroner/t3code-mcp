@@ -128,6 +128,25 @@ describe("OperationJournal", () => {
       }],
     }));
     await expect(new OperationJournal(path).init()).rejects.toThrow("invalid task");
+
+    const valid = {
+      operationId: "op-1", kind: "thread.turn.start", idempotencyKey: "key-1",
+      payloadHash: "hash", commandId: "command-1", status: "accepted",
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      threadId: "thread-1", turnId: "turn-1",
+    };
+    await writeFile(path, JSON.stringify({ operations: [{ ...valid, terminalRunStatus: "completed" }] }));
+    await expect(new OperationJournal(path).init()).rejects.toThrow("invalid operation");
+
+    await writeFile(path, JSON.stringify({
+      operations: [{ ...valid, terminalRunStatus: "failed", terminalFailure: { message: "missing fields" } }],
+    }));
+    await expect(new OperationJournal(path).init()).rejects.toThrow("invalid operation");
+
+    await writeFile(path, JSON.stringify({
+      operations: [], threadFailures: [{ threadId: "thread-1", turnId: "turn-1", failure: { message: "missing fields" } }],
+    }));
+    await expect(new OperationJournal(path).init()).rejects.toThrow("invalid thread failure");
   });
 
   it("loads a version-one operation journal and upgrades it when a task is added", async () => {

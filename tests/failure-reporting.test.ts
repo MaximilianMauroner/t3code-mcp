@@ -172,7 +172,65 @@ describe("structured provider failures", () => {
     thread.session = { status: "error", activeTurnId: turnId, lastError: "Updated in overview" };
     await restarted.threadsOverview({ includeArchived: false, runningLimit: 5 });
     thread.session = { status: "ready", activeTurnId: null, lastError: null };
-    expect((await restarted.threadGet(thread.id)).thread.failure?.message).toBe("Updated in overview");
+    expect((await restarted.threadGet(thread.id)).thread.failure?.message).toBe("First observed in threadGet");
+  });
+
+  it("keeps retained failure metadata when a later session observation is less specific", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = {
+      status: "error", activeTurnId: turnId, lastError: "Usage exhausted",
+      failureCategory: "quota", failureCode: "usage_limit", resetAt: "2026-09-30T00:00:00Z",
+    };
+    await fixture.gateway.runGet(run.runId);
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Later generic error" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({
+      category: "quota", code: "usage_limit", message: "Usage exhausted",
+      resetAt: "2026-09-30T00:00:00.000Z",
+    });
+  });
+
+  it("binds a session-only failure to its active turn", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = null;
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Session failed before turn projection" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({
+      turnId, source: "t3_session", message: "Session failed before turn projection",
+    });
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure?.turnId).toBe(turnId);
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    const restarted = makeGateway(fixture.config).gateway;
+    expect((await restarted.threadGet(thread.id)).thread.failure?.message)
+      .toBe("Session failed before turn projection");
+    expect((await restarted.runGet(run.runId)).failure?.turnId).toBe(turnId);
+  });
+
+  it("returns a failure retained by threadGet after T3 disconnects", async () => {
+    const { fake, fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    await fixture.gateway.runGet(run.runId);
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Thread-only observation" };
+    await fixture.gateway.threadGet(thread.id);
+    await fake.close();
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId))).toMatchObject({
+      runStatus: "failed", connectionStatus: "disconnected",
+      failure: { message: "Thread-only observation", turnId },
+    });
+  });
+
+  it("returns a failure persisted before a descriptor request fails", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Provider refused" };
+    fixture.client.getDescriptor = async () => { throw new Error("descriptor unavailable"); };
+    expect(await fixture.gateway.runGet(run.runId)).toMatchObject({
+      runStatus: "failed", connectionStatus: "disconnected",
+      failure: { message: "Provider refused", turnId },
+    });
   });
 
   it("keeps a precise failure when concurrent reads later see only a generic fallback", async () => {
