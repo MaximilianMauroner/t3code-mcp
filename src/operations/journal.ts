@@ -49,6 +49,12 @@ export interface OperationRecord {
   readonly terminalFailure?: FailureInfo | null;
 }
 
+interface ThreadFailureRecord {
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly failure: FailureInfo;
+}
+
 export interface TaskRecord {
   readonly taskRef: string;
   readonly idempotencyKey: string;
@@ -99,6 +105,7 @@ export class IdempotencyConflictError extends Error {
 export class OperationJournal {
   private readonly entries = new Map<string, OperationRecord>();
   private readonly tasks = new Map<string, TaskRecord>();
+  private readonly threadFailures = new Map<string, ThreadFailureRecord>();
   private initialized = false;
   private writing: Promise<void> = Promise.resolve();
 
@@ -137,6 +144,16 @@ export class OperationJournal {
           throw new Error("Operation journal contains an invalid task.");
         }
         this.tasks.set(task.idempotencyKey, task);
+      }
+      const threadFailures = (parsed as { threadFailures?: unknown }).threadFailures;
+      if (threadFailures !== undefined && !Array.isArray(threadFailures)) {
+        throw new Error("Operation journal thread failures must be an array.");
+      }
+      for (const item of threadFailures ?? []) {
+        if (!isThreadFailureRecord(item)) {
+          throw new Error("Operation journal contains an invalid thread failure.");
+        }
+        this.threadFailures.set(`${item.threadId}\u0000${item.turnId}`, item);
       }
     } catch (error) {
       if (!isFileNotFound(error)) {
@@ -381,11 +398,60 @@ export class OperationJournal {
 
   async getFailureByTurnId(threadId: string, turnId: string): Promise<FailureInfo | null> {
     await this.init();
+    const retained = this.threadFailures.get(`${threadId}\u0000${turnId}`);
+    if (retained) return retained.failure;
     return [...this.entries.values()].find((entry) =>
       entry.kind === "thread.turn.start" && entry.threadId === threadId &&
       entry.turnId === turnId && entry.terminalRunStatus === "failed" &&
       entry.terminalFailure?.turnId === turnId
     )?.terminalFailure ?? null;
+  }
+
+  async retainTerminalFailure(
+    threadId: string,
+    turnId: string,
+    candidate: FailureInfo,
+    operationId?: string,
+  ): Promise<FailureInfo> {
+    await this.init();
+    if (candidate.turnId !== turnId) {
+      throw new Error("A terminal failure must match its turn.");
+    }
+    const key = `${threadId}\u0000${turnId}`;
+    const operation = operationId === undefined
+      ? null
+      : [...this.entries.values()].find((entry) => entry.operationId === operationId) ?? null;
+    if (operation !== null && (operation.threadId !== threadId ||
+      (operation.turnId !== undefined && operation.turnId !== turnId))) {
+      throw new Error("A terminal failure does not match the run operation.");
+    }
+    const legacyFailure = [...this.entries.values()].find((entry) =>
+      entry.kind === "thread.turn.start" && entry.threadId === threadId &&
+      entry.turnId === turnId && entry.terminalFailure?.turnId === turnId
+    )?.terminalFailure ?? null;
+    const existing = this.threadFailures.get(key)?.failure ?? operation?.terminalFailure ?? legacyFailure;
+    const failure = existing?.source === "t3_session" && candidate.source === "t3_turn"
+      ? existing
+      : candidate;
+    const failureChanged = JSON.stringify(existing) !== JSON.stringify(failure);
+    const operationChanged = operation !== null && (operation.terminalRunStatus !== "failed" ||
+      operation.turnId !== turnId || JSON.stringify(operation.terminalFailure) !== JSON.stringify(failure));
+    if (!failureChanged && !operationChanged) return failure;
+
+    // Update both maps before awaiting persistence so concurrent reads cannot
+    // replace a precise session failure with a later generic turn fallback.
+    this.threadFailures.set(key, { threadId, turnId, failure });
+    if (operation !== null) {
+      this.entries.set(operation.idempotencyKey, {
+        ...operation,
+        turnId,
+        terminalRunStatus: "failed",
+        terminalFailure: failure,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    await this.persist();
+    return failure;
   }
 
   private async persist(): Promise<void> {
@@ -396,6 +462,7 @@ export class OperationJournal {
           version: 2,
           operations: [...this.entries.values()],
           tasks: [...this.tasks.values()],
+          threadFailures: [...this.threadFailures.values()],
         },
         null,
         2,
@@ -445,6 +512,16 @@ function isOperationRecord(value: unknown): value is OperationRecord {
     typeof entry.createdAt === "string" &&
     typeof entry.updatedAt === "string"
   );
+}
+
+function isThreadFailureRecord(value: unknown): value is ThreadFailureRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  if (typeof item.threadId !== "string" || typeof item.turnId !== "string" ||
+    typeof item.failure !== "object" || item.failure === null) return false;
+  const failure = item.failure as Record<string, unknown>;
+  return failure.turnId === item.turnId && typeof failure.message === "string" &&
+    ["t3_session", "t3_turn"].includes(String(failure.source));
 }
 
 function isTaskRecord(value: unknown): value is TaskRecord {

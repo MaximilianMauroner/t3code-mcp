@@ -1017,6 +1017,10 @@ export class T3Gateway {
       executionCounts[threadActivity(thread)] += 1;
       if (needsAttentionFor(thread, now)) needsAttentionCount += 1;
     }
+    await Promise.all(filtered.filter((thread) => thread.latestTurn?.state === "error")
+      .map((thread) => this.withRetainedFailure(
+        threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
+      )));
     const running = filtered
       .filter(isThreadRunning)
       .map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
@@ -2130,10 +2134,11 @@ export class T3Gateway {
   }
 
   private async withRetainedFailure<T extends ThreadSummary>(summary: T): Promise<T> {
-    if (summary.latestTurn?.state !== "error" || summary.failure === null ||
-      summary.failure.source === "t3_session") return summary;
-    const retained = await this.journal.getFailureByTurnId(summary.id, summary.latestTurn.turnId);
-    return retained === null ? summary : { ...summary, failure: retained };
+    if (summary.latestTurn?.state !== "error" || summary.failure === null) return summary;
+    const retained = await this.journal.retainTerminalFailure(
+      summary.id, summary.latestTurn.turnId, summary.failure,
+    );
+    return { ...summary, failure: retained };
   }
 
   private async observeRun(record: OperationRecord): Promise<RunResult> {
@@ -2165,23 +2170,18 @@ export class T3Gateway {
               : message?.role === "assistant"
                 ? "completed"
                 : "accepted";
-      const runStatus = record.terminalRunStatus ?? observedRunStatus;
       const observedFailure = observedRunStatus === "failed" && sameTurn
         ? failureInfo(thread, turnId)
         : null;
-      const failure = observedFailure !== null &&
-        observedFailure.message !== "T3 reported that the provider turn failed without an error message."
-        ? observedFailure
-        : record.terminalFailure ?? observedFailure;
-      if (observedRunStatus === "failed" && turnId !== null &&
-        (record.terminalRunStatus === undefined ||
-          (failure !== null && JSON.stringify(failure) !== JSON.stringify(record.terminalFailure)))) {
-        await this.journal.update(record.operationId, {
-          turnId,
-          terminalRunStatus: "failed",
-          terminalFailure: failure ?? null,
-        });
-      }
+      const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
+      const failure = turnId !== null && (observedFailure !== null || priorFailure !== null)
+        ? await this.journal.retainTerminalFailure(
+          thread.id, turnId, observedFailure ?? priorFailure!, record.operationId,
+        )
+        : record.terminalFailure ?? null;
+      const runStatus = record.terminalRunStatus === "failed" || failure !== null
+        ? "failed"
+        : observedRunStatus;
       return {
         environmentId: await this.environmentId(),
         operationId: record.operationId,
@@ -2881,6 +2881,8 @@ function failureInfo(thread: ThreadShell, expectedTurnId?: string | null): Failu
 function sanitizeFailureText(value: string, maxLength: number): string {
   return value
     .replace(/https?:\/\/[^\s)]+/gi, "[REDACTED URL]")
+    .replace(/(["'])(api[_-]?key|access[_-]?token|authorization|password|secret)\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
+      "$1$2$1:$3[REDACTED]$3")
     .replace(/Bearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
     .replace(/\b(api[_-]?key|access[_-]?token|authorization|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")

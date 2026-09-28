@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { FakeT3, assistantMessage } from "./support/fake-t3.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
 import { makeGateway } from "../src/gateway.js";
@@ -155,6 +157,60 @@ describe("structured provider failures", () => {
     });
   });
 
+  it("retains a failure first observed through the thread and overview reads", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "First observed in threadGet" };
+
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure?.message).toBe("First observed in threadGet");
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    const restarted = makeGateway(fixture.config).gateway;
+    expect((await restarted.threadGet(thread.id)).thread.failure?.message).toBe("First observed in threadGet");
+    expect((await restarted.runGet(run.runId)).failure?.message).toBe("First observed in threadGet");
+
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Updated in overview" };
+    await restarted.threadsOverview({ includeArchived: false, runningLimit: 5 });
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    expect((await restarted.threadGet(thread.id)).thread.failure?.message).toBe("Updated in overview");
+  });
+
+  it("keeps a precise failure when concurrent reads later see only a generic fallback", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Precise provider reason" };
+    const exact = structuredClone(await fixture.client.getThread(thread.id));
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    const generic = structuredClone(await fixture.client.getThread(thread.id));
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let calls = 0;
+    fixture.client.getThread = async () => {
+      calls += 1;
+      if (calls === 1) {
+        await firstGate;
+        return exact;
+      }
+      if (calls === 2) {
+        releaseFirst();
+        await secondGate;
+        return generic;
+      }
+      return generic;
+    };
+
+    const first = fixture.gateway.runGet(run.runId);
+    const second = fixture.gateway.runGet(run.runId);
+    expect((await first).failure?.message).toBe("Precise provider reason");
+    releaseSecond();
+    expect((await second).failure?.message).toBe("Precise provider reason");
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure?.message)
+      .toBe("Precise provider reason");
+  });
+
   it("does not use an error from another active turn or leak credential fields", async () => {
     const { fixture, thread, run } = await setup();
     const turnId = thread.latestTurn!.turnId;
@@ -172,6 +228,12 @@ describe("structured provider failures", () => {
     const matched = (await fixture.gateway.runGet(run.runId)).failure;
     expect(JSON.stringify(matched)).not.toMatch(/secret-token|secret-provider|secret-code/);
     expect(matched?.provider).toBe("password=[REDACTED]");
+
+    thread.session.lastError = '{"api_key":"private-value","password":"private-password","secret":"escaped\\\"value"}';
+    const quoted = (await fixture.gateway.runGet(run.runId)).failure;
+    expect(JSON.stringify(quoted)).not.toMatch(/private-value|private-password|escaped/);
+    expect(await readFile(join(fixture.directory, "operations.json"), "utf8"))
+      .not.toMatch(/private-value|private-password|escaped/);
   });
 
   it("uses a session error without an active turn only when its timestamp belongs to the failed turn", async () => {
