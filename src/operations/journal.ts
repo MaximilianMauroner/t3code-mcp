@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { summarizeForAudit, type AuditLog } from "./audit-log.js";
+import type { FailureInfo } from "../gateway.js";
 
 export type OperationStatus = "prepared" | "accepted" | "uncertain" | "rejected";
 
@@ -44,6 +45,8 @@ export interface OperationRecord {
   readonly snoozedUntil?: string;
   readonly t3Sequence?: number;
   readonly lastError?: string;
+  readonly terminalRunStatus?: "failed";
+  readonly terminalFailure?: FailureInfo | null;
 }
 
 export interface TaskRecord {
@@ -332,7 +335,7 @@ export class OperationJournal {
 
   async update(
     operationId: string,
-    patch: Partial<Pick<OperationRecord, "status" | "t3Sequence" | "turnId" | "lastError">>,
+    patch: Partial<Pick<OperationRecord, "status" | "t3Sequence" | "turnId" | "lastError" | "terminalRunStatus" | "terminalFailure">>,
   ): Promise<OperationRecord> {
     await this.init();
     const entry = [...this.entries.values()].find((candidate) => candidate.operationId === operationId);
@@ -374,6 +377,15 @@ export class OperationJournal {
   async getByRunId(runId: string): Promise<OperationRecord | null> {
     await this.init();
     return [...this.entries.values()].find((entry) => entry.runId === runId) ?? null;
+  }
+
+  async getFailureByTurnId(threadId: string, turnId: string): Promise<FailureInfo | null> {
+    await this.init();
+    return [...this.entries.values()].find((entry) =>
+      entry.kind === "thread.turn.start" && entry.threadId === threadId &&
+      entry.turnId === turnId && entry.terminalRunStatus === "failed" &&
+      entry.terminalFailure?.turnId === turnId
+    )?.terminalFailure ?? null;
   }
 
   private async persist(): Promise<void> {

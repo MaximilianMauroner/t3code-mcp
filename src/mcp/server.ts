@@ -102,7 +102,7 @@ const failureOutput = z.object({
   turnId: z.string().nullable(),
   resetAt: z.string().nullable(),
   retryAfter: z.string().nullable(),
-  source: z.literal("t3_session"),
+  source: z.enum(["t3_session", "t3_turn"]),
 }).passthrough();
 
 const threadSummaryOutput = z
