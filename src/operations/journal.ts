@@ -576,7 +576,11 @@ function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidat
   // Full V2 reads already select the authoritative root item. Replace older
   // attempts, including their reset metadata, rather than mixing two errors.
   if (candidate.source === "t3_v2_turn_item") return candidate;
-  const preferred = failureSourcePriority[candidate.source] > failureSourcePriority[existing.source] ? candidate : existing;
+  const upgradesUnknown = existing.source !== "t3_v2_turn_item" &&
+    existing.category === "unknown" && candidate.category !== "unknown";
+  const losesKnownCategory = candidate.category === "unknown" && existing.category !== "unknown";
+  const preferred = upgradesUnknown || (!losesKnownCategory &&
+    failureSourcePriority[candidate.source] > failureSourcePriority[existing.source]) ? candidate : existing;
   const other = preferred === candidate ? existing : candidate;
   return {
     ...preferred,

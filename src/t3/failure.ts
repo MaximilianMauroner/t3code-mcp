@@ -64,8 +64,9 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   const sessionTime = Date.parse(session?.updatedAt ?? "");
   const sessionMatches = session?.activeTurnId === turnId ||
     (session?.activeTurnId == null && session?.status === "error" && turn?.turnId === turnId &&
+      turn.completedAt != null &&
       sessionTime >= Date.parse(turn.requestedAt) &&
-      (turn.completedAt == null || sessionTime <= Date.parse(turn.completedAt)));
+      sessionTime <= Date.parse(turn.completedAt));
   const provider = sessionMatches ? session?.providerName : null;
   const identity = provider ?? thread.modelSelection.provider ?? thread.modelSelection.instanceId ?? null;
   // A provider type is more specific than V1's generic usage-limit sentence.
@@ -76,14 +77,18 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
     return buildFailure(activity, turnId, identity, thread.modelSelection.model, "t3_activity");
   }
   if (sessionMatches && session?.lastError?.trim()) {
+    const code = session.failureCode ?? providerCode(session.lastError);
     const failure = buildFailure({
       message: session.lastError, class: session.lastErrorClass,
-      code: session.failureCode ?? providerCode(session.lastError),
+      code,
       resetAt: session.resetAt, retryAfter: session.retryAfter,
     }, turnId, identity, thread.modelSelection.model, "t3_session");
     const category = session.failureCategory;
     if (category === "quota" || category === "rate_limit" || category === "auth_billing" ||
-        category === "provider_internal" || category === "provider_error" || category === "unknown") return { ...failure, category };
+        category === "provider_internal" || category === "provider_error") return { ...failure, category };
+    if (category === "unknown" && session.lastErrorClass === "usage_limit") {
+      return { ...failure, category: categoryForFailure(null, code, session.lastError) };
+    }
     return failure;
   }
   if (assistant) return buildFailure({ message: assistant.text, code: assistantCode }, turnId, identity, thread.modelSelection.model, "t3_message");
@@ -119,11 +124,11 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
     .replace(/(["'])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1/g, "$1[REDACTED PATH]$1")
     .replace(/(^|[^\p{L}\p{N}_\\/])(?:\/[^\s"'<>\])}]+|[A-Za-z]:[\\/][^\s"'<>\])}]+|\\\\[^\s"'<>\])}]+)/gu, "$1[REDACTED PATH]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, "[REDACTED HOST]")
-    .replace(/(["'])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id)[_-]?token|authorization|credential|password|secret|token))\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
+    .replace(/(["'])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
-    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id)[_-]?token|authorization|credential|password|secret|token))\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]")
+    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .slice(0, maxLength);
 }

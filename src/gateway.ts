@@ -2955,9 +2955,17 @@ function threadDetail(
       ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
         summary.latestTurn?.state === "error"));
   const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? thread : summary ?? thread;
-  const fullFailure = source.latestTurn?.state === "error" &&
+  let fullFailure = source.latestTurn?.state === "error" &&
     source.latestTurn.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
   const shellFailure = failureInfo(source);
+  if (source === summary && fullFailure && shellFailure &&
+    fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
+    fullFailure = {
+      ...fullFailure,
+      resetAt: shellFailure.resetAt ?? fullFailure.resetAt,
+      retryAfter: shellFailure.retryAfter ?? fullFailure.retryAfter,
+    };
+  }
   return {
     ...threadSummary(source, projectTitle, environmentId, now),
     failure: fullFailure?.source === "t3_turn"

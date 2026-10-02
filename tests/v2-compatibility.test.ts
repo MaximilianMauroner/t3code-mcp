@@ -331,6 +331,18 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject({ category: "unknown", code: "api_error_429", resetAt: null });
   });
 
+  it("enriches a root failure with a later matching shell reset", async () => {
+    const { gateway, snapshot, shell, journal } = await setup();
+    await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "shell-reset" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    const failure = { ...providerFailures.codexUsageLimit, resetAt: null };
+    snapshot.projection.turnItems.push({ id: "terminal", type: "error", status: "failed", ordinal: 1, runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: failure.message, lastErrorClass: failure.class, usageLimitResetAt: providerFailures.codexUsageLimit.resetAt, updatedAt: "2026-10-02T20:00:01.000Z" });
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ source: "t3_v2_turn_item", code: failure.code, resetAt: providerFailures.codexUsageLimit.resetAt });
+    expect(await journal.getFailureByTurnId("thread-1", run.id)).toMatchObject({ resetAt: providerFailures.codexUsageLimit.resetAt });
+  });
+
   it("uses exact shell credit text and leaves a broad shell limit unknown", async () => {
     const { gateway, shell } = await setup();
     Object.assign(shell.threads[0]!, { latestRunId: "failed-run", activeRunId: null, status: "failed", lastError: "API Error: Request rejected (429) · Usage credits are required for this model.", lastErrorClass: "usage_limit" });
