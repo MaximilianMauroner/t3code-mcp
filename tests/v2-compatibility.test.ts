@@ -300,9 +300,9 @@ describe("merged orchestrator V2 boundary", () => {
   it("does not bind a distinct V2 session error to the shell's latest run", async () => {
     const { gateway, shell } = await setup();
     Object.assign(shell.threads[0]!, { latestRunId: "old-failed-run", activeRunId: null, status: "failed", lastError: "New unbound session error", lastErrorClass: null, usageLimitResetAt: null });
-    const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
-    expect(overview.highlights[0]?.failure).toMatchObject({ category: "unknown", source: "t3_turn", resetAt: null });
-    expect(overview.highlights[0]?.failure?.message).not.toContain("unbound session");
+    const summary = (await gateway.threadsList({ includeArchived: false, detail: "summary", limit: 5 })).page.items[0];
+    expect(summary?.failure).toMatchObject({ category: "unknown", source: "t3_turn", resetAt: null });
+    expect(summary?.failure?.message).not.toContain("unbound session");
   });
 
   it("keeps a disconnected mutation uncertain and never replays it", async () => {
