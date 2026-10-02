@@ -133,11 +133,11 @@ describe("structured provider failures", () => {
     const turnId = thread.latestTurn!.turnId;
     thread.latestTurn = { ...thread.latestTurn!, state: "error" };
     thread.session = { status: "ready" };
-    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project /mnt/customer/project /opt/service/secret C:\\customer\\secret \\\\server\\share\\secret \"C:\\Program Files\\customer\\secret\" 10.2.3.4:8317 paths: [/mnt/customer/project/secret.ts] failed {/opt/service/secret} /mnt/customer/name,with,commas.ts OPENAI_API_KEY=vendor-private ANTHROPIC_API_KEY: vendor-private MY_ACCESS_TOKEN=vendor-private {"MY_ACCESS_TOKEN":"vendor-private"}', turnId));
+    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project /mnt/customer/project /opt/service/secret C:\\customer\\secret \\\\server\\share\\secret \"C:\\Program Files\\customer\\secret\" 10.2.3.4:8317 paths: [/mnt/customer/project/secret.ts] failed {/opt/service/secret} /mnt/customer/name,with,commas.ts OPENAI_API_KEY="vendor-private quoted-private" ANTHROPIC_API_KEY: vendor-private MY_ACCESS_TOKEN=vendor-private {"MY_ACCESS_TOKEN":"vendor-private"}', turnId));
     const observed = await fixture.gateway.runGet(run.runId);
-    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|vendor-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
-    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|vendor-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
-    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|vendor-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|vendor-private|quoted-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|vendor-private|quoted-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|vendor-private|quoted-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
   });
 
   it("prefers a specific V1 provider error over a generic activity class", async () => {

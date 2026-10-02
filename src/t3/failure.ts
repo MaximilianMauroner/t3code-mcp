@@ -123,7 +123,7 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
       "$1$2$1:$3[REDACTED]$3")
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
-    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id)[_-]?token|authorization|credential|password|secret|token))\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id)[_-]?token|authorization|credential|password|secret|token))\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .slice(0, maxLength);
 }
