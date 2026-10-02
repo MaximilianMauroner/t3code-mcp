@@ -52,7 +52,7 @@ const TurnItem = z.object({
   id: Id, type: z.string(), runId: Id.nullable(), nodeId: Id.nullable(), updatedAt: Time,
   requestId: Id.optional(), questions: z.array(z.unknown()).optional(), prompt: z.string().optional(),
   failure: ProviderFailureSchema.optional(), retry: ProviderRetrySchema.optional(), title: z.string().nullable(),
-  status: z.string(), ordinal: z.number().optional(),
+  status: z.string(), ordinal: z.number().int().nonnegative(),
 }).passthrough();
 const RuntimeRequest = PendingRequest.extend({
   nodeId: Id,
@@ -106,7 +106,9 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>): Thr
       status: sessionStatus(status), providerInstanceId: thread.providerInstanceId,
       activeTurnId: runId, lastError: hasBoundFailure ? thread.lastError ?? null : null,
       lastErrorClass: hasBoundFailure ? thread.lastErrorClass : null,
-      failureCategory: hasBoundFailure ? categoryForFailure(thread.lastErrorClass) : "unknown",
+      failureCategory: hasBoundFailure
+        ? categoryForFailure(thread.lastErrorClass === "usage_limit" ? null : thread.lastErrorClass, null, thread.lastError ?? undefined)
+        : "unknown",
       resetAt: hasBoundFailure ? thread.usageLimitResetAt ?? null : null, updatedAt: thread.updatedAt,
     },
     hasPendingApprovals: request !== null && request.kind !== "user_input",
@@ -130,7 +132,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
       .filter((item) => item.runId === run.id && item.nodeId === run.rootNodeId &&
         item.type === "error" && item.status === "failed" && item.failure)
       .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt) ||
-        (a.ordinal ?? 0) - (b.ordinal ?? 0) || a.id.localeCompare(b.id))
+        a.ordinal - b.ordinal || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
       .at(-1);
     return item?.failure ? [{
       turnId: run.id, provider: run.providerInstanceId,
@@ -141,7 +143,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
     !(run.status === "cancelled" && run.startedAt === null)).at(-1);
   const executedFailure = turnFailures.find((entry) => entry.turnId === executed?.id)?.failure;
   const sessionError = projection.providerSessions
-    .filter((session) => session.providerInstanceId === projection.thread.providerInstanceId)
+    .filter((session) => session.providerInstanceId === executed?.providerInstanceId)
     .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt)).at(-1)?.lastError;
   const limited = executedFailure?.class === "usage_limit" &&
     (sessionError == null || sessionError === executedFailure.message) ? executed : null;

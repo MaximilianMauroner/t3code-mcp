@@ -82,7 +82,7 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
     }, turnId, identity, thread.modelSelection.model, "t3_session");
     const category = session.failureCategory;
     if (category === "quota" || category === "rate_limit" || category === "auth_billing" ||
-        category === "provider_internal" || category === "provider_error") return { ...failure, category };
+        category === "provider_internal" || category === "provider_error" || category === "unknown") return { ...failure, category };
     return failure;
   }
   if (assistant) return buildFailure({ message: assistant.text, code: assistantCode }, turnId, identity, thread.modelSelection.model, "t3_message");
@@ -116,7 +116,7 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
     .replace(/\n\s+at\s[^\n]*/g, "")
     .replace(/(?:https?|file):\/\/[^\s)]+/gi, "[REDACTED URL]")
     .replace(/(["'])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1/g, "$1[REDACTED PATH]$1")
-    .replace(/(^|[\s"'(<:=])(?:\/[^\s"'<>),;]+|[A-Za-z]:[\\/][^\s"'<>),;]+|\\\\[^\s"'<>),;]+)/g, "$1[REDACTED PATH]")
+    .replace(/(^|[^\p{L}\p{N}_\\/])(?:\/[^\s"'<>\])}]+|[A-Za-z]:[\\/][^\s"'<>\])}]+|\\\\[^\s"'<>\])}]+)/gu, "$1[REDACTED PATH]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, "[REDACTED HOST]")
     .replace(/(["'])(api[_-]?key|(?:access|refresh|id)[_-]?token|authorization|credential|password|secret|token)\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")

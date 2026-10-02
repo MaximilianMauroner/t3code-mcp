@@ -2450,7 +2450,8 @@ export class T3Gateway {
       try {
         const snapshot = await this.client.getThread(summary.id);
         const sameTurn = summary.observedTurnId === (snapshot.thread.latestTurn?.turnId ?? null);
-        const current = sameTurn ? summary : {
+        const sameState = summary.latestTurn?.state === snapshot.thread.latestTurn?.state;
+        const current = sameTurn && sameState ? summary : {
           ...summary, ...threadSummary(snapshot.thread, summary.projectTitle,
             summary.observedTarget.environmentId, Date.parse(summary.observedAt)),
         };
@@ -2938,11 +2939,18 @@ function threadDetail(
   const fullHasNewerTurn = thread.latestTurn != null && summary?.latestTurn != null &&
     thread.latestTurn.turnId !== summary.latestTurn.turnId &&
     Date.parse(thread.latestTurn.requestedAt) > Date.parse(summary.latestTurn.requestedAt);
-  const source: ThreadShell = fullHasNewerTurn ? thread : summary ?? thread;
+  const sameTurn = thread.latestTurn?.turnId === summary?.latestTurn?.turnId;
+  const fullHasNewerState = sameTurn && summary != null &&
+    (Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
+      ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
+        summary.latestTurn?.state === "error"));
+  const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? thread : summary ?? thread;
+  const fullFailure = source.latestTurn?.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
+  const shellFailure = failureInfo(source);
   return {
     ...threadSummary(source, projectTitle, environmentId, now),
-    failure: source.latestTurn?.turnId === thread.latestTurn?.turnId
-      ? failureInfo(thread) ?? failureInfo(source) : failureInfo(source),
+    failure: fullFailure?.source === "t3_turn"
+      ? shellFailure ?? fullFailure : fullFailure ?? shellFailure,
     // Latest response is bounded to the observed turn; full history needs t3_thread_messages.
     latestResponse: latestAssistant(
       thread.messages,
