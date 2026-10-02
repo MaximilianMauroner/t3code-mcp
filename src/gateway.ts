@@ -55,6 +55,7 @@ import {
 } from "./t3/commands.js";
 import { T3HttpClient, T3HttpError } from "./t3/http-client.js";
 import type {
+  FailureEvidenceOrder,
   Descriptor,
   LatestTurn,
   Message,
@@ -1110,9 +1111,9 @@ export class T3Gateway {
     const environmentId = await this.environmentId();
     const summary = shell.threads.find((thread) => thread.id === threadId);
     const projectTitle = shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ?? null;
-    let detail = await this.withRetainedFailure(
-      threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now()),
-    );
+    const observed = threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now());
+    let detail = await this.withRetainedFailure(observed,
+      snapshot.thread.turnFailures?.find((entry) => entry.turnId === observed.failure?.turnId)?.order);
     if (detail.failure === null && snapshot.thread.latestTurn == null) {
       const latestUserTurnId = snapshot.thread.messages.filter((message) => message.role === "user").at(-1)?.turnId;
       const retained = latestUserTurnId
@@ -1530,7 +1531,7 @@ export class T3Gateway {
     if (!operation || operation.kind !== "thread.turn.start") {
       throw new GatewayError("run_not_found", `Run ${runId} was not found in the gateway journal.`);
     }
-    return this.observeRun(operation);
+    return (await this.observeRun(operation)).run;
   }
 
   async runWait(runId: string, timeoutSeconds: number): Promise<RunResult> {
@@ -1538,13 +1539,16 @@ export class T3Gateway {
     const initial = await this.runGet(runId);
     const deadline = Date.now() + timeoutSeconds * 1000;
     let current = initial;
+    let failureOrder: FailureEvidenceOrder | undefined;
     let observations = 1;
     let intervalMs = 500;
     while (Date.now() < deadline && waitCanContinue(current)) {
       await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
       const record = await this.journal.getByRunId(runId) ?? await this.findRun(runId);
       if (!record || record.kind !== "thread.turn.start") throw new GatewayError("run_not_found", `Run ${runId} was not found in the gateway journal.`);
-      current = await this.observeRun(record, initial.environmentId);
+      const observation = await this.observeRun(record, initial.environmentId);
+      current = observation.run;
+      failureOrder = observation.failureOrder;
       observations += 1;
       if (hasRelevantChange(initial, current)) break;
       intervalMs = Math.min(2_000, intervalMs * 2);
@@ -1578,7 +1582,7 @@ export class T3Gateway {
       }
       if (current.failure && current.threadId) {
         current = { ...current, failure: await this.journal.retainTerminalFailure(
-          current.threadId, current.t3TurnId, current.failure, current.operationId,
+          current.threadId, current.t3TurnId, current.failure, current.operationId, failureOrder,
         ) };
       }
       if (current.threadId && current.t3TurnId &&
@@ -2239,7 +2243,7 @@ export class T3Gateway {
     return record;
   }
 
-  private async withRetainedFailure<T extends ThreadSummary>(summary: T): Promise<T> {
+  private async withRetainedFailure<T extends ThreadSummary>(summary: T, order?: FailureEvidenceOrder): Promise<T> {
     if (summary.latestTurn?.state === "completed" || summary.latestTurn?.state === "interrupted") {
       await this.journal.clearTerminalFailure(summary.id, summary.latestTurn.turnId);
       return { ...summary, failure: null };
@@ -2247,12 +2251,14 @@ export class T3Gateway {
     if (summary.failure === null || summary.failure.turnId === null ||
       (summary.latestTurn !== null && summary.latestTurn.state !== "error")) return summary;
     const retained = await this.journal.retainTerminalFailure(
-      summary.id, summary.failure.turnId, summary.failure,
+      summary.id, summary.failure.turnId, summary.failure, undefined, order,
     );
     return { ...summary, failure: retained };
   }
 
-  private async observeRun(record: OperationRecord, boundedEnvironmentId?: string): Promise<RunResult> {
+  private async observeRun(record: OperationRecord, boundedEnvironmentId?: string): Promise<{
+    readonly run: RunResult; readonly failureOrder?: FailureEvidenceOrder;
+  }> {
     if (!record.runId || !record.threadId) {
       throw new GatewayError("run_invalid", "The journal entry does not contain a run handle.");
     }
@@ -2289,16 +2295,17 @@ export class T3Gateway {
                 ? "completed"
                 : "accepted";
       const observedFailure = turnId === null ? null : failureInfo(thread, turnId);
+      const failureOrder = thread.turnFailures?.find((entry) => entry.turnId === turnId)?.order;
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
       const failure = recovered ? null : turnId !== null && (observedFailure !== null || priorFailure !== null)
         ? boundedEnvironmentId === undefined
-          ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId)
+          ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId, failureOrder)
           : observedFailure ?? priorFailure
         : record.terminalFailure ?? null;
       const runStatus = !recovered && (record.terminalRunStatus === "failed" || failure !== null)
         ? "failed"
         : observedRunStatus;
-      return {
+      const run: RunResult = {
         environmentId: boundedEnvironmentId ?? await this.environmentId(),
         ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings, sameTurn ? thread : undefined) }),
         operationId: record.operationId,
@@ -2321,6 +2328,7 @@ export class T3Gateway {
           userInput: thread.hasPendingUserInput ?? false,
         },
       };
+      return { run, failureOrder };
     } catch (error) {
       if (error instanceof GatewayError && error.code === "environment_mismatch") throw error;
       const telemetry = this.client.telemetry();
@@ -2330,7 +2338,7 @@ export class T3Gateway {
         ? await this.journal.getFailureByTurnId(latestRecord.threadId, latestRecord.turnId).catch(() => null)
         : null;
       const failure = retainedFailure ?? latestRecord.terminalFailure ?? null;
-      return {
+      const run: RunResult = {
         environmentId: boundedEnvironmentId ?? await this.environmentId().catch(() => this.config.environmentId ?? "unknown"),
         ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings) }),
         operationId: record.operationId,
@@ -2351,6 +2359,7 @@ export class T3Gateway {
         pendingActions: { approvals: false, userInput: false },
         error: sanitizeFailureText(safeErrorMessage(error), 2_000),
       };
+      return { run };
     }
   }
 
@@ -2462,11 +2471,12 @@ export class T3Gateway {
         const sameTurn = summary.observedTurnId === (snapshot.thread.latestTurn?.turnId ?? null);
         const sameState = summary.latestTurn?.state === snapshot.thread.latestTurn?.state;
         const current = sameTurn && sameState ? summary : {
-          ...summary, ...threadSummary(snapshot.thread, summary.projectTitle,
+          ...summary, ...threadSummary(withShellMetadata(snapshot.thread, summary), summary.projectTitle,
             summary.observedTarget.environmentId, Date.parse(summary.observedAt)),
         };
         const failure = failureInfo(snapshot.thread, current.observedTurnId);
-        const enriched = await this.withRetainedFailure({ ...current, failure: failure ?? current.failure });
+        const enriched = await this.withRetainedFailure({ ...current, failure: failure ?? current.failure },
+          snapshot.thread.turnFailures?.find((entry) => entry.turnId === current.observedTurnId)?.order);
         const latest = latestAssistant(snapshot.thread.messages, current.observedTurnId)
           ?? (current.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
             ? latestAssistant(snapshot.thread.messages, null, true) : null);
@@ -2939,6 +2949,15 @@ function threadSummary(
   };
 }
 
+function withShellMetadata(thread: Thread, shell: Pick<ThreadShell, "latestUserMessageAt" | "hasPendingApprovals" | "hasPendingUserInput">): Thread {
+  return {
+    ...thread,
+    latestUserMessageAt: thread.latestUserMessageAt === undefined ? shell.latestUserMessageAt : thread.latestUserMessageAt,
+    hasPendingApprovals: thread.hasPendingApprovals ?? shell.hasPendingApprovals,
+    hasPendingUserInput: thread.hasPendingUserInput ?? shell.hasPendingUserInput,
+  };
+}
+
 function threadDetail(
   thread: Thread,
   summary: ThreadShell | undefined,
@@ -2954,7 +2973,7 @@ function threadDetail(
     (Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
       ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
         summary.latestTurn?.state === "error"));
-  const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? thread : summary ?? thread;
+  const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? withShellMetadata(thread, summary ?? {}) : summary ?? thread;
   let fullFailure = source.latestTurn?.state === "error" &&
     source.latestTurn.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
   const shellFailure = failureInfo(source);

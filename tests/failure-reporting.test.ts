@@ -199,6 +199,26 @@ describe("structured provider failures", () => {
     expect(await makeGateway(fixture.config).gateway.runGet(run.runId)).toMatchObject({ runStatus: "unknown", failure: null });
   });
 
+  it("preserves omitted shell metadata when a full read advances the turn", async () => {
+    const { fixture, thread } = await setup(false);
+    const latestUserMessageAt = new Date().toISOString();
+    thread.latestUserMessageAt = latestUserMessageAt;
+    thread.hasPendingApprovals = true;
+    thread.hasPendingUserInput = true;
+    const shell = structuredClone(await fixture.client.getShell());
+    thread.latestTurn = { turnId: "new-turn", state: "running", requestedAt: new Date(Date.now() + 1000).toISOString() };
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    delete full.thread.latestUserMessageAt;
+    delete full.thread.hasPendingApprovals;
+    delete full.thread.hasPendingUserInput;
+    fixture.client.getShell = async () => shell;
+    fixture.client.getThread = async () => full;
+    const expected = { latestTurn: { turnId: "new-turn" }, latestUserMessageAt, hasPendingApprovals: true, hasPendingUserInput: true };
+    expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]).toMatchObject(expected);
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject(expected);
+  });
+
   it.each(["completed", "interrupted"] as const)("clears a full failure when the later shell is %s", async (state) => {
     const { fixture, thread, run, fake } = await setup(false);
     const turnId = thread.latestTurn!.turnId;

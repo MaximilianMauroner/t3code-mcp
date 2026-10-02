@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { sanitizeFailureText } from "../t3/failure.js";
-import { ProviderRetrySchema } from "../t3/types.js";
+import { FailureEvidenceOrderSchema, ProviderRetrySchema, type FailureEvidenceOrder } from "../t3/types.js";
 import { summarizeForAudit, type AuditLog } from "./audit-log.js";
 import { settingsReceiptSchema, type SettingsReceipt } from "./settings.js";
 import type { FailureInfo } from "../gateway.js";
@@ -57,6 +57,7 @@ interface ThreadFailureRecord {
   readonly threadId: string;
   readonly turnId: string;
   readonly failure: FailureInfo;
+  readonly order?: FailureEvidenceOrder;
 }
 
 export interface TaskRecord {
@@ -419,6 +420,7 @@ export class OperationJournal {
     turnId: string,
     candidate: FailureInfo,
     operationId?: string,
+    order?: FailureEvidenceOrder,
   ): Promise<FailureInfo> {
     await this.init();
     if (candidate.turnId !== turnId) {
@@ -436,8 +438,13 @@ export class OperationJournal {
       entry.kind === "thread.turn.start" && entry.threadId === threadId &&
       entry.turnId === turnId && entry.terminalFailure?.turnId === turnId
     )?.terminalFailure ?? null;
-    const existing = this.threadFailures.get(key)?.failure ?? operation?.terminalFailure ?? legacyFailure;
-    const merged = mergeTerminalFailure(existing, candidate);
+    const retained = this.threadFailures.get(key);
+    const existing = retained?.failure ?? operation?.terminalFailure ?? legacyFailure;
+    const comparison = order && retained?.order ? compareFailureOrder(order, retained.order) : null;
+    const stale = candidate.source === "t3_v2_turn_item" && retained?.order !== undefined &&
+      (order === undefined || (comparison !== null && comparison < 0));
+    const merged = stale && existing ? existing : mergeTerminalFailure(existing, candidate, comparison === 0);
+    const nextOrder = candidate.source === "t3_v2_turn_item" && !stale ? order : retained?.order;
     const admittedModel = operation?.settings?.resolved.modelSelection;
     // A V1 snapshot carries mutable thread settings. The run receipt records
     // the settings admitted for this operation; V2 root items use run metadata.
@@ -447,13 +454,14 @@ export class OperationJournal {
       provider: sanitizeFailureText(admittedModel.provider ?? admittedModel.instanceId ?? merged.provider ?? "", 200) || null,
     } : merged;
     const failureChanged = JSON.stringify(existing) !== JSON.stringify(failure);
+    const orderChanged = JSON.stringify(retained?.order) !== JSON.stringify(nextOrder);
     const operationChanged = operation !== null && (operation.terminalRunStatus !== "failed" ||
       operation.turnId !== turnId || JSON.stringify(operation.terminalFailure) !== JSON.stringify(failure));
-    if (!failureChanged && !operationChanged) return failure;
+    if (!failureChanged && !orderChanged && !operationChanged) return failure;
 
     // Update both maps before awaiting persistence so concurrent reads cannot
     // replace a precise session failure with a later generic turn fallback.
-    this.threadFailures.set(key, { threadId, turnId, failure });
+    this.threadFailures.set(key, { threadId, turnId, failure, order: nextOrder });
     if (operation !== null) {
       this.entries.set(operation.idempotencyKey, {
         ...operation,
@@ -549,7 +557,8 @@ function isThreadFailureRecord(value: unknown): value is ThreadFailureRecord {
   if (typeof value !== "object" || value === null) return false;
   const item = value as Record<string, unknown>;
   return typeof item.threadId === "string" && typeof item.turnId === "string" &&
-    isFailureInfo(item.failure) && item.failure.turnId === item.turnId;
+    isFailureInfo(item.failure) && item.failure.turnId === item.turnId &&
+    (item.order === undefined || FailureEvidenceOrderSchema.safeParse(item.order).success);
 }
 
 function isFailureInfo(value: unknown): value is FailureInfo {
@@ -571,11 +580,21 @@ const failureSourcePriority = {
   t3_turn: 0, t3_session: 1, t3_activity: 2, t3_message: 3, t3_v2_turn_item: 4,
 };
 
-function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo): FailureInfo {
+function compareFailureOrder(candidate: FailureEvidenceOrder, existing: FailureEvidenceOrder): number {
+  return candidate.snapshotSequence - existing.snapshotSequence ||
+    Date.parse(candidate.updatedAt) - Date.parse(existing.updatedAt) || candidate.ordinal - existing.ordinal ||
+    (candidate.itemId < existing.itemId ? -1 : candidate.itemId > existing.itemId ? 1 : 0);
+}
+
+function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo, sameItem = false): FailureInfo {
   if (!existing) return candidate;
   // Full V2 reads already select the authoritative root item. Replace older
   // attempts, including their reset metadata, rather than mixing two errors.
-  if (candidate.source === "t3_v2_turn_item") return candidate;
+  if (candidate.source === "t3_v2_turn_item") return sameItem ? {
+    ...candidate,
+    resetAt: candidate.resetAt ?? existing.resetAt,
+    retryAfter: candidate.retryAfter ?? existing.retryAfter,
+  } : candidate;
   const upgradesUnknown = existing.source !== "t3_v2_turn_item" &&
     existing.category === "unknown" && candidate.category !== "unknown";
   const losesKnownCategory = candidate.category === "unknown" && existing.category !== "unknown";

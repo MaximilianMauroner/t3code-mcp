@@ -135,6 +135,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
         a.ordinal - b.ordinal || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
       .at(-1);
     return item?.failure ? [{
+      order: { snapshotSequence: snapshot.snapshotSequence, updatedAt: item.updatedAt, ordinal: item.ordinal, itemId: item.id },
       turnId: run.id, provider: run.providerInstanceId,
       modelSelection: run.modelSelection, failure: item.failure, retry: item.retry,
     }] : [];

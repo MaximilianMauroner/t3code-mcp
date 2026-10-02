@@ -8,7 +8,7 @@ The source target is merge commit [`de343914273eceb852a1d1d739cd1d38df7796ee`](h
 
 ## Gateway behavior
 
-The public MCP tools and journal format stay the same. The T3 boundary selects its transport from the public descriptor's `orchestrationProtocolVersion`. An absent version means V1. Unknown versions fail before dispatch.
+The public MCP tools and journal version stay the same. Failure fields and optional internal evidence ordering are additive; older journal records remain readable. The T3 boundary selects its transport from the public descriptor's `orchestrationProtocolVersion`. An absent version means V1. Unknown versions fail before dispatch.
 
 | Operation | V1 | V2 |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ Both transports use the configured bearer credential. Each RPC connection handle
 
 `src/t3/v2.ts` maps V2 runs and messages into the gateway's existing turn fields. T3 run IDs populate `t3TurnId`, `observedTarget.turnId`, and message `turnId`; these are not provider-native IDs. Queue entries do not replace the run that is executing, and child-node responses do not become the root run's answer.
 
-Pending-action detail comes from pending runtime requests with a `live` or `message` response capability. Resolved, expired, cancelled, and `not_resumable` requests are excluded. Structured failure code and reset time come from the matching run's error item. `usage_limit` maps to `quota`, and `provider_error` maps to `provider_internal`. Other failure classes remain `unknown` in the existing MCP failure contract.
+Pending-action detail comes from pending runtime requests with a `live` or `message` response capability. Resolved, expired, cancelled, and `not_resumable` requests are excluded. Structured failure code and reset time come from the matching run's error item. `provider_error` maps to the additive `provider_error` category. It does not imply a crash. Specific provider codes and exact known refusal messages take priority over the broad `usage_limit` class. Bare HTTP 429, Claude `api_error_429`, and shell-only broad usage-limit evidence stay `unknown`; known quota evidence maps to the existing `quota` category. Other classes stay `unknown` unless an explicit provider type identifies a category. See [failure authority and limits](usage.md).
 
 The gateway still rejects sends to busy threads and polls for updates. This change does not expose V2 queue, steering, fork, or delegation features. Composite tasks retain the gateway's existing explicit worktree preparation. V2 rejects the internal V1 bootstrap payload; MCP task creation uses separate thread creation and message admission.
 

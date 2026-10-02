@@ -106,6 +106,14 @@ export const MessageSchema = z
   .catchall(z.unknown());
 export type Message = z.infer<typeof MessageSchema>;
 
+export const FailureEvidenceOrderSchema = z.object({
+  snapshotSequence: z.number().int().nonnegative(),
+  updatedAt: z.iso.datetime({ offset: true }),
+  ordinal: z.number().int().nonnegative(),
+  itemId: NonEmptyString,
+});
+export type FailureEvidenceOrder = z.infer<typeof FailureEvidenceOrderSchema>;
+
 export const ThreadSchema = ThreadShellSchema.extend({
   messages: z.array(MessageSchema).default([]),
   activities: z.array(z.unknown()).default([]),
@@ -113,6 +121,7 @@ export const ThreadSchema = ThreadShellSchema.extend({
   proposedPlans: z.array(z.unknown()).default([]),
   // Internal V2 normalization retains authoritative failures for historical runs.
   turnFailures: z.array(z.object({
+    order: FailureEvidenceOrderSchema.optional(),
     turnId: NonEmptyString,
     provider: NonEmptyString,
     modelSelection: ModelSelectionSchema,

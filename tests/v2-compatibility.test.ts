@@ -119,8 +119,9 @@ async function setup() {
   cleanups.push(async () => { for (const ws of sockets.clients) ws.terminate(); sockets.close(); await new Promise<void>((resolve) => server.close(() => resolve())); });
   const directory = await mkdtemp(join(tmpdir(), "t3-v2-test-"));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
-  const made = makeGateway({ t3HttpBaseUrl: baseUrl, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 });
-  return { ...made, snapshot, shell, commands, requests, baseUrl, setProtocol: (version: 1 | 2) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
+  const config = { t3HttpBaseUrl: baseUrl, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 };
+  const made = makeGateway(config);
+  return { ...made, config, snapshot, shell, commands, requests, baseUrl, setProtocol: (version: 1 | 2) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
 }
 
 describe("merged orchestrator V2 boundary", () => {
@@ -341,6 +342,42 @@ describe("merged orchestrator V2 boundary", () => {
     Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: failure.message, lastErrorClass: failure.class, usageLimitResetAt: providerFailures.codexUsageLimit.resetAt, updatedAt: "2026-10-02T20:00:01.000Z" });
     expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ source: "t3_v2_turn_item", code: failure.code, resetAt: providerFailures.codexUsageLimit.resetAt });
     expect(await journal.getFailureByTurnId("thread-1", run.id)).toMatchObject({ resetAt: providerFailures.codexUsageLimit.resetAt });
+  });
+
+  it.each(["run", "thread", "overview"])("rejects a delayed older V2 %s read, including after restart", async (reader) => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "concurrent-root" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1, runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    const older = await client.getThread("thread-1");
+    snapshot.snapshotSequence = 3;
+    snapshot.projection.turnItems.push({ id: "second", type: "error", status: "failed", ordinal: 2, runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: "2026-10-02T20:00:01.000Z", failure: { class: "usage_limit", code: "api_error_429", message: "API Error: 429" }, retry: { attempt: 3, maxAttempts: 3, retryDelayMs: null } });
+    const newer = await client.getThread("thread-1");
+    let releaseOlder!: () => void;
+    let signalEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseOlder = resolve; });
+    const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    let calls = 0;
+    client.getThread = async () => {
+      if (++calls === 1) { signalEntered(); await gate; return older; }
+      return newer;
+    };
+    const delayed = reader === "run" ? gateway.runGet(sent.runId).then((result) => result.failure)
+      : reader === "thread" ? gateway.threadGet("thread-1").then((result) => result.thread.failure)
+      : gateway.threadsOverview({ includeArchived: false, runningLimit: 5 }).then((result) => result.highlights[0]?.failure);
+    await entered;
+    const expected = { category: "unknown", code: "api_error_429", resetAt: null, retry: { attempt: 3 } };
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    releaseOlder();
+    expect(await delayed).toMatchObject(expected);
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => older;
+    const retained = await restarted.gateway.runGet(sent.runId);
+    expect(retained.failure).toMatchObject(expected);
+    expect(retained).not.toHaveProperty("failureOrder");
+    expect(retained.failure).not.toHaveProperty("order");
   });
 
   it("uses exact shell credit text and leaves a broad shell limit unknown", async () => {
