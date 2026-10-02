@@ -163,7 +163,7 @@ describe("structured provider failures", () => {
     expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject({ model: admittedModel, provider: "codex_openai" });
   });
 
-  it("updates full list and overview rows when a newer turn has replaced the shell failure", async () => {
+  it("keeps list selection and overview counts on the shell snapshot when a newer turn replaces it", async () => {
     const { fixture, thread } = await setup(false);
     const oldTurn = thread.latestTurn!;
     thread.latestTurn = { ...oldTurn, state: "error" };
@@ -172,10 +172,12 @@ describe("structured provider failures", () => {
     thread.latestTurn = { turnId: "new-turn", state: "running", requestedAt: new Date(Date.parse(oldTurn.requestedAt) + 1000).toISOString() };
     thread.session = { status: "running", activeTurnId: "new-turn", lastError: null };
     fixture.client.getShell = async () => oldShell;
-    const list = await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 });
-    expect(list.page.items[0]).toMatchObject({ latestTurn: { turnId: "new-turn" }, activity: "running", failure: null });
+    const list = await fixture.gateway.threadsList({ includeArchived: false, detail: "full", activity: "failed", needsAttention: true, limit: 5 });
+    expect(list.page.items[0]).toMatchObject({ latestTurn: { turnId: oldTurn.turnId }, activity: "failed", failure: null });
     const overview = await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
-    expect(overview.highlights[0]).toMatchObject({ latestTurn: { turnId: "new-turn" }, activity: "running", failure: null });
+    expect(overview.highlights[0]).toMatchObject({ latestTurn: { turnId: oldTurn.turnId }, activity: "failed", failure: null });
+    expect(overview.executionCounts.failed).toBe(1);
+    expect(overview.runningCount).toBe(0);
     expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { turnId: "new-turn" }, failure: null });
   });
 
@@ -190,8 +192,8 @@ describe("structured provider failures", () => {
     thread.session = { status: "ready", activeTurnId: null, lastError: null };
     thread.updatedAt = new Date().toISOString();
     fixture.client.getShell = async () => failedShell;
-    expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]).toMatchObject({ latestTurn: { state: "completed" }, failure: null });
-    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]).toMatchObject({ latestTurn: { state: "completed" }, failure: null });
+    expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]).toMatchObject({ latestTurn: { state: "error" }, failure: null });
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]).toMatchObject({ latestTurn: { state: "error" }, failure: null });
     expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { state: "completed" }, failure: null });
     expect(await fixture.gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
     expect(await makeGateway(fixture.config).gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
@@ -214,8 +216,9 @@ describe("structured provider failures", () => {
     fixture.client.getShell = async () => shell;
     fixture.client.getThread = async () => full;
     const expected = { latestTurn: { turnId: "new-turn" }, latestUserMessageAt, hasPendingApprovals: true, hasPendingUserInput: true };
-    expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]).toMatchObject(expected);
-    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]).toMatchObject(expected);
+    const shellExpected = { ...expected, latestTurn: { turnId: shell.threads[0]!.latestTurn!.turnId } };
+    expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]).toMatchObject(shellExpected);
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]).toMatchObject(shellExpected);
     expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject(expected);
   });
 
@@ -429,6 +432,31 @@ describe("structured provider failures", () => {
     await restarted.threadsOverview({ includeArchived: false, runningLimit: 5 });
     thread.session = { status: "ready", activeTurnId: null, lastError: null };
     expect((await restarted.threadGet(thread.id)).thread.failure?.message).toBe("First observed in threadGet");
+  });
+
+  it.each(["activity", "message"] as const)("replaces a retained V1 %s with later evidence from the same source", async (source) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: null };
+    if (source === "activity") thread.activities.push({ kind: "runtime.error", turnId,
+      payload: { message: "Codex usage limit reached. Send the message again once the limit resets." } });
+    else thread.messages.push(assistantMessage("API Error: rate_limit_error: first refusal", turnId));
+    expect((await fixture.gateway.runGet(run.runId)).failure?.category).toBe(source === "activity" ? "quota" : "rate_limit");
+    const older = structuredClone(await fixture.client.getThread(thread.id));
+    if (source === "activity") thread.activities.push({ kind: "runtime.error", turnId,
+      payload: { message: "Credentials unavailable", type: "auth_unavailable" } });
+    else thread.messages.push(assistantMessage("API Error: auth_unavailable: credentials unavailable", turnId));
+    const newer = structuredClone(await fixture.client.getThread(thread.id));
+    newer.snapshotSequence = older.snapshotSequence + 1;
+    fixture.client.getThread = async () => newer;
+    const expected = { category: "auth_billing", code: "auth_unavailable", resetAt: null };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject(expected);
+    const restarted = makeGateway(fixture.config);
+    restarted.client.getThread = async () => older;
+    expect((await restarted.gateway.runGet(run.runId)).failure).toMatchObject(expected);
   });
 
   it("keeps retained failure metadata when a later session observation is less specific", async () => {

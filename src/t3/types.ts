@@ -51,8 +51,22 @@ export const ProjectSchema = z
   .catchall(z.unknown());
 export type Project = z.infer<typeof ProjectSchema>;
 
+// Private observation provenance. Never included in MCP output schemas.
+export const FailureEvidenceOrderSchema = z.object({
+  protocolVersion: z.union([z.literal(1), z.literal(2)]),
+  scope: z.enum(["full", "shell"]),
+  snapshotSequence: z.number().int().nonnegative(),
+  item: z.object({
+    updatedAt: z.iso.datetime({ offset: true }),
+    ordinal: z.number().int().nonnegative(),
+    id: NonEmptyString,
+  }).optional(),
+});
+export type FailureEvidenceOrder = z.infer<typeof FailureEvidenceOrderSchema>;
+
 export const ThreadShellSchema = z
   .object({
+    evidenceOrder: FailureEvidenceOrderSchema.optional(),
     id: NonEmptyString,
     projectId: NonEmptyString,
     title: NonEmptyString,
@@ -106,14 +120,6 @@ export const MessageSchema = z
   .catchall(z.unknown());
 export type Message = z.infer<typeof MessageSchema>;
 
-export const FailureEvidenceOrderSchema = z.object({
-  snapshotSequence: z.number().int().nonnegative(),
-  updatedAt: z.iso.datetime({ offset: true }),
-  ordinal: z.number().int().nonnegative(),
-  itemId: NonEmptyString,
-});
-export type FailureEvidenceOrder = z.infer<typeof FailureEvidenceOrderSchema>;
-
 export const ThreadSchema = ThreadShellSchema.extend({
   messages: z.array(MessageSchema).default([]),
   activities: z.array(z.unknown()).default([]),
@@ -125,7 +131,7 @@ export const ThreadSchema = ThreadShellSchema.extend({
     turnId: NonEmptyString,
     provider: NonEmptyString,
     modelSelection: ModelSelectionSchema,
-    failure: ProviderFailureSchema,
+    failure: ProviderFailureSchema.nullable(),
     retry: ProviderRetrySchema.optional(),
   })).optional(),
 }).catchall(z.unknown());

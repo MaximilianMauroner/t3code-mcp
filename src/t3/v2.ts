@@ -84,7 +84,7 @@ function sessionStatus(status: string): string {
   return "ready";
 }
 
-export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>): ThreadShell {
+export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>, snapshotSequence?: number): ThreadShell {
   const request = thread.pendingRuntimeRequest;
   const runId = thread.activeRunId ?? thread.latestRunId;
   const status = thread.activityRunStatus ?? thread.status;
@@ -94,6 +94,7 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>): Thr
   const hasBoundFailure = status === "failed" && thread.lastErrorClass != null;
   return ThreadShellSchema.parse({
     ...thread,
+    evidenceOrder: snapshotSequence === undefined ? undefined : { protocolVersion: 2, scope: "shell", snapshotSequence },
     title: thread.title || "Untitled",
     orchestrationProtocolVersion: 2,
     latestTurn: runId ? {
@@ -127,18 +128,19 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
   const rootNodes = new Set(runs.map((run) => run.rootNodeId));
   const messages = projection.messages.filter((message) => message.nodeId === null || rootNodes.has(message.nodeId));
   const pending = projection.runtimeRequests.filter((request) => request.status === "pending" && request.responseCapability.type !== "not_resumable");
-  const turnFailures = runs.filter((run) => run.status === "failed").flatMap((run) => {
+  const turnFailures = runs.filter((run) => run.status === "failed").map((run) => {
     const item = projection.turnItems
       .filter((item) => item.runId === run.id && item.nodeId === run.rootNodeId &&
         item.type === "error" && item.status === "failed" && item.failure)
       .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt) ||
         a.ordinal - b.ordinal || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
       .at(-1);
-    return item?.failure ? [{
-      order: { snapshotSequence: snapshot.snapshotSequence, updatedAt: item.updatedAt, ordinal: item.ordinal, itemId: item.id },
+    return {
+      order: { protocolVersion: 2, scope: "full", snapshotSequence: snapshot.snapshotSequence,
+        item: item ? { updatedAt: item.updatedAt, ordinal: item.ordinal, id: item.id } : undefined },
       turnId: run.id, provider: run.providerInstanceId,
-      modelSelection: run.modelSelection, failure: item.failure, retry: item.retry,
-    }] : [];
+      modelSelection: run.modelSelection, failure: item?.failure ?? null, retry: item?.retry,
+    };
   });
   const executed = runs.filter((run) => run.status !== "queued" &&
     !(run.status === "cancelled" && run.startedAt === null)).at(-1);

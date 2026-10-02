@@ -991,6 +991,7 @@ export class T3Gateway {
     const sorted = sortThreads(filtered, input.sort ?? "recent", now);
     const summaries = await Promise.all(sorted.map(async (thread) => this.withRetainedFailure(
       threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
+      failureEvidenceOrder(thread, shell.snapshotSequence, "shell"),
     )));
     // detail=full is served by the same shell rows plus latest-response enrichment on the page only.
     // Full transcripts still require t3_thread_messages.
@@ -1041,6 +1042,7 @@ export class T3Gateway {
     await Promise.all(filtered.filter((thread) => thread.latestTurn?.state === "error")
       .map((thread) => this.withRetainedFailure(
         threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
+        failureEvidenceOrder(thread, shell.snapshotSequence, "shell"),
       )));
     const running = filtered
       .filter(isThreadRunning)
@@ -1111,9 +1113,10 @@ export class T3Gateway {
     const environmentId = await this.environmentId();
     const summary = shell.threads.find((thread) => thread.id === threadId);
     const projectTitle = shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ?? null;
-    const observed = threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now());
-    let detail = await this.withRetainedFailure(observed,
-      snapshot.thread.turnFailures?.find((entry) => entry.turnId === observed.failure?.turnId)?.order);
+    const observed = threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now(),
+      failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full"),
+      summary ? failureEvidenceOrder(summary, shell.snapshotSequence, "shell") : undefined);
+    let detail = await this.withRetainedFailure(observed.detail, observed.failureOrder);
     if (detail.failure === null && snapshot.thread.latestTurn == null) {
       const latestUserTurnId = snapshot.thread.messages.filter((message) => message.role === "user").at(-1)?.turnId;
       const retained = latestUserTurnId
@@ -2295,7 +2298,7 @@ export class T3Gateway {
                 ? "completed"
                 : "accepted";
       const observedFailure = turnId === null ? null : failureInfo(thread, turnId);
-      const failureOrder = thread.turnFailures?.find((entry) => entry.turnId === turnId)?.order;
+      const failureOrder = failureEvidenceOrder(thread, snapshot.snapshotSequence, "full", turnId);
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
       const failure = recovered ? null : turnId !== null && (observedFailure !== null || priorFailure !== null)
         ? boundedEnvironmentId === undefined
@@ -2470,16 +2473,18 @@ export class T3Gateway {
         const snapshot = await this.client.getThread(summary.id);
         const sameTurn = summary.observedTurnId === (snapshot.thread.latestTurn?.turnId ?? null);
         const sameState = summary.latestTurn?.state === snapshot.thread.latestTurn?.state;
-        const current = sameTurn && sameState ? summary : {
-          ...summary, ...threadSummary(withShellMetadata(snapshot.thread, summary), summary.projectTitle,
-            summary.observedTarget.environmentId, Date.parse(summary.observedAt)),
-        };
-        const failure = failureInfo(snapshot.thread, current.observedTurnId);
-        const enriched = await this.withRetainedFailure({ ...current, failure: failure ?? current.failure },
-          snapshot.thread.turnFailures?.find((entry) => entry.turnId === current.observedTurnId)?.order);
-        const latest = latestAssistant(snapshot.thread.messages, current.observedTurnId)
-          ?? (current.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
-            ? latestAssistant(snapshot.thread.messages, null, true) : null);
+        const fullSummary = threadSummary(withShellMetadata(snapshot.thread, summary), summary.projectTitle,
+          summary.observedTarget.environmentId, Date.parse(summary.observedAt));
+        const fullOrder = failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full");
+        // Observe full evidence privately, but keep selection, sorting and counts
+        // on the shell snapshot that selected this row.
+        const observed = await this.withRetainedFailure(fullSummary, fullOrder);
+        const enriched = sameTurn && sameState
+          ? { ...summary, failure: observed.failure }
+          : { ...summary, failure: null };
+        const latest = sameTurn && sameState ? latestAssistant(snapshot.thread.messages, summary.observedTurnId)
+          ?? (summary.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
+            ? latestAssistant(snapshot.thread.messages, null, true) : null) : null;
         const excerpt = latest ? truncateExcerpt(latest.text, excerptChars) : null;
         results.push({ ...enriched, latestResponseExcerpt: excerpt });
       } catch {
@@ -2958,37 +2963,62 @@ function withShellMetadata(thread: Thread, shell: Pick<ThreadShell, "latestUserM
   };
 }
 
+function failureEvidenceOrder(
+  thread: ThreadShell, snapshotSequence: number, scope: "full" | "shell", turnId: string | null | undefined = thread.latestTurn?.turnId,
+): FailureEvidenceOrder {
+  if (scope === "shell" && thread.evidenceOrder) return thread.evidenceOrder;
+  const persisted = "turnFailures" in thread
+    ? (thread as Thread).turnFailures?.find((entry) => entry.turnId === turnId)?.order : undefined;
+  return persisted ?? { protocolVersion: thread.orchestrationProtocolVersion === 2 ? 2 : 1, scope, snapshotSequence };
+}
+
 function threadDetail(
   thread: Thread,
   summary: ThreadShell | undefined,
   projectTitle: string | null = null,
   environmentId = "unknown",
   now = Date.now(),
-): ThreadDetail {
+  fullOrder?: FailureEvidenceOrder,
+  shellOrder?: FailureEvidenceOrder,
+): { detail: ThreadDetail; failureOrder?: FailureEvidenceOrder } {
   const fullHasNewerTurn = thread.latestTurn != null && summary?.latestTurn != null &&
     thread.latestTurn.turnId !== summary.latestTurn.turnId &&
     Date.parse(thread.latestTurn.requestedAt) > Date.parse(summary.latestTurn.requestedAt);
   const sameTurn = thread.latestTurn?.turnId === summary?.latestTurn?.turnId;
   const fullHasNewerState = sameTurn && summary != null &&
-    (Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
+    ((fullOrder?.protocolVersion === 2 && shellOrder?.protocolVersion === 2 &&
+        fullOrder.snapshotSequence > shellOrder.snapshotSequence) ||
+      Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
       ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
         summary.latestTurn?.state === "error"));
   const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? withShellMetadata(thread, summary ?? {}) : summary ?? thread;
-  let fullFailure = source.latestTurn?.state === "error" &&
+  const fullFailure = source.latestTurn?.state === "error" &&
     source.latestTurn.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
   const shellFailure = failureInfo(source);
-  if (source === summary && fullFailure && shellFailure &&
-    fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
-    fullFailure = {
-      ...fullFailure,
-      resetAt: shellFailure.resetAt ?? fullFailure.resetAt,
-      retryAfter: shellFailure.retryAfter ?? fullFailure.retryAfter,
-    };
+  let failure = fullFailure ?? shellFailure;
+  let failureOrder = fullFailure ? fullOrder : source === summary ? shellOrder : fullOrder;
+  const newerShell = source === summary && shellOrder?.protocolVersion === 2 &&
+    (shellOrder.snapshotSequence > (fullOrder?.snapshotSequence ?? -1) ||
+      (shellOrder.snapshotSequence === fullOrder?.snapshotSequence &&
+        Date.parse(summary.updatedAt ?? "") > Date.parse(thread.updatedAt ?? "")));
+  if (newerShell && shellFailure) {
+    if (fullFailure && fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
+      failure = { ...fullFailure, resetAt: shellFailure.resetAt ?? fullFailure.resetAt,
+        retryAfter: shellFailure.retryAfter ?? fullFailure.retryAfter };
+    } else {
+      // The run identity is immutable even when a later shell supplies the reason.
+      const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
+      failure = run ? { ...shellFailure, provider: sanitizeFailureText(run.provider, 200),
+        model: sanitizeFailureText(run.modelSelection.model, 200) } : shellFailure;
+    }
+    failureOrder = shellOrder;
+  } else if (fullFailure?.source === "t3_turn" && fullOrder?.protocolVersion !== 2) {
+    failure = shellFailure ?? fullFailure;
+    failureOrder = shellFailure ? shellOrder : fullOrder;
   }
-  return {
+  return { failureOrder, detail: {
     ...threadSummary(source, projectTitle, environmentId, now),
-    failure: fullFailure?.source === "t3_turn"
-      ? shellFailure ?? fullFailure : fullFailure ?? shellFailure,
+    failure,
     // Latest response is bounded to the observed turn; full history needs t3_thread_messages.
     latestResponse: latestAssistant(
       thread.messages,
@@ -3001,7 +3031,7 @@ function threadDetail(
     activityCount: thread.activities.length,
     checkpointCount: thread.checkpoints.length,
     proposedPlanCount: thread.proposedPlans.length,
-  };
+  } };
 }
 
 function latestAssistant(

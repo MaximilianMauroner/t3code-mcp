@@ -46,7 +46,8 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   const full = "messages" in thread ? thread as Thread : null;
   const persisted = full?.turnFailures?.find((entry) => entry.turnId === turnId);
   if (persisted) {
-    return buildFailure({ ...persisted.failure, retry: persisted.retry }, turnId, persisted.provider, persisted.modelSelection.model, "t3_v2_turn_item");
+    return buildFailure({ ...persisted.failure, retry: persisted.retry }, turnId, persisted.provider, persisted.modelSelection.model,
+      persisted.failure ? "t3_v2_turn_item" : "t3_turn");
   }
   const turn = thread.latestTurn;
   if (turn && (turn.turnId !== turnId || turn.state !== "error")) return null;

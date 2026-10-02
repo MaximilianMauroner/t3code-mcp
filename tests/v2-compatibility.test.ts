@@ -39,6 +39,7 @@ async function setup() {
   let hold = false;
   let rejectRpc = false;
   let protocolVersion: 1 | 2 = 2;
+  let archivedSequence = 2;
   const server = createServer(async (request, response) => {
     const path = request.url ?? "/";
     requests.push({ path, protocol: request.headers["x-t3-orchestration-protocol"]?.toString(), authorization: request.headers.authorization });
@@ -77,7 +78,7 @@ async function setup() {
   sockets.on("connection", (ws) => ws.on("message", (data) => {
     const frame = z.object({ _tag: z.literal("Request"), id: z.string(), tag: z.string(), payload: z.record(z.string(), z.unknown()), headers: z.array(z.unknown()) }).parse(JSON.parse(data.toString()));
     if (frame.tag === "orchestration.getArchivedShellSnapshot") {
-      ws.send(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: { schemaVersion: 1, snapshotSequence: 2, projects: [project], threads: [{ ...shell.threads[0], id: "archived-1", archivedAt: now }] } } }));
+      ws.send(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: { schemaVersion: 1, snapshotSequence: archivedSequence, projects: [project], threads: [{ ...shell.threads[0], id: "archived-1", archivedAt: now }] } } }));
       return;
     }
     const command = frame.payload;
@@ -121,10 +122,19 @@ async function setup() {
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   const config = { t3HttpBaseUrl: baseUrl, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 };
   const made = makeGateway(config);
-  return { ...made, config, snapshot, shell, commands, requests, baseUrl, setProtocol: (version: 1 | 2) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
+  return { ...made, config, snapshot, shell, commands, requests, baseUrl, setArchivedSequence: (sequence: number) => { archivedSequence = sequence; }, setProtocol: (version: 1 | 2) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
 }
 
 describe("merged orchestrator V2 boundary", () => {
+  it("keeps each V2 shell row's source sequence when archived reads are ahead", async () => {
+    const { client, setArchivedSequence } = await setup();
+    setArchivedSequence(10);
+    const shell = await client.getShell();
+    expect(shell.snapshotSequence).toBe(10);
+    expect(shell.threads.find((thread) => thread.id === "thread-1")?.evidenceOrder).toMatchObject({ scope: "shell", snapshotSequence: 2 });
+    expect(shell.threads.find((thread) => thread.id === "archived-1")?.evidenceOrder).toMatchObject({ scope: "shell", snapshotSequence: 10 });
+  });
+
   it("switches between V2 and V1 in both directions after descriptor refresh", async () => {
     const { client, setProtocol, requests, commands } = await setup();
     for (const version of [2, 1, 2] as const) {
@@ -237,6 +247,7 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.projection.runs.push({ ...failed, id: "later-run", ordinal: 2, status: "running", userMessageId: "later-user", modelSelection: selection, providerInstanceId: "codex_openai" });
     snapshot.projection.messages.push({ id: "later-answer", role: "assistant", runId: "later-run", nodeId: failed.rootNodeId, text: "Later response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", latestResponse: null, failure: { category: "provider_error", class: "provider_error", code: "api_error_401", model: "claude-opus-5-5", provider: "claude-instance", resetAt: null, source: "t3_v2_turn_item" } });
+    expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject({ model: "claude-opus-5-5", provider: "claude-instance" });
     expect((await gateway.threadGet("thread-1")).thread.failure).toBeNull();
   });
 
@@ -339,9 +350,59 @@ describe("merged orchestrator V2 boundary", () => {
     run.status = "failed";
     const failure = { ...providerFailures.codexUsageLimit, resetAt: null };
     snapshot.projection.turnItems.push({ id: "terminal", type: "error", status: "failed", ordinal: 1, runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure });
+    shell.snapshotSequence = 3;
     Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: failure.message, lastErrorClass: failure.class, usageLimitResetAt: providerFailures.codexUsageLimit.resetAt, updatedAt: "2026-10-02T20:00:01.000Z" });
     expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ source: "t3_v2_turn_item", code: failure.code, resetAt: providerFailures.codexUsageLimit.resetAt });
     expect(await journal.getFailureByTurnId("thread-1", run.id)).toMatchObject({ resetAt: providerFailures.codexUsageLimit.resetAt });
+  });
+
+  it("replaces an older root with a newer bound shell reason without mixing failure metadata", async () => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "changed-shell" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    const older = await client.getThread("thread-1");
+    expect((await gateway.runGet(sent.runId)).failure?.category).toBe("quota");
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: "New provider failure", lastErrorClass: "provider_error", usageLimitResetAt: null,
+      modelSelection: { instanceId: "changed-provider", model: "changed-model" }, updatedAt: "2026-10-02T20:00:01.000Z" });
+    const expected = { category: "provider_error", class: "provider_error", message: "New provider failure",
+      code: null, resetAt: null, retry: null, source: "t3_session", provider: run.providerInstanceId, model: run.modelSelection.model };
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
+    expect((await gateway.threadsList({ includeArchived: false, limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
+    expect((await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject(expected);
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => older;
+    expect((await restarted.gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+  });
+
+  it("invalidates a retained root when a newer full snapshot marks that error recovered", async () => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "recovered-item" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    run.modelSelection = { instanceId: "claude-instance", model: "claude-opus-5-5" };
+    run.providerInstanceId = "claude-instance";
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    const older = await client.getThread("thread-1");
+    expect((await gateway.runGet(sent.runId)).failure?.category).toBe("quota");
+    snapshot.snapshotSequence = 3;
+    snapshot.projection.turnItems[0]!.status = "completed";
+    snapshot.projection.thread.modelSelection = { instanceId: "changed-provider", model: "changed-model" };
+    const expected = { category: "unknown", class: null, code: null, resetAt: null, retry: null,
+      source: "t3_turn", provider: run.providerInstanceId, model: run.modelSelection.model };
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", failure: expected });
+    expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject(expected);
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
+    expect((await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => older;
+    expect((await restarted.gateway.runGet(sent.runId)).failure).toMatchObject(expected);
   });
 
   it.each(["run", "thread", "overview"])("rejects a delayed older V2 %s read, including after restart", async (reader) => {
@@ -394,6 +455,7 @@ describe("merged orchestrator V2 boundary", () => {
   it("uses precise same-turn shell evidence when the full failure is generic", async () => {
     const { gateway, snapshot, shell } = await setup();
     snapshot.projection.runs.push({ id: "failed-run", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "failed", userMessageId: "user-1", rootNodeId: "root", requestedAt: now, startedAt: now, completedAt: now });
+    shell.snapshotSequence = 3;
     Object.assign(shell.threads[0]!, { latestRunId: "failed-run", activeRunId: null, status: "failed", lastError: "Codex usage limit reached. Send the message again once the limit resets.", lastErrorClass: "usage_limit", usageLimitResetAt: providerFailures.codexUsageLimit.resetAt });
     expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ category: "quota", source: "t3_session", resetAt: providerFailures.codexUsageLimit.resetAt });
   });

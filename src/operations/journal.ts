@@ -441,14 +441,25 @@ export class OperationJournal {
     const retained = this.threadFailures.get(key);
     const existing = retained?.failure ?? operation?.terminalFailure ?? legacyFailure;
     const comparison = order && retained?.order ? compareFailureOrder(order, retained.order) : null;
-    const stale = candidate.source === "t3_v2_turn_item" && retained?.order !== undefined &&
+    const stale = retained?.order !== undefined &&
       (order === undefined || (comparison !== null && comparison < 0));
-    const merged = stale && existing ? existing : mergeTerminalFailure(existing, candidate, comparison === 0);
-    const nextOrder = candidate.source === "t3_v2_turn_item" && !stale ? order : retained?.order;
+    const authoritativeV2 = order?.protocolVersion === 2;
+    const laterV1Evidence = comparison !== null && comparison > 0 &&
+      candidate.source === existing?.source &&
+      (candidate.source === "t3_activity" || candidate.source === "t3_message");
+    let merged = stale && existing ? existing
+      : authoritativeV2 || laterV1Evidence
+        ? mergeOrderedFailure(existing, candidate, comparison === 0)
+        : mergeTerminalFailure(existing, candidate);
+    if (!stale && authoritativeV2 && order.scope === "shell" && existing) {
+      merged = { ...merged, provider: existing.provider, model: existing.model };
+    }
+    const nextOrder = !stale && merged.source === candidate.source && merged.message === candidate.message &&
+      merged.category === candidate.category ? order ?? retained?.order : retained?.order;
     const admittedModel = operation?.settings?.resolved.modelSelection;
     // A V1 snapshot carries mutable thread settings. The run receipt records
     // the settings admitted for this operation; V2 root items use run metadata.
-    const failure = admittedModel && merged.source !== "t3_v2_turn_item" ? {
+    const failure = admittedModel && nextOrder?.protocolVersion !== 2 && merged.source !== "t3_v2_turn_item" ? {
       ...merged,
       model: sanitizeFailureText(admittedModel.model, 200),
       provider: sanitizeFailureText(admittedModel.provider ?? admittedModel.instanceId ?? merged.provider ?? "", 200) || null,
@@ -581,20 +592,30 @@ const failureSourcePriority = {
 };
 
 function compareFailureOrder(candidate: FailureEvidenceOrder, existing: FailureEvidenceOrder): number {
+  if (candidate.protocolVersion !== existing.protocolVersion) return 1;
   return candidate.snapshotSequence - existing.snapshotSequence ||
-    Date.parse(candidate.updatedAt) - Date.parse(existing.updatedAt) || candidate.ordinal - existing.ordinal ||
-    (candidate.itemId < existing.itemId ? -1 : candidate.itemId > existing.itemId ? 1 : 0);
+    Number(candidate.scope === "full") - Number(existing.scope === "full") ||
+    (candidate.item && existing.item
+      ? Date.parse(candidate.item.updatedAt) - Date.parse(existing.item.updatedAt) ||
+        candidate.item.ordinal - existing.item.ordinal || (candidate.item.id < existing.item.id ? -1 : candidate.item.id > existing.item.id ? 1 : 0)
+      : 0);
 }
 
-function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo, sameItem = false): FailureInfo {
-  if (!existing) return candidate;
-  // Full V2 reads already select the authoritative root item. Replace older
-  // attempts, including their reset metadata, rather than mixing two errors.
-  if (candidate.source === "t3_v2_turn_item") return sameItem ? {
+function mergeOrderedFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo, sameObservation: boolean): FailureInfo {
+  // A different error, or authoritative absence, replaces the entire reason.
+  // Metadata can be preserved only for the same explicitly identified error.
+  return sameObservation && existing?.message === candidate.message && existing.class === candidate.class ? {
     ...candidate,
     resetAt: candidate.resetAt ?? existing.resetAt,
     retryAfter: candidate.retryAfter ?? existing.retryAfter,
   } : candidate;
+}
+
+function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo): FailureInfo {
+  if (!existing) return candidate;
+  // Full V2 reads already select the authoritative root item. Replace older
+  // attempts, including their reset metadata, rather than mixing two errors.
+  if (candidate.source === "t3_v2_turn_item") return candidate;
   const upgradesUnknown = existing.source !== "t3_v2_turn_item" &&
     existing.category === "unknown" && candidate.category !== "unknown";
   const losesKnownCategory = candidate.category === "unknown" && existing.category !== "unknown";
