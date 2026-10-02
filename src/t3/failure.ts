@@ -19,6 +19,7 @@ const ProviderError = z.object({ error: z.object({ type: z.string().optional(), 
 export function categoryForFailure(errorClass?: string | null, code?: string | null, message?: string): FailureCategory {
   if (code === "credits_required" || code === "auth_unavailable" || code === "authentication_error" ||
       message === "API Error: Request rejected (429) · Usage credits are required for this model.") return "auth_billing";
+  if (code === "api_error_429") return "unknown";
   if (code === "rate_limit_error" || code === "rateLimitExceeded") return "rate_limit";
   if (code === "usageLimitExceeded" || code === "usage_limit" || errorClass === "usage_limit") return "quota";
   if (message === "Claude usage limit reached. Send the message again once the limit resets." ||
@@ -67,7 +68,7 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   const provider = sessionMatches ? session?.providerName : null;
   const identity = provider ?? thread.modelSelection.provider ?? thread.modelSelection.instanceId ?? null;
   // A provider type is more specific than V1's generic usage-limit sentence.
-  if (assistant && categoryForFailure(null, assistantCode, assistant.text) !== "unknown" && !activity?.class) {
+  if (assistant && categoryForFailure(null, assistantCode, assistant.text) !== "unknown") {
     return buildFailure({ message: assistant.text, code: assistantCode }, turnId, identity, thread.modelSelection.model, "t3_message");
   }
   if (activity && (activity.message || activity.detail)) {
@@ -114,7 +115,8 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
   return value
     .replace(/\n\s+at\s[^\n]*/g, "")
     .replace(/(?:https?|file):\/\/[^\s)]+/gi, "[REDACTED URL]")
-    .replace(/\/(?:home|Users|tmp|var|etc|root|workspace|work)\/[^\s"'<>]+/g, "[REDACTED PATH]")
+    .replace(/(["'])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1/g, "$1[REDACTED PATH]$1")
+    .replace(/(^|[\s"'(<:=])(?:\/[^\s"'<>),;]+|[A-Za-z]:[\\/][^\s"'<>),;]+|\\\\[^\s"'<>),;]+)/g, "$1[REDACTED PATH]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, "[REDACTED HOST]")
     .replace(/(["'])(api[_-]?key|(?:access|refresh|id)[_-]?token|authorization|credential|password|secret|token)\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")

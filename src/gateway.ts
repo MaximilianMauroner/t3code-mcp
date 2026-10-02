@@ -1577,7 +1577,9 @@ export class T3Gateway {
         await this.journal.update(record.operationId, { turnId: current.t3TurnId });
       }
       if (current.failure && current.threadId) {
-        await this.journal.retainTerminalFailure(current.threadId, current.t3TurnId, current.failure, current.operationId);
+        current = { ...current, failure: await this.journal.retainTerminalFailure(
+          current.threadId, current.t3TurnId, current.failure, current.operationId,
+        ) };
       }
     }
     const result: RunResult = {
@@ -2447,12 +2449,15 @@ export class T3Gateway {
     for (const summary of summaries) {
       try {
         const snapshot = await this.client.getThread(summary.id);
-        const failure = summary.observedTurnId === snapshot.thread.latestTurn?.turnId
-          ? failureInfo(snapshot.thread, summary.observedTurnId)
-          : null;
-        const enriched = await this.withRetainedFailure({ ...summary, failure: failure ?? summary.failure });
-        const latest = latestAssistant(snapshot.thread.messages, summary.observedTurnId)
-          ?? (summary.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
+        const sameTurn = summary.observedTurnId === (snapshot.thread.latestTurn?.turnId ?? null);
+        const current = sameTurn ? summary : {
+          ...summary, ...threadSummary(snapshot.thread, summary.projectTitle,
+            summary.observedTarget.environmentId, Date.parse(summary.observedAt)),
+        };
+        const failure = failureInfo(snapshot.thread, current.observedTurnId);
+        const enriched = await this.withRetainedFailure({ ...current, failure: failure ?? current.failure });
+        const latest = latestAssistant(snapshot.thread.messages, current.observedTurnId)
+          ?? (current.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
             ? latestAssistant(snapshot.thread.messages, null, true) : null);
         const excerpt = latest ? truncateExcerpt(latest.text, excerptChars) : null;
         results.push({ ...enriched, latestResponseExcerpt: excerpt });
@@ -2930,10 +2935,14 @@ function threadDetail(
   environmentId = "unknown",
   now = Date.now(),
 ): ThreadDetail {
-  const source: ThreadShell = summary ?? thread;
+  const fullHasNewerTurn = thread.latestTurn != null && summary?.latestTurn != null &&
+    thread.latestTurn.turnId !== summary.latestTurn.turnId &&
+    Date.parse(thread.latestTurn.requestedAt) > Date.parse(summary.latestTurn.requestedAt);
+  const source: ThreadShell = fullHasNewerTurn ? thread : summary ?? thread;
   return {
     ...threadSummary(source, projectTitle, environmentId, now),
-    failure: source.latestTurn?.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : failureInfo(source),
+    failure: source.latestTurn?.turnId === thread.latestTurn?.turnId
+      ? failureInfo(thread) ?? failureInfo(source) : failureInfo(source),
     // Latest response is bounded to the observed turn; full history needs t3_thread_messages.
     latestResponse: latestAssistant(
       thread.messages,
@@ -2954,11 +2963,9 @@ function latestAssistant(
   turnId: string | null,
   allowUnboundFallback = false,
 ): Message | null {
-  if (turnId === null) {
-    return allowUnboundFallback ? messages.filter((message) => message.role === "assistant").at(-1) ?? null : null;
-  }
+  if (turnId === null && !allowUnboundFallback) return null;
   const candidates = messages.filter(
-    (message) => message.role === "assistant" && message.turnId === turnId,
+    (message) => message.role === "assistant" && (turnId === null || message.turnId === turnId),
   );
   const latest = candidates.at(-1) ?? null;
   return latest?.text.startsWith("API Error:")

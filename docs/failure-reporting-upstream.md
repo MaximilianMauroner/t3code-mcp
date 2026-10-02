@@ -16,7 +16,7 @@ failure evidence and keeps the existing MCP fields and journal records valid.
   `0.0.45-nightly.20261002.2595`, rather than the older version in the task brief.
   No service or tunnel was restarted. No database query or provider turn was run.
 - Sanitized live V1 fixtures and V2 adapter-test fixtures are documented in
-  [the fixture source notes](../tests/fixtures/failures/README.md).
+  [the fixture source notes](failure-fixture-sources.md).
 
 At the merged upstream commit, `packages/contracts/src/orchestrationV2.ts`
 defines the failure classes and fields. `packages/shared/src/orchestrationV2ThreadError.ts`

@@ -52,7 +52,7 @@ const TurnItem = z.object({
   id: Id, type: z.string(), runId: Id.nullable(), nodeId: Id.nullable(), updatedAt: Time,
   requestId: Id.optional(), questions: z.array(z.unknown()).optional(), prompt: z.string().optional(),
   failure: ProviderFailureSchema.optional(), retry: ProviderRetrySchema.optional(), title: z.string().nullable(),
-  status: z.string().optional(), ordinal: z.number().optional(),
+  status: z.string(), ordinal: z.number().optional(),
 }).passthrough();
 const RuntimeRequest = PendingRequest.extend({
   nodeId: Id,
@@ -63,6 +63,7 @@ export const V2ThreadSchema = z.object({
   snapshotSequence: z.number().int().nonnegative(),
   projection: z.object({
     thread: AppThread, runs: z.array(Run), messages: z.array(Message),
+    providerSessions: z.array(z.object({ providerInstanceId: Id, lastError: z.string().nullable(), updatedAt: Time })),
     runtimeRequests: z.array(RuntimeRequest), turnItems: z.array(TurnItem),
     plans: z.array(z.object({ id: Id, runId: Id.nullable(), kind: z.string(), status: z.string(), markdown: z.string().optional() }).passthrough()),
     checkpoints: z.array(z.unknown()), updatedAt: Time,
@@ -121,7 +122,6 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
   // Queue entries can have larger ordinals than the run that is executing.
   const runs = [...projection.runs].sort((a, b) => a.ordinal - b.ordinal);
   const active = runs.find((run) => ActiveStatuses.has(run.status));
-  const latest = active ?? runs.filter((run) => run.status !== "queued").at(-1) ?? runs.at(-1);
   const rootNodes = new Set(runs.map((run) => run.rootNodeId));
   const messages = projection.messages.filter((message) => message.nodeId === null || rootNodes.has(message.nodeId));
   const pending = projection.runtimeRequests.filter((request) => request.status === "pending" && request.responseCapability.type !== "not_resumable");
@@ -137,7 +137,16 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
       modelSelection: run.modelSelection, failure: item.failure, retry: item.retry,
     }] : [];
   });
-  const failure = turnFailures.find((failure) => failure.turnId === latest?.id)?.failure;
+  const executed = runs.filter((run) => run.status !== "queued" &&
+    !(run.status === "cancelled" && run.startedAt === null)).at(-1);
+  const executedFailure = turnFailures.find((entry) => entry.turnId === executed?.id)?.failure;
+  const sessionError = projection.providerSessions
+    .filter((session) => session.providerInstanceId === projection.thread.providerInstanceId)
+    .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt)).at(-1)?.lastError;
+  const limited = executedFailure?.class === "usage_limit" &&
+    (sessionError == null || sessionError === executedFailure.message) ? executed : null;
+  const latest = active ?? limited ?? runs.filter((run) => run.status !== "queued").at(-1) ?? runs.at(-1);
+  const failure = turnFailures.find((entry) => entry.turnId === latest?.id)?.failure;
   const shell = normalizeV2ShellThread({
     ...projection.thread,
     latestRunId: latest?.id ?? null,

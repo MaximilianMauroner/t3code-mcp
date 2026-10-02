@@ -133,11 +133,60 @@ describe("structured provider failures", () => {
     const turnId = thread.latestTurn!.turnId;
     thread.latestTurn = { ...thread.latestTurn!, state: "error" };
     thread.session = { status: "ready" };
-    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project 10.2.3.4:8317', turnId));
+    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project /mnt/customer/project /opt/service/secret C:\\customer\\secret \\\\server\\share\\secret \"C:\\Program Files\\customer\\secret\" 10.2.3.4:8317', turnId));
     const observed = await fixture.gateway.runGet(run.runId);
-    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|home\/private|10\.2\.3\.4/);
-    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|home\/private|10\.2\.3\.4/);
-    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|home\/private|10\.2\.3\.4/);
+    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+  });
+
+  it("prefers a specific V1 provider error over a generic activity class", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities = creditsRequired.activities.map((activity) => ({ ...activity, turnId, payload: { ...activity.payload, class: "usage_limit" } }));
+    thread.messages.push(MessageSchema.parse({ ...creditsRequired.messages[0]!, turnId }));
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ category: "auth_billing", source: "t3_message" });
+  });
+
+  it("uses admitted V1 run settings after the thread model changes, including on reconnect", async () => {
+    const { fixture, fake, thread, run } = await setup(false);
+    const admittedModel = thread.modelSelection.model;
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Provider stopped" };
+    thread.modelSelection = { instanceId: "different-provider", model: "different-model" };
+    // A thread-only read cannot know the admitted V1 model before run binding.
+    await fixture.gateway.threadGet(thread.id);
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ model: admittedModel, provider: "codex_openai" });
+    await fake.close();
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject({ model: admittedModel, provider: "codex_openai" });
+  });
+
+  it("updates full list and overview rows when a newer turn has replaced the shell failure", async () => {
+    const { fixture, thread } = await setup(false);
+    const oldTurn = thread.latestTurn!;
+    thread.latestTurn = { ...oldTurn, state: "error" };
+    thread.session = { status: "error", activeTurnId: oldTurn.turnId, lastError: "Older failure" };
+    const oldShell = structuredClone(await fixture.client.getShell());
+    thread.latestTurn = { turnId: "new-turn", state: "running", requestedAt: new Date(Date.parse(oldTurn.requestedAt) + 1000).toISOString() };
+    thread.session = { status: "running", activeTurnId: "new-turn", lastError: null };
+    fixture.client.getShell = async () => oldShell;
+    const list = await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 });
+    expect(list.page.items[0]).toMatchObject({ latestTurn: { turnId: "new-turn" }, activity: "running", failure: null });
+    const overview = await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+    expect(overview.highlights[0]).toMatchObject({ latestTurn: { turnId: "new-turn" }, activity: "running", failure: null });
+    expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { turnId: "new-turn" }, failure: null });
+  });
+
+  it("keeps a newer same-turn shell failure when the earlier full read was still running", async () => {
+    const { fixture, thread } = await setup(false);
+    const running = structuredClone(await fixture.client.getThread(thread.id));
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Codex usage limit reached. Send the message again once the limit resets." };
+    fixture.client.getThread = async () => running;
+    expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { state: "error" }, activity: "failed", failure: { category: "quota", source: "t3_session" } });
   });
 
   it("reports a pre-response quota failure with no invented reset time", async () => {
@@ -179,7 +228,7 @@ describe("structured provider failures", () => {
       failure: {
         category: "quota",
         code: "usage_limit",
-        provider: "Codex",
+        provider: "codex_openai",
         model: thread.modelSelection.model,
         turnId,
         resetAt: "2026-09-15T00:00:00.000Z",
@@ -392,7 +441,7 @@ describe("structured provider failures", () => {
     thread.session.activeTurnId = turnId;
     const matched = (await fixture.gateway.runGet(run.runId)).failure;
     expect(JSON.stringify(matched)).not.toMatch(/secret-token|secret-provider|secret-code/);
-    expect(matched?.provider).toBe("password=[REDACTED]");
+    expect(matched?.provider).toBe("codex_openai");
 
     thread.session.lastError = '{"api_key":"private-value","password":"private-password","secret":"escaped\\\"value"}';
     const quoted = (await fixture.gateway.runGet(run.runId)).failure;

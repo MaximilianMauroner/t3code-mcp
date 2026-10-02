@@ -28,7 +28,7 @@ const thread = {
 // Wire fields from the merged V2 contracts, without the V1 session/latestTurn.
 async function setup() {
   const snapshot = V2ThreadSchema.parse({ snapshotSequence: 2, projection: {
-    thread, runs: [], messages: [], runtimeRequests: [], turnItems: [], plans: [], checkpoints: [], updatedAt: now,
+    thread, runs: [], messages: [], providerSessions: [], runtimeRequests: [], turnItems: [], plans: [], checkpoints: [], updatedAt: now,
   } });
   const shell = V2ShellSchema.parse({ schemaVersion: 1, snapshotSequence: 2, projects: [project], archivedThreads: [], threads: [{
     ...thread, latestRunId: null, activeRunId: null, status: "idle", pendingRuntimeRequest: null,
@@ -190,7 +190,7 @@ describe("merged orchestrator V2 boundary", () => {
       { id: "dead", nodeId: "node-root", kind: "user_input", status: "pending", responseCapability: { type: "not_resumable", reason: "restart" }, createdAt: now },
       { id: "live", nodeId: "node-root", kind: "user_input", status: "pending", responseCapability: { type: "message" }, createdAt: now },
     );
-    snapshot.projection.turnItems.push({ id: "question", type: "user_input_request", requestId: "live", runId: "active", nodeId: "node-root", title: "Question", questions: [{ id: "q1", question: "Which?" }], updatedAt: now });
+    snapshot.projection.turnItems.push({ id: "question", type: "user_input_request", status: "waiting", requestId: "live", runId: "active", nodeId: "node-root", title: "Question", questions: [{ id: "q1", question: "Which?" }], updatedAt: now });
     const result = (await client.getThread("thread-1")).thread;
     expect(result.latestTurn?.turnId).toBe("active");
     expect(result.messages).toEqual([]);
@@ -263,13 +263,38 @@ describe("merged orchestrator V2 boundary", () => {
 
   it.each([
     ["rateLimitExceeded", "Provider stopped this request.", "rate_limit"],
+    ["api_error_429", "Provider stopped this request.", "unknown"],
     [null, "API Error: Request rejected (429) · Usage credits are required for this model.", "auth_billing"],
   ] as const)("uses explicit V2 provider evidence instead of its broad limit class: %s", async (code, message, category) => {
-    const { gateway, snapshot } = await setup();
+    const { gateway, snapshot, shell } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "specific-type" });
     snapshot.projection.runs[0]!.status = "failed";
     snapshot.projection.turnItems.push({ id: "terminal", type: "error", status: "failed", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: { class: "usage_limit", code, message } });
+    Object.assign(shell.threads[0]!, { latestRunId: "run-v2", activeRunId: null, status: "failed", lastError: message, lastErrorClass: "usage_limit" });
+    await gateway.threadsList({ includeArchived: false, detail: "summary", limit: 5 });
     expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ category, class: "usage_limit", resetAt: null });
+  });
+
+  it("keeps a usage-limit-blocked run visible after an unstarted successor is cancelled", async () => {
+    const { gateway, client, snapshot, shell } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "cancelled-queue" });
+    const failed = snapshot.projection.runs[0]!;
+    failed.status = "failed";
+    failed.completedAt = now;
+    snapshot.projection.turnItems.push({ id: "limited", type: "error", status: "failed", runId: failed.id, nodeId: failed.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    snapshot.projection.runs.push({ ...failed, id: "cancelled-successor", ordinal: 2, status: "cancelled", userMessageId: "later-user", startedAt: null });
+    Object.assign(shell.threads[0]!, { latestRunId: failed.id, activeRunId: null, status: "failed", lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    expect((await gateway.threadGet("thread-1")).thread).toMatchObject({ latestTurn: { turnId: failed.id, state: "error" }, failure: { class: "usage_limit", source: "t3_v2_turn_item" } });
+    expect((await gateway.runGet(sent.runId)).failure?.turnId).toBe(failed.id);
+    snapshot.projection.providerSessions.push({ providerInstanceId: "codex_openai", lastError: "Distinct session failure", updatedAt: now });
+    const { thread: normalized } = await client.getThread("thread-1");
+    expect(normalized.latestTurn?.turnId).toBe("cancelled-successor");
+  });
+
+  it("rejects V2 error items without the required status instead of guessing terminal state", async () => {
+    const { snapshot } = await setup();
+    const payload = { ...snapshot, projection: { ...snapshot.projection, turnItems: [{ id: "missing-status", type: "error", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: providerFailures.codexUsageLimit }] } };
+    expect(V2ThreadSchema.safeParse(payload).success).toBe(false);
   });
 
   it("does not bind a distinct V2 session error to the shell's latest run", async () => {

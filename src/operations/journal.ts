@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { sanitizeFailureText } from "../t3/failure.js";
 import { ProviderRetrySchema } from "../t3/types.js";
 import { summarizeForAudit, type AuditLog } from "./audit-log.js";
 import { settingsReceiptSchema, type SettingsReceipt } from "./settings.js";
@@ -436,7 +437,15 @@ export class OperationJournal {
       entry.turnId === turnId && entry.terminalFailure?.turnId === turnId
     )?.terminalFailure ?? null;
     const existing = this.threadFailures.get(key)?.failure ?? operation?.terminalFailure ?? legacyFailure;
-    const failure = mergeTerminalFailure(existing, candidate);
+    const merged = mergeTerminalFailure(existing, candidate);
+    const admittedModel = operation?.settings?.resolved.modelSelection;
+    // A V1 snapshot carries mutable thread settings. The run receipt records
+    // the settings admitted for this operation; V2 root items use run metadata.
+    const failure = admittedModel && merged.source !== "t3_v2_turn_item" ? {
+      ...merged,
+      model: sanitizeFailureText(admittedModel.model, 200),
+      provider: sanitizeFailureText(admittedModel.provider ?? admittedModel.instanceId ?? merged.provider ?? "", 200) || null,
+    } : merged;
     const failureChanged = JSON.stringify(existing) !== JSON.stringify(failure);
     const operationChanged = operation !== null && (operation.terminalRunStatus !== "failed" ||
       operation.turnId !== turnId || JSON.stringify(operation.terminalFailure) !== JSON.stringify(failure));
@@ -555,7 +564,7 @@ function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidat
   const other = preferred === candidate ? existing : candidate;
   return {
     ...preferred,
-    category: preferred.category === "unknown" ? other.category : preferred.category,
+    category: preferred.category === "unknown" && preferred.source === other.source ? other.category : preferred.category,
     class: preferred.class ?? other.class ?? null,
     retryable: preferred.retryable ?? other.retryable ?? null,
     retry: preferred.retry ?? other.retry ?? null,
