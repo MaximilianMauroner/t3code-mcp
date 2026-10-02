@@ -1,0 +1,30 @@
+{
+  "latestTurn": {
+    "turnId": "failed-turn",
+    "state": "error",
+    "requestedAt": "2026-09-09T20:42:18.522Z",
+    "startedAt": "2026-09-09T20:42:18.522Z",
+    "completedAt": "2026-09-09T20:46:56.750Z",
+    "assistantMessageId": null
+  },
+  "session": {
+    "status": "stopped",
+    "activeTurnId": null,
+    "lastError": "Codex usage limit reached. Send the message again once the limit resets.",
+    "updatedAt": "2026-09-10T07:26:23.623Z"
+  },
+  "activities": [
+    {
+      "id": "error-0",
+      "tone": "error",
+      "kind": "runtime.error",
+      "summary": "Runtime error",
+      "payload": {
+        "message": "Codex usage limit reached. Send the message again once the limit resets."
+      },
+      "turnId": "failed-turn",
+      "createdAt": "2026-09-09T20:46:56.750Z"
+    }
+  ],
+  "messages": []
+}

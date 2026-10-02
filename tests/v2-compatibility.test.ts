@@ -10,6 +10,7 @@ import { makeGateway } from "../src/gateway.js";
 import { T3HttpClient } from "../src/t3/http-client.js";
 import { requestT3Rpc } from "../src/t3/rpc-client.js";
 import { V2ShellSchema, V2ThreadSchema } from "../src/t3/v2.js";
+import providerFailures from "./fixtures/failures/v2-provider-failures.json" with { type: "json" };
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -103,7 +104,7 @@ async function setup() {
     }
     if (command.type === "message.dispatch") {
       const message = z.object({ messageId: z.string(), threadId: z.string(), text: z.string(), createdBy: z.literal("user"), creationSource: z.literal("mcp"), dispatchMode: z.object({ type: z.literal("start_immediately") }), attachments: z.array(z.unknown()) }).parse(command);
-      snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, status: "running", userMessageId: message.messageId, rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null });
+      snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "running", userMessageId: message.messageId, rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null });
       snapshot.projection.messages.push({ id: message.messageId, runId: "run-v2", nodeId: null, role: "user", text: message.text, attachments: [], streaming: false, createdAt: now, updatedAt: now });
     }
     if (command.type === "run.interrupt") snapshot.projection.runs[0]!.status = "interrupted";
@@ -154,7 +155,7 @@ describe("merged orchestrator V2 boundary", () => {
   it("reads active and archived threads with negotiated protocol and maps run responses", async () => {
     const { client, requests, snapshot } = await setup();
     expect((await client.getShell()).threads.map((thread) => thread.id)).toEqual(["thread-1", "archived-1"]);
-    snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, status: "completed", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: now });
+    snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "completed", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: now });
     snapshot.projection.messages.push({ id: "answer-1", runId: "run-v2", nodeId: "node-root", role: "assistant", text: "Done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     expect((await client.getThread("thread-1")).thread).toMatchObject({ latestTurn: { turnId: "run-v2", state: "completed", assistantMessageId: "answer-1" }, messages: [{ turnId: "run-v2", text: "Done" }] });
     expect(requests.filter((request) => request.path.startsWith("/api/orchestration/")).every((request) => request.protocol === "2")).toBe(true);
@@ -181,8 +182,8 @@ describe("merged orchestrator V2 boundary", () => {
     });
     expect((await client.getShell()).threads[0]!.latestTurn).toMatchObject({ turnId: "active", requestedAt: now, completedAt: null });
     snapshot.projection.runs.push(
-      { id: "active", ordinal: 1, status: "waiting", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null },
-      { id: "queued", ordinal: 2, status: "queued", userMessageId: "user-2", rootNodeId: null, requestedAt: now, startedAt: null, completedAt: null },
+      { id: "active", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "waiting", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null },
+      { id: "queued", ordinal: 2, providerInstanceId: "codex_openai", modelSelection: selection, status: "queued", userMessageId: "user-2", rootNodeId: null, requestedAt: now, startedAt: null, completedAt: null },
     );
     snapshot.projection.messages.push({ id: "child-answer", runId: "active", nodeId: "child-node", role: "assistant", text: "Child done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     snapshot.projection.runtimeRequests.push(
@@ -203,8 +204,80 @@ describe("merged orchestrator V2 boundary", () => {
     const { gateway, snapshot } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "limited" });
     snapshot.projection.runs[0]!.status = "failed";
-    snapshot.projection.turnItems.push({ id: "failure", type: "error", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: { class: "usage_limit", code: "usage_limit", message: "Limit reached", resetAt: "2026-10-03T00:00:00.000Z" } });
+    snapshot.projection.turnItems.push({ id: "failure", type: "error", status: "failed", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: { class: "usage_limit", code: "usage_limit", message: "Limit reached", resetAt: "2026-10-03T00:00:00.000Z" } });
     expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", latestResponse: null, failure: { category: "quota", code: "usage_limit", resetAt: "2026-10-03T00:00:00.000Z", turnId: "run-v2" } });
+  });
+
+  it("reports V2 class and retryability and enriches a retained reset from the same root failure", async () => {
+    const { gateway, snapshot, shell } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "late-reset" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    run.completedAt = now;
+    const failure = { ...providerFailures.codexUsageLimit, resetAt: null, retryable: false };
+    snapshot.projection.turnItems.push({ id: "terminal-error", type: "error", status: "failed", ordinal: 1, runId: run.id, nodeId: run.rootNodeId, title: "Usage limit reached", updatedAt: now, failure, retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 250 } });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: failure.message, lastErrorClass: failure.class, usageLimitResetAt: null });
+    // Observe a summary-only shell row first; a full read upgrades its provenance.
+    expect((await gateway.threadsList({ includeArchived: false, limit: 5, detail: "summary" })).page.items[0]?.failure).toMatchObject({ category: "quota", class: "usage_limit", source: "t3_session", resetAt: null });
+    expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject({ category: "quota", class: "usage_limit", retryable: false, retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 250 }, source: "t3_v2_turn_item", resetAt: null });
+    snapshot.projection.turnItems[0]!.failure!.resetAt = providerFailures.codexUsageLimit.resetAt;
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ resetAt: providerFailures.codexUsageLimit.resetAt, retryAfter: null });
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ source: "t3_v2_turn_item", code: "usageLimitExceeded" });
+  });
+
+  it("reads historical V2 failures after a later run and retains the failed run's model", async () => {
+    const { gateway, snapshot } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "historical" });
+    const failed = snapshot.projection.runs[0]!;
+    failed.status = "failed";
+    failed.modelSelection = { instanceId: "claude-instance", model: "claude-opus-5-5" };
+    failed.providerInstanceId = "claude-instance";
+    snapshot.projection.turnItems.push({ id: "auth-error", type: "error", status: "failed", runId: failed.id, nodeId: failed.rootNodeId, title: "Provider error", updatedAt: now, failure: providerFailures.claudeAuthentication });
+    snapshot.projection.runs.push({ ...failed, id: "later-run", ordinal: 2, status: "running", userMessageId: "later-user", modelSelection: selection, providerInstanceId: "codex_openai" });
+    snapshot.projection.messages.push({ id: "later-answer", role: "assistant", runId: "later-run", nodeId: failed.rootNodeId, text: "Later response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", latestResponse: null, failure: { category: "provider_error", class: "provider_error", code: "api_error_401", model: "claude-opus-5-5", provider: "claude-instance", resetAt: null, source: "t3_v2_turn_item" } });
+    expect((await gateway.threadGet("thread-1")).thread.failure).toBeNull();
+  });
+
+  it("ignores V2 child failures and recovered retry items, even in a failed run", async () => {
+    const { gateway, snapshot } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "root-only" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push(
+      { id: "child", type: "error", status: "failed", ordinal: 4, runId: run.id, nodeId: "child-node", title: null, updatedAt: now, failure: providerFailures.codexUsageLimit },
+      { id: "recovered", type: "error", status: "completed", ordinal: 3, runId: run.id, nodeId: run.rootNodeId, title: "Provider recovered", updatedAt: now, failure: providerFailures.codexUsageLimit },
+    );
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ category: "unknown", source: "t3_turn", resetAt: null });
+    snapshot.projection.turnItems.push({ id: "terminal", type: "error", status: "failed", ordinal: 5, runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: { class: "provider_error", code: null, message: "API Error: 429" } });
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ category: "provider_error", class: "provider_error", source: "t3_v2_turn_item", resetAt: null });
+  });
+
+  it.each(["transport_error", "permission_error", "validation_error", "future_error"])("retains the V2 %s class without guessing a category", async (errorClass) => {
+    const { gateway, snapshot } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "other-class" });
+    snapshot.projection.runs[0]!.status = "failed";
+    snapshot.projection.turnItems.push({ id: "terminal", type: "error", status: "failed", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: { class: errorClass, code: null, message: "Provider stopped", retryable: true, resetAt: "not-a-time" } });
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ category: "unknown", class: errorClass, retryable: true, resetAt: null, retryAfter: null });
+  });
+
+  it.each([
+    ["rateLimitExceeded", "Provider stopped this request.", "rate_limit"],
+    [null, "API Error: Request rejected (429) · Usage credits are required for this model.", "auth_billing"],
+  ] as const)("uses explicit V2 provider evidence instead of its broad limit class: %s", async (code, message, category) => {
+    const { gateway, snapshot } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "specific-type" });
+    snapshot.projection.runs[0]!.status = "failed";
+    snapshot.projection.turnItems.push({ id: "terminal", type: "error", status: "failed", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: { class: "usage_limit", code, message } });
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ category, class: "usage_limit", resetAt: null });
+  });
+
+  it("does not bind a distinct V2 session error to the shell's latest run", async () => {
+    const { gateway, shell } = await setup();
+    Object.assign(shell.threads[0]!, { latestRunId: "old-failed-run", activeRunId: null, status: "failed", lastError: "New unbound session error", lastErrorClass: null, usageLimitResetAt: null });
+    const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+    expect(overview.highlights[0]?.failure).toMatchObject({ category: "unknown", source: "t3_turn", resetAt: null });
+    expect(overview.highlights[0]?.failure?.message).not.toContain("unbound session");
   });
 
   it("keeps a disconnected mutation uncertain and never replays it", async () => {

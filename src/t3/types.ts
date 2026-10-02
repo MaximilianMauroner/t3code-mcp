@@ -12,6 +12,20 @@ export const ModelSelectionSchema = z
   .catchall(z.unknown());
 export type ModelSelection = z.infer<typeof ModelSelectionSchema>;
 
+export const ProviderRetrySchema = z.object({
+  attempt: z.number().int().positive(),
+  maxAttempts: z.number().int().positive().nullable(),
+  retryDelayMs: z.number().int().nonnegative().nullable(),
+});
+
+export const ProviderFailureSchema = z.object({
+  class: z.string(),
+  message: z.string(),
+  code: z.string().nullable(),
+  retryable: z.boolean().nullable().optional(),
+  resetAt: z.string().nullable().optional(),
+});
+
 export const LatestTurnSchema = z
   .object({
     turnId: NonEmptyString,
@@ -57,6 +71,7 @@ export const ThreadShellSchema = z
       providerInstanceId: z.string().optional(),
       activeTurnId: z.string().nullable().optional(),
       lastError: z.string().nullable().optional(),
+      lastErrorClass: z.string().nullable().optional(),
       failureCode: z.string().nullable().optional(),
       failureCategory: z.string().nullable().optional(),
       resetAt: z.string().nullable().optional(),
@@ -96,6 +111,14 @@ export const ThreadSchema = ThreadShellSchema.extend({
   activities: z.array(z.unknown()).default([]),
   checkpoints: z.array(z.unknown()).default([]),
   proposedPlans: z.array(z.unknown()).default([]),
+  // Internal V2 normalization retains authoritative failures for historical runs.
+  turnFailures: z.array(z.object({
+    turnId: NonEmptyString,
+    provider: NonEmptyString,
+    modelSelection: ModelSelectionSchema,
+    failure: ProviderFailureSchema,
+    retry: ProviderRetrySchema.optional(),
+  })).optional(),
 }).catchall(z.unknown());
 export type Thread = z.infer<typeof ThreadSchema>;
 

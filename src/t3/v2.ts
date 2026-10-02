@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { ProjectSchema, ThreadSchema, ThreadShellSchema, type ThreadShell } from "./types.js";
+import { ModelSelectionSchema, ProjectSchema, ProviderFailureSchema, ProviderRetrySchema, ThreadSchema, ThreadShellSchema, type ThreadShell } from "./types.js";
+import { categoryForFailure } from "./failure.js";
 
 const Id = z.string().min(1);
 const Time = z.string().min(1);
 const RunStatus = z.enum(["preparing", "queued", "starting", "running", "waiting", "completed", "interrupted", "failed", "cancelled", "rolled_back"]);
 const ActiveStatuses = new Set(["preparing", "starting", "running", "waiting"]);
-const Failure = z.object({ class: z.string(), message: z.string(), code: z.string().nullable(), resetAt: Time.nullable().optional() });
 const PendingRequest = z.object({ id: Id, kind: z.string(), createdAt: Time });
 const AppThread = ThreadShellSchema.omit({ latestTurn: true, session: true }).extend({
   providerInstanceId: Id,
@@ -39,6 +39,7 @@ export const V2ShellSchema = z.object({
 export const V2ArchivedShellSchema = V2ShellSchema.omit({ projects: true, archivedThreads: true });
 const Run = z.object({
   id: Id, ordinal: z.number().int().positive(), status: RunStatus,
+  providerInstanceId: Id, modelSelection: ModelSelectionSchema,
   userMessageId: Id, rootNodeId: Id.nullable(),
   requestedAt: Time, startedAt: Time.nullable(), completedAt: Time.nullable(),
 });
@@ -50,7 +51,8 @@ const Message = z.object({
 const TurnItem = z.object({
   id: Id, type: z.string(), runId: Id.nullable(), nodeId: Id.nullable(), updatedAt: Time,
   requestId: Id.optional(), questions: z.array(z.unknown()).optional(), prompt: z.string().optional(),
-  failure: Failure.optional(), title: z.string().nullable(),
+  failure: ProviderFailureSchema.optional(), retry: ProviderRetrySchema.optional(), title: z.string().nullable(),
+  status: z.string().optional(), ordinal: z.number().optional(),
 }).passthrough();
 const RuntimeRequest = PendingRequest.extend({
   nodeId: Id,
@@ -66,12 +68,6 @@ export const V2ThreadSchema = z.object({
     checkpoints: z.array(z.unknown()), updatedAt: Time,
   }).passthrough(),
 });
-
-function failureCategory(value: string | null | undefined): string {
-  if (value === "usage_limit") return "quota";
-  if (value === "provider_error") return "provider_internal";
-  return "unknown";
-}
 
 function turnState(status: string): "running" | "completed" | "interrupted" | "error" {
   if (ActiveStatuses.has(status) || status === "queued") return "running";
@@ -92,6 +88,9 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>): Thr
   const runId = thread.activeRunId ?? thread.latestRunId;
   const status = thread.activityRunStatus ?? thread.status;
   const activeIsLatest = thread.activeRunId === null || thread.activeRunId === thread.latestRunId;
+  // Upstream clears the class when a distinct, unbound session error replaces
+  // the root failure. That session text cannot explain this run.
+  const hasBoundFailure = status === "failed" && thread.lastErrorClass != null;
   return ThreadShellSchema.parse({
     ...thread,
     title: thread.title || "Untitled",
@@ -104,9 +103,10 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>): Thr
     } : null,
     session: {
       status: sessionStatus(status), providerInstanceId: thread.providerInstanceId,
-      activeTurnId: runId, lastError: thread.lastError ?? null,
-      failureCategory: failureCategory(thread.lastErrorClass),
-      resetAt: thread.usageLimitResetAt ?? null, updatedAt: thread.updatedAt,
+      activeTurnId: runId, lastError: hasBoundFailure ? thread.lastError ?? null : null,
+      lastErrorClass: hasBoundFailure ? thread.lastErrorClass : null,
+      failureCategory: hasBoundFailure ? categoryForFailure(thread.lastErrorClass) : "unknown",
+      resetAt: hasBoundFailure ? thread.usageLimitResetAt ?? null : null, updatedAt: thread.updatedAt,
     },
     hasPendingApprovals: request !== null && request.kind !== "user_input",
     hasPendingUserInput: request?.kind === "user_input",
@@ -125,7 +125,19 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
   const rootNodes = new Set(runs.map((run) => run.rootNodeId));
   const messages = projection.messages.filter((message) => message.nodeId === null || rootNodes.has(message.nodeId));
   const pending = projection.runtimeRequests.filter((request) => request.status === "pending" && request.responseCapability.type !== "not_resumable");
-  const failure = projection.turnItems.filter((item) => item.runId === latest?.id && item.type === "error" && item.failure).at(-1)?.failure;
+  const turnFailures = runs.filter((run) => run.status === "failed").flatMap((run) => {
+    const item = projection.turnItems
+      .filter((item) => item.runId === run.id && item.nodeId === run.rootNodeId &&
+        item.type === "error" && item.status === "failed" && item.failure)
+      .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt) ||
+        (a.ordinal ?? 0) - (b.ordinal ?? 0) || a.id.localeCompare(b.id))
+      .at(-1);
+    return item?.failure ? [{
+      turnId: run.id, provider: run.providerInstanceId,
+      modelSelection: run.modelSelection, failure: item.failure, retry: item.retry,
+    }] : [];
+  });
+  const failure = turnFailures.find((failure) => failure.turnId === latest?.id)?.failure;
   const shell = normalizeV2ShellThread({
     ...projection.thread,
     latestRunId: latest?.id ?? null,
@@ -167,6 +179,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
         };
       })],
       checkpoints: projection.checkpoints,
+      turnFailures,
       proposedPlans: projection.plans.filter((plan) => plan.kind === "proposed_plan").map((plan) => ({
         ...plan, turnId: plan.runId, planMarkdown: plan.markdown,
         implementedAt: plan.status === "completed" ? projection.updatedAt : null,

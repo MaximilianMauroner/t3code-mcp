@@ -4,6 +4,12 @@ import { join } from "node:path";
 import { FakeT3, assistantMessage } from "./support/fake-t3.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
 import { makeGateway } from "../src/gateway.js";
+import { MessageSchema, ThreadSchema } from "../src/t3/types.js";
+import claudeRateLimit from "./fixtures/failures/v1-claude-rate-limit.json" with { type: "json" };
+import codexUsageLimit from "./fixtures/failures/v1-codex-usage-limit.json" with { type: "json" };
+import creditsRequired from "./fixtures/failures/v1-credits-required.json" with { type: "json" };
+import authUnavailable from "./fixtures/failures/v1-auth-unavailable.json" with { type: "json" };
+import unboundStartError from "./fixtures/failures/v1-unbound-start-error.json" with { type: "json" };
 
 const fakes: FakeT3[] = [];
 const fixtures: GatewayFixture[] = [];
@@ -34,6 +40,106 @@ async function setup(previousResponse = true) {
 }
 
 describe("structured provider failures", () => {
+  it.each([
+    ["rate limit", claudeRateLimit, "rate_limit", "rate_limit_error", "t3_message"],
+    ["Codex usage limit", codexUsageLimit, "quota", null, "t3_activity"],
+    ["credit refusal", creditsRequired, "auth_billing", null, "t3_message"],
+  ] as const)("reads a real V1 %s payload through run, thread, and overview status", async (_label, payload, category, code, source) => {
+    const { fixture, thread, run } = await setup();
+    const turnId = thread.latestTurn!.turnId;
+    const captured = ThreadSchema.parse({ ...thread, ...payload });
+    thread.latestTurn = { ...captured.latestTurn!, turnId };
+    thread.session = captured.session;
+    thread.activities = payload.activities.map((value) => ({ ...value, turnId }));
+    thread.messages.push(...captured.messages.map((message) => ({ ...message, turnId })));
+    const expected = { category, code, source, turnId, class: null, retryable: null, resetAt: null, retryAfter: null };
+    expect((await fixture.gateway.runWait(run.runId, 0.1)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject(expected);
+  });
+
+  it("reads a turn-bound auth_unavailable type and ignores an earlier turn's provider error", async () => {
+    const { fixture, thread, run } = await setup();
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    thread.messages.push(MessageSchema.parse({ ...authUnavailable, turnId: "old-turn" }));
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ category: "unknown", source: "t3_turn" });
+    thread.messages.push(MessageSchema.parse({ ...authUnavailable, turnId }));
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ category: "auth_billing", code: "auth_unavailable", source: "t3_message" });
+  });
+
+  it("rejects real unbound start errors and a session timestamp after the failed turn", async () => {
+    const { fixture, thread, run } = await setup();
+    const turnId = thread.latestTurn!.turnId;
+    const captured = ThreadSchema.parse({ ...thread, ...unboundStartError });
+    thread.latestTurn = { ...captured.latestTurn!, turnId };
+    thread.session = captured.session;
+    thread.activities = captured.activities;
+    const observed = await fixture.gateway.runGet(run.runId);
+    expect(observed.failure).toMatchObject({ category: "unknown", source: "t3_turn", turnId });
+    expect(observed.failure?.message).not.toContain("ProviderUnsupportedError");
+    expect(observed.latestResponse).toBeNull();
+  });
+
+  it.each(["exceeded retry limit, last status: 429 Too Many Requests", "API Error: Request rejected (429)"])("leaves a bare 429 unknown: %s", async (message) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: message };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ category: "unknown", code: null, resetAt: null });
+  });
+
+  it("accepts only exact known T3 usage-limit sentences", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Maybe Claude usage limit reached. Send the message again once the limit resets." };
+    expect((await fixture.gateway.runGet(run.runId)).failure?.category).toBe("unknown");
+    thread.session.lastError = "Claude usage limit reached. Send the message again once the limit resets.";
+    expect((await fixture.gateway.runGet(run.runId)).failure?.category).toBe("quota");
+  });
+
+  it("reports a V1 activity first seen through overview and retains it after session recovery", async () => {
+    const { fixture, thread, run } = await setup();
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "stopped", activeTurnId: null, lastError: null };
+    thread.activities = codexUsageLimit.activities.map((activity) => ({ ...activity, turnId }));
+    const overview = await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+    expect(overview.highlights[0]).toMatchObject({ failure: { category: "quota", source: "t3_activity" }, latestResponseExcerpt: null });
+    thread.activities = [];
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject({ category: "quota", source: "t3_activity" });
+  });
+
+  it("keeps a later shell turn separate from a failed full snapshot", async () => {
+    const { fixture, thread } = await setup();
+    const oldTurn = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities = codexUsageLimit.activities.map((activity) => ({ ...activity, turnId: oldTurn }));
+    thread.messages.push(assistantMessage("older failed output", oldTurn));
+    const newer = structuredClone(await fixture.client.getShell());
+    newer.threads[0]!.latestTurn = { turnId: "newer-turn", state: "running", requestedAt: new Date().toISOString() };
+    newer.threads[0]!.session = { status: "running", activeTurnId: "newer-turn", lastError: null };
+    fixture.client.getShell = async () => newer;
+    const detail = (await fixture.gateway.threadGet(thread.id)).thread;
+    expect(detail.latestTurn?.turnId).toBe("newer-turn");
+    expect(detail.failure).toBeNull();
+    expect(detail.latestResponse).toBeNull();
+  });
+
+  it("redacts provider-error responses, credential forms, and private paths before retention", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "ready" };
+    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project 10.2.3.4:8317', turnId));
+    const observed = await fixture.gateway.runGet(run.runId);
+    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|home\/private|10\.2\.3\.4/);
+    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|home\/private|10\.2\.3\.4/);
+    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|home\/private|10\.2\.3\.4/);
+  });
+
   it("reports a pre-response quota failure with no invented reset time", async () => {
     const { fixture, thread, run } = await setup(false);
     const turnId = thread.latestTurn!.turnId;
@@ -91,7 +197,7 @@ describe("structured provider failures", () => {
     expect(overview.highlights[0]?.failure).toMatchObject({ category: "quota", turnId });
   });
 
-  it("does not infer a category or reset time from a 429-looking message", async () => {
+  it("classifies the exact credit refusal without inferring a reset time", async () => {
     const { fixture, thread, run } = await setup();
     const turnId = thread.latestTurn!.turnId;
     thread.latestTurn = { ...thread.latestTurn!, state: "error", completedAt: new Date().toISOString() };
@@ -103,7 +209,7 @@ describe("structured provider failures", () => {
     };
 
     const observed = await fixture.gateway.runGet(run.runId);
-    expect(observed.failure).toMatchObject({ category: "unknown", code: null, resetAt: null, retryAfter: null });
+    expect(observed.failure).toMatchObject({ category: "auth_billing", code: null, resetAt: null, retryAfter: null });
   });
 
   it.each([

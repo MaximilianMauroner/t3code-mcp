@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { ProviderRetrySchema } from "../t3/types.js";
 import { summarizeForAudit, type AuditLog } from "./audit-log.js";
 import { settingsReceiptSchema, type SettingsReceipt } from "./settings.js";
 import type { FailureInfo } from "../gateway.js";
@@ -533,25 +534,35 @@ function isFailureInfo(value: unknown): value is FailureInfo {
   if (typeof value !== "object" || value === null) return false;
   const failure = value as Record<string, unknown>;
   const nullableString = (field: unknown) => field === null || typeof field === "string";
-  return ["quota", "rate_limit", "auth_billing", "provider_internal", "unknown"].includes(String(failure.category)) &&
+  return ["quota", "rate_limit", "auth_billing", "provider_internal", "provider_error", "unknown"].includes(String(failure.category)) &&
+    (failure.class === undefined || nullableString(failure.class)) &&
+    (failure.retryable === undefined || failure.retryable === null || typeof failure.retryable === "boolean") &&
+    (failure.retry === undefined || failure.retry === null || ProviderRetrySchema.safeParse(failure.retry).success) &&
     nullableString(failure.code) && typeof failure.message === "string" &&
     nullableString(failure.provider) && typeof failure.model === "string" &&
     nullableString(failure.turnId) && nullableString(failure.resetAt) &&
     nullableString(failure.retryAfter) &&
-    ["t3_session", "t3_turn"].includes(String(failure.source));
+    ["t3_session", "t3_turn", "t3_activity", "t3_message", "t3_v2_turn_item"].includes(String(failure.source));
 }
+
+const failureSourcePriority = {
+  t3_turn: 0, t3_session: 1, t3_activity: 2, t3_message: 3, t3_v2_turn_item: 4,
+};
 
 function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo): FailureInfo {
   if (!existing) return candidate;
-  if (existing.source === "t3_turn") return candidate.source === "t3_session" ? candidate : existing;
-  if (candidate.source === "t3_turn") return existing;
+  const preferred = failureSourcePriority[candidate.source] > failureSourcePriority[existing.source] ? candidate : existing;
+  const other = preferred === candidate ? existing : candidate;
   return {
-    ...existing,
-    category: existing.category === "unknown" ? candidate.category : existing.category,
-    code: existing.code ?? candidate.code,
-    provider: existing.provider ?? candidate.provider,
-    resetAt: existing.resetAt ?? candidate.resetAt,
-    retryAfter: existing.retryAfter ?? candidate.retryAfter,
+    ...preferred,
+    category: preferred.category === "unknown" ? other.category : preferred.category,
+    class: preferred.class ?? other.class ?? null,
+    retryable: preferred.retryable ?? other.retryable ?? null,
+    retry: preferred.retry ?? other.retry ?? null,
+    code: preferred.code ?? other.code,
+    provider: preferred.provider ?? other.provider,
+    resetAt: preferred.resetAt ?? other.resetAt,
+    retryAfter: preferred.retryAfter ?? other.retryAfter,
   };
 }
 
