@@ -10,7 +10,7 @@ The original idea was to pair it with GPTVoice's tool calls to start tasks and g
 flowchart LR
     User[You] <--> Client[Any compatible MCP client]
     Client <-->|MCP over stdio or Streamable HTTP| Gateway[t3-code-mcp]
-    Gateway <-->|Authenticated HTTP| T3[T3 Code and its coding agents]
+    Gateway <-->|Authenticated HTTP and WebSocket RPC| T3[T3 Code and its coding agents]
     Gateway -->|Read-only Git status and revision comparison| Workspace[T3-selected workspace]
 ```
 
@@ -23,7 +23,7 @@ flowchart LR
 - Record redacted tool, transport, upstream, Git, and journal activity for later review through `t3_audit_log`.
 - Connect through local stdio or authenticated Streamable HTTP.
 
-The gateway uses T3's authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment. See [usage and tool behavior](docs/usage.md) for examples, supported tools, and current limits.
+The gateway supports T3 orchestration protocols 1 and 2. Protocol 2, introduced by [upstream PR #2829](https://github.com/pingdotgg/t3code/pull/2829), uses HTTP snapshot reads and authenticated WebSocket RPC for thread control. Protocol 1 retains HTTP dispatch for older deployments. The recorded live integration target is `v0.0.41-nightly.20260910.1507`; V2 has source-contract and local fixture coverage, with live verification still required. See [orchestrator compatibility](docs/orchestrator-compatibility.md). See [usage and tool behavior](docs/usage.md) for examples, supported tools, and current limits.
 
 ## Security
 
@@ -54,7 +54,7 @@ Connect your MCP client to `http://127.0.0.1:8787/mcp` with `Authorization: Bear
 
 Request connection status, list projects, and read an existing thread to verify the connection. Follow the [configuration and client connection guide](docs/configuration.md) for all environment variables and the first write-enabled check.
 
-The gateway writes its append-only redacted usage trail to `audit.jsonl` in `T3_MCP_DATA_DIR`; a future agent can query the bounded history with `t3_audit_log`.
+The gateway writes its append-only redacted usage trail to `audit.jsonl` in `T3_MCP_DATA_DIR`; a future agent can query the bounded history with `t3_audit_log`. For offline aggregate analysis without T3 credentials, run `pnpm usage-summary --file ./data/audit.jsonl --since <ISO> --until <ISO>`. See [usage analysis](docs/usage.md#usage-analysis) for metric definitions and [task briefs](docs/task-briefs.md) for precise launch/continuation examples.
 
 ## Documentation
 
@@ -66,9 +66,9 @@ The gateway writes its append-only redacted usage trail to `audit.jsonl` in `T3_
 | [Linux deployment](docs/deployment.md) | Systemd services, tunnel setup, credentials, and startup checks |
 | [Development and verification](docs/development.md) | Build and test commands, diagnostics, and opt-in live integration tests |
 
-## Upstream work that would improve this gateway
+## V1 integration references
 
-These open items in [pingdotgg/t3code](https://github.com/pingdotgg/t3code) each remove or reduce a limit described in [current limits](docs/usage.md#current-limits). This gateway needs no change for most of them; it reads the same server state. State checked 2026-09-11.
+These references record the V1 limits checked on 2026-09-11. Several are addressed by the new V2 orchestrator. See [orchestrator compatibility](docs/orchestrator-compatibility.md) for the gateway behavior after that upgrade.
 
 | Gateway limit | Upstream item | Effect here |
 | --- | --- | --- |

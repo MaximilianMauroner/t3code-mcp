@@ -123,6 +123,7 @@ export const DescriptorSchema = z
     label: z.string(),
     platform: z.unknown().optional(),
     serverVersion: NonEmptyString,
+    orchestrationProtocolVersion: z.number().int().positive().optional(),
     capabilities: z.record(z.string(), z.unknown()).default({}),
   })
   .catchall(z.unknown());

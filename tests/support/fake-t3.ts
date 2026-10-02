@@ -156,6 +156,10 @@ export class FakeT3 {
     return thread;
   }
 
+  countRequests(path: string): number {
+    return this.requests.filter((request) => request.path === path).length;
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
     const path = url.pathname;
@@ -289,6 +293,8 @@ export class FakeT3 {
           });
         }
         const thread = this.thread(command.threadId);
+        if (command.modelSelection) thread.modelSelection = command.modelSelection;
+        thread.runtimeMode = command.runtimeMode;
         if (command.bootstrap?.prepareWorktree) {
           thread.branch = command.bootstrap.prepareWorktree.branch ?? command.bootstrap.prepareWorktree.baseBranch;
           thread.worktreePath = `/remote/worktrees/${command.threadId}`;

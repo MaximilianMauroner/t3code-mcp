@@ -34,3 +34,24 @@ pnpm test:live
 ```
 
 Set `T3_LIVE_HTTP_BASE_URL` and `T3_LIVE_ENVIRONMENT_ID` for another environment. If no project ID is supplied, the test uses the first listed project. `test:live` sets `T3_LIVE_TESTS=1`; the test still skips without a token. This verifies the T3 integration, while the [client connection check](configuration.md#connect-an-mcp-client) verifies the complete workflow.
+
+## Usage and monitoring regression checks
+
+`tests/usage-improvements.test.ts` exercises adaptive wait request counts with fake time, pending input/approval, disconnection, environment revalidation, failure isolation, settings inheritance and restart provenance. `tests/mcp-server.test.ts` includes a caller journey with no duplicate dispatch plus concurrent audit attribution. `tests/usage-summary.test.ts` verifies filtered streaming cursors, fixed-snapshot appends, invalid lines, aggregation and context isolation.
+
+For bounded-memory evidence, build and run the disposable audit benchmark:
+
+```sh
+pnpm build
+pnpm benchmark:audit
+```
+
+It scans 131,072 synthetic events (about 75 MB) for both a one-item page and a usage summary under a 32 MB JavaScript heap, reports elapsed time/peak RSS, and removes its fixture. RSS includes native/runtime memory and is not the JavaScript heap limit. This is an offline workload measurement, not a claim of production token/cost savings.
+
+Prompt comparison scenarios live in `evals/task-briefs.json`; [the evaluation recipe](task-briefs.md#offline-evaluation) explains the external caller boundary and evidence required for a model-quality comparison.
+
+## Upstream compatibility review
+
+See [orchestrator compatibility](orchestrator-compatibility.md) for the merged V2 source target, transport changes, and rollout limits. `tests/v2-compatibility.test.ts` uses a disposable HTTP/WebSocket server to cover protocol negotiation, archived listings, composite task creation, send idempotency, run association, settings, input responses, interruption, structured failures, disconnection, tagged RPC errors, and cancellation/timeout. `tests/http-client.test.ts` covers V1 transport and tagged HTTP errors.
+
+This is local boundary verification. Run the read-only diagnostics and opt-in live integration test against the intended deployed V2 build before treating it as live verified. The configured route must support authenticated WebSocket upgrades at `/ws` as well as the HTTP API. Restart the gateway when upgrading T3 so its cached descriptor is refreshed.

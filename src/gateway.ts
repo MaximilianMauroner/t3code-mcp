@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
+import { observeSettings, safeModelSelection, type SettingsReceipt, type SettingsObservation } from "./operations/settings.js";
 import { isAbsolute, join } from "node:path";
 import {
   GATEWAY_COMMIT,
@@ -268,6 +269,7 @@ export type ThreadSendResult = MutationResult & {
   readonly t3TurnId: string | null;
   readonly providerTurnId: string | null;
   readonly nextAction: "Use t3_run_get or t3_run_wait.";
+  readonly settings?: SettingsObservation;
 };
 
 export type RunStatus =
@@ -281,6 +283,7 @@ export type RunStatus =
   | "unknown";
 
 export interface RunResult {
+  readonly settings?: SettingsObservation;
   readonly environmentId: string;
   readonly operationId: string;
   readonly projectId: string | null;
@@ -300,6 +303,11 @@ export interface RunResult {
   readonly pendingActions: {
     readonly approvals: boolean;
     readonly userInput: boolean;
+  };
+  readonly monitoring?: {
+    readonly observations: number;
+    readonly requestedTimeoutSeconds: number;
+    readonly elapsedMs: number;
   };
   readonly timedOut?: boolean;
   readonly error?: string;
@@ -365,6 +373,8 @@ export interface ThreadStartInput extends MutationCommonInput {
 }
 
 export interface ThreadSendInput extends MutationCommonInput {
+  /** Internal provenance for a newly created thread; never exposed as a caller option. */
+  readonly initialSettings?: SettingsReceipt;
   readonly threadId: string;
   readonly message: string;
   readonly modelSelection?: ModelSelection;
@@ -542,6 +552,7 @@ export interface TaskSummary {
 }
 
 export interface TaskDetail extends TaskSummary {
+  readonly settings?: SettingsObservation;
   readonly thread: ThreadDetail | null;
   readonly run: RunResult | null;
 }
@@ -755,7 +766,7 @@ export class T3Gateway {
     if (workspaceMode === "worktree" && !input.branch) {
       throw new GatewayError(
         "worktree_base_branch_required",
-        "workspaceMode=worktree requires branch to select the worktree's base branch.",
+        "workspaceMode=worktree requires a base branch, for example branch=main. The gateway generates the isolated task branch/path; omit worktreePath. Use workspaceMode=local to use the current checkout.",
       );
     }
     if (workspaceMode === "worktree" && input.worktreePath != null) {
@@ -840,6 +851,7 @@ export class T3Gateway {
       }
 
       const sent = await this.threadSend({
+        initialSettings: (await this.journal.getByOperationId(created.operationId))?.settings,
         threadId: created.threadId,
         message: input.instruction,
         modelSelection: input.modelSelection,
@@ -1258,6 +1270,12 @@ export class T3Gateway {
       payloadHash: hashPayload(payload),
       projectId: input.projectId,
       threadId,
+      settings: {
+        requested: { modelSelection: input.modelSelection ? safeModelSelection(input.modelSelection) : null, runtimeMode: input.runtimeMode ?? null },
+        resolved: { modelSelection: safeModelSelection(modelSelection), runtimeMode: input.runtimeMode ?? "full-access" },
+        modelSource: input.modelSelection ? "explicit" : "project_default",
+        runtimeSource: "explicit",
+      },
     });
     if (begun.reused) {
       const reconciled = await this.reconcile(begun.record);
@@ -1306,7 +1324,7 @@ export class T3Gateway {
     if (workspaceMode === "worktree" && !input.branch) {
       throw new GatewayError(
         "worktree_base_branch_required",
-        "workspaceMode=worktree requires branch to select the worktree's base branch.",
+        "workspaceMode=worktree requires a base branch, for example branch=main. The gateway generates the isolated task branch/path; omit worktreePath. Use workspaceMode=local to use the current checkout.",
       );
     }
     if (workspaceMode === "worktree" && input.worktreePath != null) {
@@ -1368,6 +1386,7 @@ export class T3Gateway {
     }
 
     return this.threadSend({
+      initialSettings: (await this.journal.getByOperationId(created.operationId))?.settings,
       threadId: created.threadId,
       message: input.message,
       modelSelection: input.modelSelection,
@@ -1433,7 +1452,8 @@ export class T3Gateway {
         "thread_busy",
         `Thread ${input.threadId} is busy (execution=${observation.execution}, ` +
           `turn=${activeTurn ?? "unknown"}, session=${typeof sessionStatus === "string" ? sessionStatus : "unknown"}, ` +
-          `quality=${observation.quality}). Valid next actions: poll t3_thread_get or t3_run_get, ` +
+          `quality=${observation.quality}). Valid next actions: use t3_run_wait with the existing gateway runId, ` +
+          `or t3_thread_get when no gateway run handle is known; ` +
           `wait for completion, or interrupt the observed turn ${activeTurn ?? "once known"} with t3_thread_interrupt. ` +
           `Queueing and steering are not enabled.`,
       );
@@ -1449,6 +1469,18 @@ export class T3Gateway {
       threadId: input.threadId,
       runId,
       messageId,
+      settings: {
+        requested: input.initialSettings?.requested ?? {
+          modelSelection: input.modelSelection ? safeModelSelection(input.modelSelection) : null,
+          runtimeMode: input.runtimeMode ?? null,
+        },
+        resolved: {
+          modelSelection: safeModelSelection(input.modelSelection ?? snapshot.thread.modelSelection),
+          runtimeMode: input.runtimeMode ?? snapshot.thread.runtimeMode,
+        },
+        modelSource: input.initialSettings?.modelSource ?? (input.modelSelection ? "explicit" : "thread_inherited"),
+        runtimeSource: input.initialSettings?.runtimeSource ?? (input.runtimeMode ? "explicit" : "thread_inherited"),
+      },
     });
     if (begun.reused) {
       const reconciled = await this.reconcile(begun.record);
@@ -1494,17 +1526,63 @@ export class T3Gateway {
   }
 
   async runWait(runId: string, timeoutSeconds: number): Promise<RunResult> {
+    const startedAt = Date.now();
     const initial = await this.runGet(runId);
     const deadline = Date.now() + timeoutSeconds * 1000;
     let current = initial;
-    while (Date.now() < deadline && !isTerminal(current.runStatus)) {
-      await delay(Math.min(500, Math.max(50, deadline - Date.now())));
-      current = await this.runGet(runId);
-      if (hasRelevantChange(initial, current)) {
-        return current;
+    let observations = 1;
+    let intervalMs = 500;
+    while (Date.now() < deadline && waitCanContinue(current)) {
+      await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
+      const record = await this.journal.getByRunId(runId) ?? await this.findRun(runId);
+      if (!record || record.kind !== "thread.turn.start") throw new GatewayError("run_not_found", `Run ${runId} was not found in the gateway journal.`);
+      current = await this.observeRun(record, initial.environmentId);
+      observations += 1;
+      if (hasRelevantChange(initial, current)) break;
+      intervalMs = Math.min(2_000, intervalMs * 2);
+    }
+    // Reuse identity only inside this bounded read. Mutation checks stay fresh.
+    // Revalidate even when the configuration does not pin an environment.
+    if (current.connectionStatus === "connected") {
+      try {
+        const finalEnvironmentId = await this.environmentId();
+        if (finalEnvironmentId !== initial.environmentId) {
+          throw new GatewayError("environment_mismatch", "T3 environment changed during the wait; discard this observation and reconnect before continuing.");
+        }
+      } catch (error) {
+        if (error instanceof GatewayError && error.code === "environment_mismatch") throw error;
+        const retainedFailure = current.threadId && current.t3TurnId
+          ? await this.journal.getFailureByTurnId(current.threadId, current.t3TurnId)
+          : null;
+        current = {
+          ...current, connectionStatus: "disconnected", runStatus: retainedFailure ? "failed" : "unknown",
+          failure: retainedFailure, stateFreshness: "unknown", threadQuality: null, threadWarning: null,
+          latestResponse: null, pendingActions: { approvals: false, userInput: false },
+          error: sanitizeFailureText(safeErrorMessage(error), 2_000),
+          ...(current.settings === undefined ? {} : { settings: observeSettings(current.settings) }),
+        };
       }
     }
-    return { ...current, ...(isTerminal(current.runStatus) ? {} : { timedOut: true }) };
+    if (current.connectionStatus === "connected" && current.t3TurnId) {
+      const record = await this.journal.getByOperationId(current.operationId);
+      if (record && record.turnId !== current.t3TurnId) {
+        await this.journal.update(record.operationId, { turnId: current.t3TurnId });
+      }
+      if (current.failure && current.threadId) {
+        await this.journal.retainTerminalFailure(current.threadId, current.t3TurnId, current.failure, current.operationId);
+      }
+    }
+    const result: RunResult = {
+      ...current,
+      ...(waitCanContinue(current) && !hasRelevantChange(initial, current) && Date.now() >= deadline ? { timedOut: true } : {}),
+      monitoring: { observations, requestedTimeoutSeconds: timeoutSeconds, elapsedMs: Date.now() - startedAt },
+    };
+    await this.auditLog.record({
+      source: "system", event: "run.wait", operation: "t3_run_wait", outcome: result.connectionStatus === "disconnected" ? "disconnected" : result.timedOut ? "timed_out" : "changed",
+      durationMs: result.monitoring!.elapsedMs,
+      details: { runId, ...result.monitoring, runStatus: result.runStatus },
+    });
+    return result;
   }
 
   async runInterrupt(input: RunInterruptInput): Promise<MutationResult> {
@@ -2156,7 +2234,7 @@ export class T3Gateway {
     return { ...summary, failure: retained };
   }
 
-  private async observeRun(record: OperationRecord): Promise<RunResult> {
+  private async observeRun(record: OperationRecord, boundedEnvironmentId?: string): Promise<RunResult> {
     if (!record.runId || !record.threadId) {
       throw new GatewayError("run_invalid", "The journal entry does not contain a run handle.");
     }
@@ -2170,7 +2248,7 @@ export class T3Gateway {
         ? thread.messages.find((candidate) => candidate.id === record.messageId) ?? null
         : null;
       const turnId = record.turnId ?? message?.turnId ?? null;
-      if (turnId && record.turnId !== turnId) {
+      if (turnId && record.turnId !== turnId && boundedEnvironmentId === undefined) {
         await this.journal.update(record.operationId, { turnId });
       }
       const latestTurn = thread.latestTurn ?? null;
@@ -2195,15 +2273,16 @@ export class T3Gateway {
         : matchingSessionFailure;
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
       const failure = turnId !== null && (observedFailure !== null || priorFailure !== null)
-        ? await this.journal.retainTerminalFailure(
-          thread.id, turnId, observedFailure ?? priorFailure!, record.operationId,
-        )
+        ? boundedEnvironmentId === undefined
+          ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId)
+          : observedFailure ?? priorFailure
         : record.terminalFailure ?? null;
       const runStatus = record.terminalRunStatus === "failed" || failure !== null
         ? "failed"
         : observedRunStatus;
       return {
-        environmentId: await this.environmentId(),
+        environmentId: boundedEnvironmentId ?? await this.environmentId(),
+        ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings, sameTurn ? thread : undefined) }),
         operationId: record.operationId,
         projectId: thread.projectId,
         threadId: thread.id,
@@ -2225,6 +2304,7 @@ export class T3Gateway {
         },
       };
     } catch (error) {
+      if (error instanceof GatewayError && error.code === "environment_mismatch") throw error;
       const telemetry = this.client.telemetry();
       const observedAt = new Date().toISOString();
       const latestRecord = await this.journal.getByOperationId(record.operationId).catch(() => null) ?? record;
@@ -2233,7 +2313,8 @@ export class T3Gateway {
         : null;
       const failure = retainedFailure ?? latestRecord.terminalFailure ?? null;
       return {
-        environmentId: await this.environmentId().catch(() => this.config.environmentId ?? "unknown"),
+        environmentId: boundedEnvironmentId ?? await this.environmentId().catch(() => this.config.environmentId ?? "unknown"),
+        ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings) }),
         operationId: record.operationId,
         projectId: record.projectId ?? null,
         threadId: record.threadId ?? null,
@@ -2465,7 +2546,16 @@ export class T3Gateway {
   }
 
   private async threadSendResult(record: OperationRecord): Promise<ThreadSendResult> {
+    let settings = record.settings ? observeSettings(record.settings) : undefined;
+    if (record.settings && record.status === "accepted" && record.threadId) {
+      try {
+        const { thread } = await this.client.getThread(record.threadId);
+        const message = thread.messages.find((candidate) => candidate.id === record.messageId);
+        if (message?.turnId && message.turnId === thread.latestTurn?.turnId) settings = observeSettings(record.settings, thread);
+      } catch { /* Keep requested/resolved values without claiming an observation. */ }
+    }
     return {
+      ...(settings === undefined ? {} : { settings }),
       ...mutationResult(record, await this.knownEnvironmentId()),
       projectId: record.projectId ?? "unknown",
       threadId: record.threadId ?? "unknown",
@@ -2553,7 +2643,10 @@ export class T3Gateway {
         // The child operation may not yet be durable enough to observe as a run.
       }
     }
-    return { ...summary, thread, run };
+    const operation = summary.runOperationId ? await this.journal.getByOperationId(summary.runOperationId) :
+      summary.threadOperationId ? await this.journal.getByOperationId(summary.threadOperationId) : null;
+    const settings = run?.settings ?? (operation?.settings ? observeSettings(operation.settings) : undefined);
+    return { ...summary, thread, run, ...(settings === undefined ? {} : { settings }) };
   }
 }
 
@@ -3023,8 +3116,15 @@ function isTerminal(status: RunStatus): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
 }
 
+function waitCanContinue(result: RunResult): boolean {
+  return result.connectionStatus === "connected" && !isTerminal(result.runStatus) &&
+    result.runStatus !== "awaiting_approval" && result.runStatus !== "awaiting_input" &&
+    !result.pendingActions.approvals && !result.pendingActions.userInput;
+}
+
 function hasRelevantChange(initial: RunResult, current: RunResult): boolean {
   return (
+    current.connectionStatus !== initial.connectionStatus ||
     current.runStatus !== initial.runStatus ||
     current.t3TurnId !== initial.t3TurnId ||
     current.latestResponse?.id !== initial.latestResponse?.id ||

@@ -1,6 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, chmod, mkdir, readFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
+import { createInterface } from "node:readline";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const auditContext = new AsyncLocalStorage<{ correlationId: string; operation: string }>();
+
+/** Async-local attribution keeps concurrent MCP calls from sharing a parent. */
+export function withAuditContext<T>(correlationId: string, operation: string, action: () => T): T {
+  return auditContext.run({ correlationId, operation }, action);
+}
 
 const AUDIT_VERSION = 1;
 const MAX_STRING_LENGTH = 512;
@@ -18,6 +27,8 @@ export interface AuditEvent {
   readonly source: AuditSource;
   readonly event: string;
   readonly correlationId?: string;
+  readonly parentCorrelationId?: string;
+  readonly parentOperation?: string;
   readonly operation?: string;
   readonly outcome?: string;
   readonly durationMs?: number;
@@ -67,6 +78,7 @@ export class AuditLog {
 
   async record(input: AuditEventInput): Promise<void> {
     try {
+      const parent = auditContext.getStore();
       const event: AuditEvent = {
         version: AUDIT_VERSION,
         eventId: `evt_${randomUUID()}`,
@@ -75,6 +87,10 @@ export class AuditLog {
         source: input.source,
         event: input.event,
         ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
+        ...(parent === undefined || parent.correlationId === input.correlationId ? {} : {
+          parentCorrelationId: parent.correlationId,
+          parentOperation: parent.operation,
+        }),
         ...(input.operation === undefined ? {} : { operation: input.operation }),
         ...(input.outcome === undefined ? {} : { outcome: input.outcome }),
         ...(input.durationMs === undefined ? {} : { durationMs: Math.max(0, Math.round(input.durationMs)) }),
@@ -93,53 +109,35 @@ export class AuditLog {
   async query(input: AuditQueryInput): Promise<AuditLogPage> {
     await this.init();
     await this.writing;
-    let raw: string;
+    const since = parseFilterTime(input.since, "since");
+    const until = parseFilterTime(input.until, "until");
+    const offset = parseCursor(input.cursor);
+    const items: AuditEvent[] = [];
+    let total = 0;
+    let invalidLines = 0;
     try {
-      raw = await readFile(this.filePath, "utf8");
+      const scan = await scanAuditFile(this.filePath, (event) => {
+        const timestamp = Date.parse(event.timestamp);
+        if (since !== null && (!Number.isFinite(timestamp) || timestamp < since)) return;
+        if (until !== null && (!Number.isFinite(timestamp) || timestamp > until)) return;
+        if (input.source !== undefined && event.source !== input.source) return;
+        if (input.event !== undefined && event.event !== input.event) return;
+        if (input.operation !== undefined && event.operation !== input.operation) return;
+        if (input.outcome !== undefined && event.outcome !== input.outcome) return;
+        if (total >= offset && items.length < input.limit) items.push(event);
+        total += 1;
+      });
+      invalidLines = scan.invalidLines;
     } catch (error) {
-      if (isFileNotFound(error)) {
-        return { items: [], nextCursor: null, hasMore: false, total: 0, invalidLines: 0 };
-      }
       this.rememberError(error);
       return { items: [], nextCursor: null, hasMore: false, total: 0, invalidLines: 0 };
     }
-
-    const events: AuditEvent[] = [];
-    let invalidLines = 0;
-    for (const line of raw.split("\n")) {
-      if (line.trim() === "") continue;
-      try {
-        const parsed: unknown = JSON.parse(line);
-        if (isAuditEvent(parsed)) {
-          events.push(parsed);
-        } else {
-          invalidLines += 1;
-        }
-      } catch {
-        invalidLines += 1;
-      }
-    }
-
-    const since = parseFilterTime(input.since, "since");
-    const until = parseFilterTime(input.until, "until");
-    const filtered = events.filter((event) => {
-      const timestamp = Date.parse(event.timestamp);
-      if (since !== null && (!Number.isFinite(timestamp) || timestamp < since)) return false;
-      if (until !== null && (!Number.isFinite(timestamp) || timestamp > until)) return false;
-      if (input.source !== undefined && event.source !== input.source) return false;
-      if (input.event !== undefined && event.event !== input.event) return false;
-      if (input.operation !== undefined && event.operation !== input.operation) return false;
-      if (input.outcome !== undefined && event.outcome !== input.outcome) return false;
-      return true;
-    });
-    const offset = parseCursor(input.cursor);
-    const items = filtered.slice(offset, offset + input.limit);
     const nextOffset = offset + items.length;
     return {
       items,
-      nextCursor: nextOffset < filtered.length ? String(nextOffset) : null,
-      hasMore: nextOffset < filtered.length,
-      total: filtered.length,
+      nextCursor: nextOffset < total ? String(nextOffset) : null,
+      hasMore: nextOffset < total,
+      total,
       invalidLines,
     };
   }
@@ -306,7 +304,7 @@ function parseCursor(cursor: string | undefined): number {
   return value;
 }
 
-function parseFilterTime(value: string | undefined, name: string): number | null {
+export function parseFilterTime(value: string | undefined, name: string): number | null {
   if (value === undefined || value.trim() === "") return null;
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) throw new Error(`${name} must be a valid ISO date.`);
@@ -324,6 +322,8 @@ function isAuditEvent(value: unknown): value is AuditEvent {
     isAuditSource(event.source) &&
     typeof event.event === "string" &&
     optionalString(event.correlationId) &&
+    optionalString(event.parentCorrelationId) &&
+    optionalString(event.parentOperation) &&
     optionalString(event.operation) &&
     optionalString(event.outcome) &&
     optionalNumber(event.durationMs) &&
@@ -349,4 +349,41 @@ function optionalDetails(value: unknown): boolean {
 
 function isFileNotFound(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+/** Scan a fixed byte snapshot, retaining at most a stream buffer and one line.
+ * Appends during a query are deferred to the next query; offset order is unchanged.
+ */
+export async function scanAuditFile(
+  filePath: string,
+  visit: (event: AuditEvent) => void,
+): Promise<{ invalidLines: number; bytes: number; validLines: number }> {
+  const file = await open(filePath, "r").catch((error: unknown) => {
+    if (isFileNotFound(error)) return null;
+    throw error;
+  });
+  if (file === null) return { invalidLines: 0, bytes: 0, validLines: 0 };
+  let lines: ReturnType<typeof createInterface> | undefined;
+  let stream: ReturnType<typeof file.createReadStream> | undefined;
+  try {
+    const bytes = (await file.stat()).size;
+    if (bytes === 0) return { invalidLines: 0, bytes, validLines: 0 };
+    stream = file.createReadStream({ encoding: "utf8", start: 0, end: bytes - 1, autoClose: false });
+    lines = createInterface({ input: stream, crlfDelay: Infinity });
+    let invalidLines = 0;
+    let validLines = 0;
+    for await (const line of lines) {
+      if (line.trim() === "") continue;
+      let parsed: unknown;
+      try { parsed = JSON.parse(line); } catch { invalidLines += 1; continue; }
+      if (!isAuditEvent(parsed)) { invalidLines += 1; continue; }
+      validLines += 1;
+      visit(parsed);
+    }
+    return { invalidLines, bytes, validLines };
+  } finally {
+    lines?.close();
+    stream?.destroy();
+    await file.close();
+  }
 }

@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+import { summarizeUsage } from "./operations/usage-summary.js";
 import { loadConfig } from "./config.js";
 import { runDoctor } from "./doctor.js";
 import { makeGateway } from "./gateway.js";
@@ -6,6 +8,21 @@ import { parseSetupArgs, renderSetup } from "./setup.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "serve";
+  if (command === "usage-summary") {
+    const args = process.argv.slice(3);
+    const flags: Record<string, string> = {};
+    for (let i = 0; i < args.length; i += 2) {
+      const name = args[i]; const value = args[i + 1];
+      if (!name || !["--file", "--since", "--until"].includes(name) || !value || value.startsWith("--") || flags[name] !== undefined) {
+        throw new Error("Use usage-summary [--file audit.jsonl] [--since ISO] [--until ISO].");
+      }
+      flags[name] = value;
+    }
+    // Offline read-only analysis needs no T3 or MCP credentials and never initializes a gateway.
+    const file = resolve(flags["--file"] ?? resolve(process.env.T3_MCP_DATA_DIR?.trim() || "./data", "audit.jsonl"));
+    console.log(JSON.stringify(await summarizeUsage(file, { since: flags["--since"], until: flags["--until"] }), null, 2));
+    return;
+  }
   if (command === "setup") {
     const options = parseSetupArgs(process.argv.slice(3));
     const result = await renderSetup(options);
@@ -97,7 +114,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      throw new Error(`Unknown command ${command}. Use serve, status, doctor, smoke, spike, or setup.`);
+      throw new Error(`Unknown command ${command}. Use serve, status, doctor, smoke, spike, setup, or usage-summary.`);
   }
 }
 

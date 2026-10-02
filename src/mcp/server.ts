@@ -1,9 +1,10 @@
+import { settingsReceiptSchema } from "../operations/settings.js";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { GATEWAY_VERSION } from "../contract.js";
-import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
+import { summarizeForAudit, withAuditContext, type AuditLog } from "../operations/audit-log.js";
 import {
   GatewayError,
   T3Gateway,
@@ -214,6 +215,8 @@ const auditEventOutput = z
     source: auditSource,
     event: z.string(),
     correlationId: z.string().optional(),
+    parentCorrelationId: z.string().optional(),
+    parentOperation: z.string().optional(),
     operation: z.string().optional(),
     outcome: z.string().optional(),
     durationMs: z.number().int().nonnegative().optional(),
@@ -429,7 +432,14 @@ const threadMessagesOutputSchema = {
     .passthrough(),
 };
 
+const settingsObservationOutput = settingsReceiptSchema.extend({
+  effective: settingsReceiptSchema.shape.resolved.extend({ observedAt: z.string() }).nullable(),
+  state: z.enum(["observed", "unresolved"]),
+  matchesResolved: z.boolean().nullable(),
+});
+
 const threadSendOutputSchema = {
+  settings: settingsObservationOutput.optional(),
   ...mutationResultShape,
   projectId: z.string(),
   threadId: z.string(),
@@ -441,6 +451,7 @@ const threadSendOutputSchema = {
 };
 
 const runResultOutputSchema = {
+  settings: settingsObservationOutput.optional(),
   environmentId: z.string(),
   operationId: z.string(),
   projectId: z.string().nullable(),
@@ -471,6 +482,7 @@ const runResultOutputSchema = {
       userInput: z.boolean(),
     })
     .passthrough(),
+  monitoring: z.object({ observations: z.number(), requestedTimeoutSeconds: z.number(), elapsedMs: z.number() }).optional(),
   timedOut: z.boolean().optional(),
   error: z.string().optional(),
   failure: failureOutput.nullable(),
@@ -506,6 +518,7 @@ const taskSummaryOutput = z.object({
 }).passthrough();
 
 const taskDetailOutput = taskSummaryOutput.extend({
+  settings: settingsObservationOutput.optional(),
   thread: threadDetailOutput.nullable(),
   run: z.object(runResultOutputSchema).passthrough().nullable(),
 });
@@ -798,7 +811,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Create and start a T3 thread",
       description:
-        "Create a thread and start its required initial message as one MCP operation. The gateway safely sequences T3's ordinary thread.create and thread.turn.start commands and never sends if creation is uncertain. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree and attach it to the T3 thread before the turn starts. Use t3_thread_send only for follow-up messages on existing threads.",
+        `Create a thread and start its required initial message as one MCP operation. The gateway safely sequences T3's ordinary thread.create and thread.turn.start commands and never sends if creation is uncertain. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree and attach it to the T3 thread before the turn starts. Use t3_thread_send only for follow-ups on idle threads. Prefer t3_task_start for a durable taskRef; this tool returns a runId. Model/runtime preferences must be arguments, not message prose. modelSelection omission uses the project default. Example: {"projectId":"project-id","title":"Repair Undo","message":"Repair the owned Undo defect and report checks","runtimeMode":"full-access","modelSelection":{"instanceId":"configured-instance","model":"requested-model"},"workspaceMode":"worktree","branch":"main","idempotencyKey":"unique-assignment-key"}. branch is the base, not the generated task branch; omit worktreePath.`,
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -823,7 +836,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Start a recoverable T3 task",
       description:
-        "Create one T3 thread and dispatch its required initial instruction as a recoverable two-command operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree from the selected local or origin base branch and attach it through ordinary HTTP thread creation. runtimeMode is required. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.",
+        `Create one T3 thread and dispatch its required initial instruction as a recoverable two-command operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree from the selected local or origin base branch and attach it through ordinary HTTP thread creation. runtimeMode is required. Put requested model/runtime settings in arguments; omitted modelSelection uses the project default. branch is the base (for example main), not the generated task branch; omit worktreePath in worktree mode. Example: {"projectId":"project-id","title":"Repair Undo","instruction":"Repair the owned Undo defect and report checks","runtimeMode":"full-access","workspaceMode":"worktree","branch":"main","idempotencyKey":"unique-assignment-key"}. Add modelSelection:{"instanceId":"configured-instance","model":"requested-model"} when a model preference is known. Save taskRef and runId for monitoring. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.`,
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -926,7 +939,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     {
       title: "Send a T3 thread message",
       description:
-        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads return thread_busy with the active turn/session and valid next actions. Uncertain results carry a durable operation handle for status lookup. Each idempotencyKey maps to one input.",
+        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads return thread_busy with the active turn/session and valid next actions. Uncertain results carry a durable operation handle for status lookup. Each idempotencyKey maps to one input. Omitted modelSelection/runtimeMode inherit the thread settings; put any user preference in these arguments. Save runId, inspect requested/resolved/effective settings, and use t3_run_wait for monitoring. Do not resend on a timeout or uncertainty with a fresh key.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         message: z.string().min(1).max(120_000),
@@ -958,7 +971,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_run_wait",
     {
       title: "Wait for a T3 run change",
-      description: "Poll for a relevant run change for a bounded interval. A timeout only means no change was observed; it does not cancel the run.",
+      description: "Wait for status, response identity, approval/input, quality or connection change using adaptive polling (up to 2 seconds). Save the runId from dispatch. Returns immediately if already terminal, blocked on approval/input or disconnected. A timeout does not cancel the run; streaming text on the same response ID is not a change trigger. Continue bounded waits or inspect a changed response; avoid duplicate monitors.",
       inputSchema: {
         runId: z.string().trim().min(1),
         timeoutSeconds: z.number().int().min(1).max(30).default(10),
@@ -1105,46 +1118,48 @@ async function runTool<T extends object>(
   operation: () => Promise<T>,
 ): Promise<CallToolResult> {
   const correlationId = `mcp_${randomUUID()}`;
-  const startedAt = Date.now();
-  await auditLog.record({
-    source: "mcp",
-    event: "tool.call",
-    correlationId,
-    operation: toolName,
-    outcome: "started",
-    details: { arguments: summarizeForAudit(input) },
+  return withAuditContext(correlationId, toolName, async () => {
+    const startedAt = Date.now();
+    await auditLog.record({
+      source: "mcp",
+      event: "tool.call",
+      correlationId,
+      operation: toolName,
+      outcome: "started",
+      details: { arguments: summarizeForAudit(input) },
+    });
+    try {
+      const result = await operation();
+      await auditLog.record({
+        source: "mcp",
+        event: "tool.result",
+        correlationId,
+        operation: toolName,
+        outcome: "completed",
+        durationMs: Date.now() - startedAt,
+        details: { result: summarizeForAudit(result) },
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        structuredContent: result as Record<string, unknown>,
+      };
+    } catch (error) {
+      const code = error instanceof GatewayError ? error.code : "gateway_error";
+      const message = error instanceof Error ? error.message : String(error);
+      await auditLog.record({
+        source: "mcp",
+        event: "tool.result",
+        correlationId,
+        operation: toolName,
+        outcome: "error",
+        durationMs: Date.now() - startedAt,
+        details: { errorCode: code, errorMessage: message },
+      });
+      return {
+        isError: true,
+        content: [{ type: "text", text: JSON.stringify({ error: { code, message } }, null, 2) }],
+        structuredContent: { error: { code, message } },
+      };
+    }
   });
-  try {
-    const result = await operation();
-    await auditLog.record({
-      source: "mcp",
-      event: "tool.result",
-      correlationId,
-      operation: toolName,
-      outcome: "completed",
-      durationMs: Date.now() - startedAt,
-      details: { result: summarizeForAudit(result) },
-    });
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      structuredContent: result as Record<string, unknown>,
-    };
-  } catch (error) {
-    const code = error instanceof GatewayError ? error.code : "gateway_error";
-    const message = error instanceof Error ? error.message : String(error);
-    await auditLog.record({
-      source: "mcp",
-      event: "tool.result",
-      correlationId,
-      operation: toolName,
-      outcome: "error",
-      durationMs: Date.now() - startedAt,
-      details: { errorCode: code, errorMessage: message },
-    });
-    return {
-      isError: true,
-      content: [{ type: "text", text: JSON.stringify({ error: { code, message } }, null, 2) }],
-      structuredContent: { error: { code, message } },
-    };
-  }
 }

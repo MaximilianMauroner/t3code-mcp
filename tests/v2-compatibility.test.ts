@@ -1,0 +1,241 @@
+import { createServer } from "node:http";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { WebSocketServer } from "ws";
+import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
+import { makeGateway } from "../src/gateway.js";
+import { T3HttpClient } from "../src/t3/http-client.js";
+import { requestT3Rpc } from "../src/t3/rpc-client.js";
+import { V2ShellSchema, V2ThreadSchema } from "../src/t3/v2.js";
+
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+const now = "2026-10-02T20:00:00.000Z";
+const selection = { instanceId: "codex_openai", model: "gpt-6.1-sol" };
+const project = { id: "project-1", title: "Project", workspaceRoot: "/remote/project", defaultModelSelection: selection };
+const thread = {
+  id: "thread-1", projectId: project.id, title: "Thread", providerInstanceId: "codex_openai",
+  modelSelection: selection, runtimeMode: "full-access", interactionMode: "default",
+  branch: null, worktreePath: null, createdBy: "user", creationSource: "web",
+  createdAt: now, updatedAt: now, archivedAt: null, settledOverride: null, settledAt: null,
+  latestUserMessageAt: null, hasActionableProposedPlan: false,
+};
+
+// Wire fields from the merged V2 contracts, without the V1 session/latestTurn.
+async function setup() {
+  const snapshot = V2ThreadSchema.parse({ snapshotSequence: 2, projection: {
+    thread, runs: [], messages: [], runtimeRequests: [], turnItems: [], plans: [], checkpoints: [], updatedAt: now,
+  } });
+  const shell = V2ShellSchema.parse({ schemaVersion: 1, snapshotSequence: 2, projects: [project], archivedThreads: [], threads: [{
+    ...thread, latestRunId: null, activeRunId: null, status: "idle", pendingRuntimeRequest: null,
+  }] });
+  const requests: Array<{ path: string; protocol?: string; authorization?: string }> = [];
+  const commands: Array<Record<string, unknown>> = [];
+  let disconnect = false;
+  let hold = false;
+  let rejectRpc = false;
+  let protocolVersion: 1 | 2 = 2;
+  const server = createServer(async (request, response) => {
+    const path = request.url ?? "/";
+    requests.push({ path, protocol: request.headers["x-t3-orchestration-protocol"]?.toString(), authorization: request.headers.authorization });
+    const send = (body: unknown, status = 200) => { response.writeHead(status, { "content-type": "application/json" }); response.end(JSON.stringify(body)); };
+    if (path === "/.well-known/t3/environment") return send({ environmentId: "v2-env", label: "Test", serverVersion: `protocol-${protocolVersion}`, orchestrationProtocolVersion: protocolVersion });
+    if (request.headers.authorization !== "Bearer test-token") return send({ code: "auth_invalid", reason: "missing_credentials", traceId: "trace-1" }, 401);
+    if (path === "/api/auth/session") return send({ authenticated: true, scopes: ["orchestration:read", "orchestration:operate"] });
+    if (protocolVersion === 1) {
+      if (path === "/api/orchestration/shell") return send({ snapshotSequence: 2, projects: [project], threads: [thread], updatedAt: now });
+      if (path === "/api/orchestration/threads/thread-1") return send({ snapshotSequence: 2, thread: { ...thread, messages: [] } });
+      if (path === "/api/orchestration/dispatch") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        commands.push(z.record(z.string(), z.unknown()).parse(JSON.parse(Buffer.concat(chunks).toString())));
+        return send({ sequence: 3 });
+      }
+    }
+    if (path.startsWith("/api/orchestration/") && request.headers["x-t3-orchestration-protocol"] !== "2") return send({ code: "invalid_request", reason: "protocol" }, 400);
+    if (path === "/api/orchestration/shell") return send(shell);
+    if (path === `/api/orchestration/threads/${snapshot.projection.thread.id}`) return send(snapshot);
+    if (path === "/api/projects/mutate") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const command = z.object({ type: z.literal("project.create"), commandId: z.string(), projectId: z.string(), title: z.string(), workspaceRoot: z.string() }).parse(JSON.parse(Buffer.concat(chunks).toString()));
+      commands.push(command);
+      return send({ id: command.projectId });
+    }
+    send({ code: "not_found", reason: "thread_not_found", traceId: "trace-2" }, 404);
+  });
+  const sockets = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (request, socket, head) => {
+    requests.push({ path: request.url ?? "", authorization: request.headers.authorization });
+    if (request.url !== "/ws?orchestrationProtocol=2" || request.headers.authorization !== "Bearer test-token") { socket.destroy(); return; }
+    sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit("connection", ws));
+  });
+  sockets.on("connection", (ws) => ws.on("message", (data) => {
+    const frame = z.object({ _tag: z.literal("Request"), id: z.string(), tag: z.string(), payload: z.record(z.string(), z.unknown()), headers: z.array(z.unknown()) }).parse(JSON.parse(data.toString()));
+    if (frame.tag === "orchestration.getArchivedShellSnapshot") {
+      ws.send(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: { schemaVersion: 1, snapshotSequence: 2, projects: [project], threads: [{ ...shell.threads[0], id: "archived-1", archivedAt: now }] } } }));
+      return;
+    }
+    const command = frame.payload;
+    commands.push(command);
+    if (disconnect) { ws.close(); return; }
+    if (hold) return;
+    if (rejectRpc) {
+      ws.send(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "OrchestrationV2DispatchCommandError", message: "Cannot archive a running thread" } }] } }));
+      return;
+    }
+    if (command.type === "thread.create") {
+      const created = z.object({ threadId: z.string(), title: z.string(), createdBy: z.literal("user"), creationSource: z.literal("mcp"), runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]) }).parse(command);
+      snapshot.projection.thread.id = created.threadId;
+      snapshot.projection.thread.title = created.title;
+      snapshot.projection.thread.runtimeMode = created.runtimeMode;
+      shell.threads[0]!.id = created.threadId;
+      shell.threads[0]!.title = created.title;
+    }
+    if (command.type === "thread.runtime-mode.set") {
+      snapshot.projection.thread.runtimeMode = z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]).parse(command.runtimeMode);
+    }
+    if (command.type === "thread.interaction-mode.set") {
+      snapshot.projection.thread.interactionMode = z.enum(["default", "plan"]).parse(command.interactionMode);
+    }
+    if (command.type === "message.dispatch") {
+      const message = z.object({ messageId: z.string(), threadId: z.string(), text: z.string(), createdBy: z.literal("user"), creationSource: z.literal("mcp"), dispatchMode: z.object({ type: z.literal("start_immediately") }), attachments: z.array(z.unknown()) }).parse(command);
+      snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, status: "running", userMessageId: message.messageId, rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null });
+      snapshot.projection.messages.push({ id: message.messageId, runId: "run-v2", nodeId: null, role: "user", text: message.text, attachments: [], streaming: false, createdAt: now, updatedAt: now });
+    }
+    if (command.type === "run.interrupt") snapshot.projection.runs[0]!.status = "interrupted";
+    if (command.type === "runtime-request.respond") snapshot.projection.runtimeRequests.find((request) => request.id === command.requestId)!.status = "resolved";
+    ws.send(JSON.stringify([{ _tag: "Exit", requestId: "unrelated", exit: { _tag: "Success", value: {} } }, { _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: { sequence: 3 } } }]));
+  }));
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("No server address");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  cleanups.push(async () => { for (const ws of sockets.clients) ws.terminate(); sockets.close(); await new Promise<void>((resolve) => server.close(() => resolve())); });
+  const directory = await mkdtemp(join(tmpdir(), "t3-v2-test-"));
+  cleanups.push(() => rm(directory, { recursive: true, force: true }));
+  const made = makeGateway({ t3HttpBaseUrl: baseUrl, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 });
+  return { ...made, snapshot, shell, commands, requests, baseUrl, setProtocol: (version: 1 | 2) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
+}
+
+describe("merged orchestrator V2 boundary", () => {
+  it("switches between V2 and V1 in both directions after descriptor refresh", async () => {
+    const { client, setProtocol, requests, commands } = await setup();
+    for (const version of [2, 1, 2] as const) {
+      setProtocol(version);
+      await client.getDescriptor();
+      const start = requests.length;
+      expect((await client.getShell()).projects[0]?.id).toBe("project-1");
+      expect((await client.getThread("thread-1")).thread.id).toBe("thread-1");
+      await client.dispatch({ type: "thread.archive", commandId: `archive-${commands.length}`, threadId: "thread-1" });
+      const observed = requests.slice(start);
+      expect(observed.some((request) => request.path === "/api/orchestration/dispatch")).toBe(version === 1);
+      expect(observed.some((request) => request.path.startsWith("/ws?"))).toBe(version === 2);
+      expect(observed.filter((request) => request.path.startsWith("/api/orchestration/")).every((request) => request.protocol === (version === 2 ? "2" : undefined))).toBe(true);
+    }
+    expect(commands).toHaveLength(3);
+  });
+
+  it("starts a recoverable composite task with V2 thread creation and message admission", async () => {
+    const { gateway, commands } = await setup();
+    const input = { projectId: "project-1", title: "V2 task", instruction: "Check this project", runtimeMode: "full-access" as const, workspaceMode: "local" as const, idempotencyKey: "task-v2" };
+    const first = await gateway.taskStart(input);
+    const second = await gateway.taskStart(input);
+    expect(first).toMatchObject({ stage: "run_accepted" });
+    expect(second.threadId).toBe(first.threadId);
+    expect(commands.filter((command) => command.type === "thread.create")).toHaveLength(1);
+    expect(commands.filter((command) => command.type === "message.dispatch")).toHaveLength(1);
+  });
+
+  it("reads active and archived threads with negotiated protocol and maps run responses", async () => {
+    const { client, requests, snapshot } = await setup();
+    expect((await client.getShell()).threads.map((thread) => thread.id)).toEqual(["thread-1", "archived-1"]);
+    snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, status: "completed", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: now });
+    snapshot.projection.messages.push({ id: "answer-1", runId: "run-v2", nodeId: "node-root", role: "assistant", text: "Done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    expect((await client.getThread("thread-1")).thread).toMatchObject({ latestTurn: { turnId: "run-v2", state: "completed", assistantMessageId: "answer-1" }, messages: [{ turnId: "run-v2", text: "Done" }] });
+    expect(requests.filter((request) => request.path.startsWith("/api/orchestration/")).every((request) => request.protocol === "2")).toBe(true);
+  });
+
+  it("sends once, binds the run, and interrupts the V2 run ID", async () => {
+    const { gateway, commands } = await setup();
+    const input = { threadId: "thread-1", message: "Do the work", runtimeMode: "approval-required" as const, interactionMode: "plan" as const, idempotencyKey: "send-v2" };
+    const sent = await gateway.threadSend(input);
+    expect(sent.status).toBe("accepted");
+    await gateway.threadSend(input);
+    expect(commands.filter((command) => command.type === "message.dispatch")).toHaveLength(1);
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "running", settings: { matchesResolved: true, effective: { runtimeMode: "approval-required" } } });
+    await gateway.runInterrupt({ runId: sent.runId, idempotencyKey: "stop-v2" });
+    expect(commands.find((command) => command.type === "run.interrupt")).toMatchObject({ runId: "run-v2" });
+    expect((await gateway.runGet(sent.runId)).runStatus).toBe("interrupted");
+  });
+
+  it("ignores queued successors, child responses, and non-actionable runtime requests", async () => {
+    const { client, snapshot, shell } = await setup();
+    Object.assign(shell.threads[0]!, {
+      latestRunId: "queued", activeRunId: "active", status: "queued", activityRunStatus: "waiting",
+      activityRunStartedAt: now, latestRunRequestedAt: "2026-10-02T21:00:00.000Z", latestRunCompletedAt: null,
+    });
+    expect((await client.getShell()).threads[0]!.latestTurn).toMatchObject({ turnId: "active", requestedAt: now, completedAt: null });
+    snapshot.projection.runs.push(
+      { id: "active", ordinal: 1, status: "waiting", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null },
+      { id: "queued", ordinal: 2, status: "queued", userMessageId: "user-2", rootNodeId: null, requestedAt: now, startedAt: null, completedAt: null },
+    );
+    snapshot.projection.messages.push({ id: "child-answer", runId: "active", nodeId: "child-node", role: "assistant", text: "Child done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    snapshot.projection.runtimeRequests.push(
+      { id: "dead", nodeId: "node-root", kind: "user_input", status: "pending", responseCapability: { type: "not_resumable", reason: "restart" }, createdAt: now },
+      { id: "live", nodeId: "node-root", kind: "user_input", status: "pending", responseCapability: { type: "message" }, createdAt: now },
+    );
+    snapshot.projection.turnItems.push({ id: "question", type: "user_input_request", requestId: "live", runId: "active", nodeId: "node-root", title: "Question", questions: [{ id: "q1", question: "Which?" }], updatedAt: now });
+    const result = (await client.getThread("thread-1")).thread;
+    expect(result.latestTurn?.turnId).toBe("active");
+    expect(result.messages).toEqual([]);
+    expect(result.hasPendingUserInput).toBe(true);
+    expect(result.activities).toHaveLength(1);
+    await client.dispatch({ type: "thread.user-input.respond", commandId: "answer-command", threadId: "thread-1", requestId: "live", answers: { q1: "first" }, createdAt: now });
+    expect((await client.getThread("thread-1")).thread.hasPendingUserInput).toBe(false);
+  });
+
+  it("retains structured usage-limit evidence tied to the failed run", async () => {
+    const { gateway, snapshot } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "limited" });
+    snapshot.projection.runs[0]!.status = "failed";
+    snapshot.projection.turnItems.push({ id: "failure", type: "error", runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: { class: "usage_limit", code: "usage_limit", message: "Limit reached", resetAt: "2026-10-03T00:00:00.000Z" } });
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", latestResponse: null, failure: { category: "quota", code: "usage_limit", resetAt: "2026-10-03T00:00:00.000Z", turnId: "run-v2" } });
+  });
+
+  it("keeps a disconnected mutation uncertain and never replays it", async () => {
+    const { gateway, disconnect, commands } = await setup();
+    disconnect();
+    const input = { threadId: "thread-1", message: "Work", idempotencyKey: "disconnect" };
+    expect((await gateway.threadSend(input)).status).toBe("uncertain");
+    expect((await gateway.threadSend(input)).status).toBe("uncertain");
+    expect(commands).toHaveLength(1);
+  });
+
+  it("rejects unknown orchestration versions before sending a command", async () => {
+    const { baseUrl, commands } = await setup();
+    const client = new T3HttpClient(baseUrl, "test-token");
+    const descriptor = await client.getDescriptor();
+    descriptor.orchestrationProtocolVersion = 3;
+    await expect(client.dispatch({ type: "thread.archive", commandId: "archive", threadId: "thread-1" })).rejects.toThrow("Unsupported T3 orchestration protocol 3");
+    expect(commands).toEqual([]);
+  });
+
+  it("bounds an unacknowledged WebSocket RPC with cancellation", async () => {
+    const { baseUrl } = await setup();
+    const signal = AbortSignal.abort(new Error("cancelled"));
+    await expect(requestT3Rpc(baseUrl, "test-token", 50, "orchestration.dispatchCommand", {}, z.unknown(), signal)).rejects.toThrow("cancelled");
+  });
+
+  it("times out a connected socket and surfaces tagged RPC failures", async () => {
+    const fixture = await setup();
+    fixture.rejectRpc();
+    await expect(fixture.client.dispatch({ type: "thread.archive", threadId: "thread-1", commandId: "archive" })).rejects.toThrow("Cannot archive a running thread");
+    fixture.hold();
+    await expect(requestT3Rpc(fixture.baseUrl, "test-token", 50, "orchestration.dispatchCommand", { type: "thread.archive" }, z.unknown())).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+});

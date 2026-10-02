@@ -14,6 +14,8 @@ import {
 import type { T3Command } from "./commands.js";
 import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
 import { z } from "zod";
+import { requestT3Rpc } from "./rpc-client.js";
+import { V2ArchivedShellSchema, V2ShellSchema, V2ThreadSchema, normalizeV2ShellThread, normalizeV2Thread } from "./v2.js";
 
 export class T3HttpError extends Error {
   override readonly name = "T3HttpError";
@@ -24,9 +26,18 @@ export class T3HttpError extends Error {
     readonly path: string,
     readonly code: string | null,
     message: string,
+    readonly reason: string | null = null,
+    readonly requiredScope: string | null = null,
+    readonly traceId: string | null = null,
   ) {
     super(message);
   }
+}
+
+function errorField(body: unknown, field: string): string | null {
+  if (typeof body !== "object" || body === null) return null;
+  const value = (body as Record<string, unknown>)[field];
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 export interface T3ConnectionTelemetry {
@@ -50,7 +61,11 @@ function errorMessage(body: unknown, status: number, method: string, path: strin
       return message;
     }
   }
-  return `T3 ${method} ${path} failed with HTTP ${status}.`;
+  // Effect tagged errors serialize their fields, but not their message getter.
+  const reason = errorField(body, "reason");
+  const requiredScope = errorField(body, "requiredScope");
+  const detail = reason ?? (requiredScope ? `requires ${requiredScope}` : errorCode(body));
+  return `T3 ${method} ${path} failed with HTTP ${status}${detail ? ` (${detail})` : ""}.`;
 }
 
 function joinUrl(baseUrl: string, path: string): string {
@@ -100,6 +115,19 @@ export class T3HttpClient {
   }
 
   async getShell(signal?: AbortSignal): Promise<ShellSnapshot> {
+    if (await this.protocolVersion(signal) === 2) {
+      const snapshot = await this.request("GET", "/api/orchestration/shell", undefined, V2ShellSchema, signal, true);
+      const archived = await this.rpc("orchestration.getArchivedShellSnapshot", {}, V2ArchivedShellSchema, signal);
+      const threads = [...snapshot.threads, ...snapshot.archivedThreads, ...archived.threads];
+      const unique = new Map(threads.map((thread) => [thread.id, thread]));
+      this.lastSnapshotAt = Date.now();
+      return {
+        snapshotSequence: Math.max(snapshot.snapshotSequence, archived.snapshotSequence),
+        projects: snapshot.projects,
+        threads: [...unique.values()].map(normalizeV2ShellThread),
+        updatedAt: new Date(this.lastSnapshotAt).toISOString(),
+      };
+    }
     const snapshot = await this.request(
       "GET",
       "/api/orchestration/shell",
@@ -113,6 +141,10 @@ export class T3HttpClient {
   }
 
   async getThread(threadId: string, signal?: AbortSignal): Promise<ThreadSnapshot> {
+    if (await this.protocolVersion(signal) === 2) {
+      const snapshot = await this.request("GET", `/api/orchestration/threads/${encodeURIComponent(threadId)}`, undefined, V2ThreadSchema, signal, true);
+      return normalizeV2Thread(snapshot);
+    }
     return this.request(
       "GET",
       `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
@@ -124,6 +156,7 @@ export class T3HttpClient {
   }
 
   async dispatch(command: T3Command, signal?: AbortSignal): Promise<DispatchResult> {
+    if (await this.protocolVersion(signal) === 2) return this.dispatchV2(command, signal);
     return this.request(
       "POST",
       "/api/orchestration/dispatch",
@@ -132,6 +165,67 @@ export class T3HttpClient {
       signal,
       true,
     );
+  }
+
+  private async protocolVersion(signal?: AbortSignal): Promise<1 | 2> {
+    const descriptor = this.cachedDescriptor ?? await this.getDescriptor(signal);
+    const version = descriptor.orchestrationProtocolVersion ?? 1;
+    if (version !== 1 && version !== 2) throw new Error(`Unsupported T3 orchestration protocol ${String(version)}.`);
+    return version;
+  }
+
+  private async rpc<T>(method: string, payload: unknown, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T> {
+    const correlationId = `t3_${randomUUID()}`;
+    const startedAt = Date.now();
+    await this.auditLog?.record({ source: "t3", event: "upstream.request", correlationId, operation: method, outcome: "started", details: { body: summarizeForAudit(payload), transport: "websocket" } });
+    try {
+      const result = await requestT3Rpc(this.baseUrl, this.accessToken, this.requestTimeoutMs, method, payload, schema, signal);
+      this.lastSuccessfulAt = Date.now();
+      this.lastError = null;
+      await this.auditLog?.record({ source: "t3", event: "upstream.response", correlationId, operation: method, outcome: "completed", durationMs: Date.now() - startedAt });
+      return result;
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+      await this.auditLog?.record({ source: "t3", event: "upstream.response", correlationId, operation: method, outcome: "error", durationMs: Date.now() - startedAt, details: { error: this.lastError } });
+      throw error;
+    }
+  }
+
+  private async dispatchV2(command: T3Command, signal?: AbortSignal): Promise<DispatchResult> {
+    const dispatch = (payload: unknown) => this.rpc("orchestration.dispatchCommand", payload, DispatchResultSchema, signal);
+    switch (command.type) {
+      case "project.create": {
+        await this.request("POST", "/api/projects/mutate", command, z.object({ id: z.string() }).passthrough(), signal, true);
+        // Project mutation is a separate store in V2 and has no event sequence.
+        return { sequence: (await this.getShell(signal)).snapshotSequence };
+      }
+      case "thread.create":
+        return dispatch({ ...command, createdBy: "user", creationSource: "mcp" });
+      case "thread.turn.start": {
+        if (command.bootstrap) throw new T3HttpError(400, "POST", "/ws", "unsupported_bootstrap", "V2 turn dispatch requires an existing thread and workspace.");
+        // V2 persists these settings on the thread before admitting a message.
+        await dispatch({ type: "thread.runtime-mode.set", commandId: `${command.commandId}:runtime`, threadId: command.threadId, runtimeMode: command.runtimeMode });
+        await dispatch({ type: "thread.interaction-mode.set", commandId: `${command.commandId}:interaction`, threadId: command.threadId, interactionMode: command.interactionMode });
+        return dispatch({
+          type: "message.dispatch", commandId: command.commandId, threadId: command.threadId,
+          messageId: command.message.messageId, text: command.message.text, attachments: command.message.attachments,
+          dispatchMode: { type: "start_immediately" }, createdBy: "user", creationSource: "mcp",
+          ...(command.modelSelection ? { modelSelection: command.modelSelection } : {}),
+          ...(command.titleSeed ? { titleSeed: command.titleSeed } : {}),
+        });
+      }
+      case "thread.turn.interrupt": {
+        const runId = command.turnId ?? (await this.getThread(command.threadId, signal)).thread.latestTurn?.turnId;
+        if (!runId) throw new T3HttpError(400, "POST", "/ws", "run_not_found", "T3 has no run to interrupt.");
+        return dispatch({ type: "run.interrupt", commandId: command.commandId, threadId: command.threadId, runId });
+      }
+      case "thread.approval.respond":
+        return dispatch({ type: "runtime-request.respond", commandId: command.commandId, threadId: command.threadId, requestId: command.requestId, decision: command.decision });
+      case "thread.user-input.respond":
+        return dispatch({ type: "runtime-request.respond", commandId: command.commandId, threadId: command.threadId, requestId: command.requestId, answers: command.answers });
+      default:
+        return dispatch(command);
+    }
   }
 
   private async request<T>(
@@ -166,6 +260,7 @@ export class T3HttpClient {
         signal: requestSignal,
         headers: {
           accept: "application/json",
+          ...(authenticated && path.startsWith("/api/orchestration/") && this.cachedDescriptor?.orchestrationProtocolVersion === 2 ? { "x-t3-orchestration-protocol": "2" } : {}),
           ...(authenticated ? { authorization: `Bearer ${this.accessToken}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
@@ -180,6 +275,9 @@ export class T3HttpClient {
           path,
           errorCode(responseBody),
           errorMessage(responseBody, response.status, method, path),
+          errorField(responseBody, "reason"),
+          errorField(responseBody, "requiredScope"),
+          errorField(responseBody, "traceId"),
         );
       }
 

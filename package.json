@@ -15,14 +15,18 @@
     "test": "vitest run",
     "test:live": "T3_LIVE_TESTS=1 vitest run tests/live.integration.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "typecheck:test": "tsc -p tsconfig.test.json"
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "usage-summary": "tsx src/cli.ts usage-summary",
+    "benchmark:audit": "node scripts/benchmark-audit.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "ws": "^8.22.0",
     "zod": "^4.6.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.20.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.0"

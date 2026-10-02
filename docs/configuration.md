@@ -4,6 +4,8 @@
 
 Run the commands below from the repository root.
 
+For T3 orchestration protocol 2, the upstream URL must route HTTP API requests and WebSocket upgrades at `/ws`. The same `T3_ACCESS_TOKEN` authenticates both. See [orchestrator compatibility](orchestrator-compatibility.md) for version support and rollout checks.
+
 ## Run the gateway
 
 Install Node.js 20 or newer and pnpm, then build:

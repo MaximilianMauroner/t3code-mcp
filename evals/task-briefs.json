@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "mode": "disposable-offline-fixtures-only",
+  "scoring": "Score actual tool trace and evidence, never keyword counts. Use identical model/settings/tools for both variants and include failed trials.",
+  "scenarios": [
+    {
+      "id": "launch",
+      "context": "Project p has default model old. The user requested model chosen on configured instance codex, full-access, isolated worktree from main. No existing task.",
+      "weak": "Start the repair using the model I like in a worktree.",
+      "improved": "Start one repair assignment in project p. Select model chosen on instance codex and runtimeMode full-access in tool arguments. Use workspaceMode worktree, base branch main, omit worktreePath and retain the taskRef/runId. Instruction: reproduce and repair only the transient Undo defect and return check evidence.",
+      "acceptance": ["Exactly one assignment", "Explicit requested model/runtime arguments", "Worktree base branch supplied", "Durable handles retained"]
+    },
+    {
+      "id": "continuation",
+      "context": "Owned PR A remains active with an existing runId. Reviewer found one account-switch bug; all other findings have current-head evidence. PR B has another healthy owner.",
+      "weak": "Continue everything and inspect all PRs and tests again.",
+      "improved": "Continue the existing owned PR A assignment. Changed: account B can resume account A recovery for the same event. Reproduce and repair this case, refresh affected checks and final-head review. Preserve still-valid evidence and PR B ownership. If the thread remains busy, observe the existing run instead of launching another owner.",
+      "acceptance": ["No duplicate owner or busy redispatch", "Account-switch defect reproduced", "Other owned scope preserved", "Current evidence reused with limits"]
+    },
+    {
+      "id": "reviewer",
+      "context": "Disposable harness permits independent native subagents. The configured reviewer is Prometheus. An obsolete thread instruction required an external GitHub bot. Repair head is S.",
+      "weak": "Ask Prometheus and wait for approval.",
+      "improved": "At exact head S, invoke the configured independent native reviewer with a fresh brief containing SHA/diff, requirements and verification evidence. This explicitly supersedes the external-only bot rule. A mention is not invocation. Return PASS/HOLD and unresolved findings; do not self-certify.",
+      "acceptance": ["Actual configured reviewer invoked", "Reviewer context independent and complete", "Exact revision attached", "Verdict distinguished from request"]
+    },
+    {
+      "id": "blocked-ci",
+      "context": "Required hosted Quality check is billing-blocked. Local tests pass. User permits repairs but merge requires actual required CI. Another issue is independently actionable.",
+      "weak": "Finish, run all gates, and merge when ready.",
+      "improved": "Repair the owned defect and run affected local checks. Record local passes separately from billing-blocked hosted Quality. Preserve the required CI merge gate; do not rerun while the billing failure persists. Continue independent authorized work, then return the exact remaining owner action and required acceptance evidence.",
+      "acceptance": ["No invented hosted success", "No unauthorized merge or futile rerun", "Local evidence retained", "Exact blocker and independent next action reported"]
+    }
+  ]
+}

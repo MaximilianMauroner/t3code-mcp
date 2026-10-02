@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { summarizeForAudit, type AuditLog } from "./audit-log.js";
+import { settingsReceiptSchema, type SettingsReceipt } from "./settings.js";
 import type { FailureInfo } from "../gateway.js";
 
 export type OperationStatus = "prepared" | "accepted" | "uncertain" | "rejected";
@@ -43,6 +44,7 @@ export interface OperationRecord {
   readonly messageId?: string;
   readonly turnId?: string;
   readonly snoozedUntil?: string;
+  readonly settings?: SettingsReceipt;
   readonly t3Sequence?: number;
   readonly lastError?: string;
   readonly terminalRunStatus?: "failed";
@@ -96,6 +98,7 @@ export interface BeginOperationInput {
   readonly messageId?: string;
   readonly turnId?: string;
   readonly snoozedUntil?: string;
+  readonly settings?: SettingsReceipt;
 }
 
 export class IdempotencyConflictError extends Error {
@@ -233,6 +236,7 @@ export class OperationJournal {
       ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
       ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
       ...(input.snoozedUntil === undefined ? {} : { snoozedUntil: input.snoozedUntil }),
+      ...(input.settings === undefined ? {} : { settings: settingsReceiptSchema.parse(input.settings) }),
     };
     this.entries.set(input.idempotencyKey, record);
     await this.persist();
@@ -249,6 +253,7 @@ export class OperationJournal {
         payloadHash: input.payloadHash,
         projectId: input.projectId,
         threadId: input.threadId,
+        ...(record.settings === undefined ? {} : { settings: record.settings }),
       },
     });
     return { record, reused: false };
@@ -509,6 +514,7 @@ function isOperationRecord(value: unknown): value is OperationRecord {
     ["prepared", "accepted", "uncertain", "rejected"].includes(String(entry.status)) &&
     typeof entry.createdAt === "string" &&
     typeof entry.updatedAt === "string" &&
+    (entry.settings === undefined || settingsReceiptSchema.safeParse(entry.settings).success) &&
     (entry.terminalRunStatus === undefined
       ? entry.terminalFailure === undefined
       : entry.terminalRunStatus === "failed" && typeof entry.turnId === "string" &&

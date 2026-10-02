@@ -353,3 +353,49 @@ async function createRepositoryWithOrigin(): Promise<string> {
   await execute("git", ["push", "-u", "origin", "main"], { cwd: repository });
   return repository;
 }
+
+describe("MCP monitoring and launch guidance", () => {
+  it("tracks a launch through pending input and completion without duplicate dispatch or history reads", async () => {
+    const { fake, client } = await connectedClient();
+    fake.addProject({ id: "journey", workspaceRoot: "/missing-journey-workspace" });
+    const args = { projectId: "journey", title: "Repair", message: "Repair the owned defect", runtimeMode: "full-access", idempotencyKey: "journey-launch" };
+    const created = await client.callTool({ name: "t3_thread_create", arguments: args });
+    expect(created.isError).not.toBe(true);
+    const run = created.structuredContent as { threadId: string; runId: string; settings: { modelSource: string } };
+    expect(run.settings.modelSource).toBe("project_default");
+    const thread = fake.threads.find((candidate) => candidate.id === run.threadId)!;
+    thread.hasPendingUserInput = true;
+    const descriptorsBefore = fake.countRequests("/.well-known/t3/environment");
+    const snapshotsBefore = fake.countRequests(`/api/orchestration/threads/${run.threadId}`);
+    const pending = await client.callTool({ name: "t3_run_wait", arguments: { runId: run.runId, timeoutSeconds: 30 } });
+    expect(pending.structuredContent).toMatchObject({ pendingActions: { userInput: true }, monitoring: { observations: 1 } });
+    expect(fake.countRequests("/.well-known/t3/environment") - descriptorsBefore).toBe(2);
+    expect(fake.countRequests(`/api/orchestration/threads/${run.threadId}`) - snapshotsBefore).toBe(1);
+    const busy = await client.callTool({ name: "t3_thread_send", arguments: { threadId: run.threadId, message: "duplicate", idempotencyKey: "new-message" } });
+    expect(busy.isError).toBe(true);
+    thread.hasPendingUserInput = false;
+    thread.latestTurn = { ...thread.latestTurn!, state: "completed" };
+    thread.session = { status: "stopped" };
+    const done = await client.callTool({ name: "t3_run_wait", arguments: { runId: run.runId, timeoutSeconds: 30 } });
+    expect(done.structuredContent).toMatchObject({ runStatus: "completed", monitoring: { observations: 1 } });
+    await client.callTool({ name: "t3_thread_create", arguments: args });
+    expect(fake.dispatches.map((dispatch) => dispatch.command.type)).toEqual(["thread.create", "thread.turn.start"]);
+  });
+
+  it("attributes overlapping MCP requests to the correct caller", async () => {
+    const { fake, client, fixture } = await connectedClient();
+    fake.addProject({ id: "correlation" });
+    fake.addThread({ id: "correlated-thread", projectId: "correlation" });
+    await Promise.all([
+      client.callTool({ name: "t3_thread_get", arguments: { threadId: "correlated-thread" } }),
+      client.callTool({ name: "t3_projects_list", arguments: { limit: 10 } }),
+    ]);
+    const rows = (await readFile(`${fixture.directory}/audit.jsonl`, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const parents = new Map(rows.filter((row) => row.event === "tool.call").map((row) => [row.correlationId, row.operation]));
+    const requests = rows.filter((row) => row.event === "upstream.request");
+    expect(requests.length).toBeGreaterThan(2);
+    for (const row of requests) expect(row.parentOperation).toBe(parents.get(row.parentCorrelationId));
+    expect(requests.some((row) => row.parentOperation === "t3_thread_get")).toBe(true);
+    expect(requests.some((row) => row.parentOperation === "t3_projects_list")).toBe(true);
+  });
+});

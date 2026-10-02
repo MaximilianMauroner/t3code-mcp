@@ -1,8 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { T3HttpError, T3HttpClient } from "../src/t3/http-client.js";
 import { FakeT3 } from "./support/fake-t3.js";
 
 describe("T3HttpClient", () => {
+  it.each([
+    { status: 404, body: { _tag: "EnvironmentResourceNotFoundError", code: "not_found", reason: "thread_not_found", traceId: "trace-1" }, detail: "thread_not_found" },
+    { status: 403, body: { _tag: "EnvironmentScopeRequiredError", code: "insufficient_scope", requiredScope: "orchestration:read", traceId: "trace-2" }, detail: "requires orchestration:read" },
+    { status: 400, body: { _tag: "EnvironmentRequestInvalidError", code: "invalid_request", reason: "invalid_command", traceId: "trace-3" }, detail: "invalid_command" },
+  ])("preserves tagged upstream error details ($status)", async ({ status, body, detail }) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(body), { status }));
+    try {
+      const client = new T3HttpClient("http://127.0.0.1:3773", "test-token");
+      await expect(client.getSession()).rejects.toMatchObject({
+        status,
+        code: body.code,
+        reason: body.reason ?? null,
+        requiredScope: body.requiredScope ?? null,
+        traceId: body.traceId,
+        message: expect.stringContaining(detail),
+      });
+      expect(client.telemetry().lastError).toContain(detail);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("uses public descriptor discovery without auth and authenticates private RPCs", async () => {
     const fake = new FakeT3();
     await fake.start();
@@ -53,6 +75,8 @@ describe("T3HttpClient", () => {
     await fake.start();
     try {
       const client = new T3HttpClient(fake.baseUrl, fake.accessToken);
+      await client.getDescriptor();
+      const successfulDiscovery = client.telemetry().lastSuccessfulAt;
       await expect(
         client.dispatch({ type: "thread.archive", commandId: "command-1", threadId: "thread-1" }),
       ).rejects.toMatchObject<Partial<T3HttpError>>({
@@ -63,7 +87,7 @@ describe("T3HttpClient", () => {
         message: "already accepted",
       });
       expect(client.telemetry().lastError).toBe("already accepted");
-      expect(client.telemetry().lastSuccessfulAt).toBeNull();
+      expect(client.telemetry().lastSuccessfulAt).toBe(successfulDiscovery);
     } finally {
       await fake.close();
     }

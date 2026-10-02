@@ -56,7 +56,7 @@ These tools are available even when `MCP_READ_ONLY=true`; that setting prevents 
 | `archived` | Threads with an archive timestamp. This explicit filter includes archives even when `includeArchived` is false. |
 | `all` or omitted | No lifecycle filter; archives remain hidden unless `includeArchived=true`. |
 
-The gateway uses the lifecycle fields exposed by T3. The T3 UI also derives settlement from client preferences, inactivity, and linked PR state; those inputs are not available to these tools, so the settled/open lists can differ from the UI's automatic classification. Older servers with no lifecycle fields show unarchived threads as open. This behavior follows the server-backed portion of T3's `threadSettled.ts` and sidebar partitioning, inspected at source revision `4b8388773`.
+The gateway uses the lifecycle fields exposed by T3. On V1, the T3 UI also derives settlement from client preferences, inactivity, and linked PR state; those inputs are not available to these tools, so the settled/open lists can differ from the UI's automatic classification. V2 persists settlement on the server; the gateway reads those lifecycle fields. Older servers with no lifecycle fields show unarchived threads as open. This behavior follows the server-backed portion of T3's `threadSettled.ts` and sidebar partitioning, inspected at source revision `4b8388773`.
 
 Thread summaries include `status` (lifecycle), `statusReason`, `activity` (execution), `isRunning`, `quality` (`fresh`/`stale`/`incomplete`/`inconsistent`), `warning` when T3 signals disagree or are incomplete, `observedTurnId`/`observedAt`/`observedTarget` (`environmentId`/`threadId`/`turnId`/`observedAt`), project title, the raw settlement override, snooze time and snooze start, pin timestamp, session status and session update time, latest user-message time, latest turn, pending flags, actionable-plan flag, and background liveness (`working` or `monitoring` when T3 provides it). `hasConflictingSignals` is kept for compatibility and mirrors `quality=inconsistent`. Overview, detail, and run reads share this normalizer and never silently resolve contradictory fields. `t3_thread_get` combines the full thread with these shell fields and its latest response. Use `t3_thread_messages` for more history. `t3_providers_list` aggregates observed `instanceId`/`provider`/`model` labels, per-project defaults, and thread usage for thread creation.
 
@@ -70,9 +70,9 @@ The task journal stores the title, payload hash, stage, IDs, optional Git baseli
 
 The low-level thread tools remain available. Call `t3_providers_list` when a project has no default model. `t3_thread_create` requires its initial `message` and is a local MCP wrapper over ordinary T3 `thread.create` and `thread.turn.start` commands; empty thread creation is not exposed to MCP clients. In worktree mode, `branch` selects the base and `startFromOrigin` selects the local branch or its `origin` tracking commit. A local-mode `worktreePath` must already exist as a directory on the shared gateway/T3 filesystem. Use `t3_thread_send` only to continue an existing idle thread. Busy threads return `thread_busy`; uncertain low-level dispatches return a durable operation handle.
 
-Failed run, thread, and overview records include a structured `failure`. At upstream T3 commit `d15210cd3da79f9a1a495a6309d912d76362a046` (checked 2026-09-28), the orchestration thread snapshot provides `latestTurn.state`, and its session provides `lastError`, provider identity, and `activeTurnId`. The snapshot does not provide a failure code, category, reset time, or retry delay. The gateway therefore reports `category: "unknown"`, `code: null`, `resetAt: null`, and `retryAfter: null` for current T3 failures, even for a 429-looking message. If a later T3 response explicitly supplies those structured fields, the gateway passes through recognized categories and valid supplied times; it never derives quota or a reset time from HTTP status or message text. `source` identifies whether the message came from the matching T3 session or whether the gateway supplied a generic message for an errored T3 turn. Observed terminal turn failures are retained in the local journal, including after the session clears its error or the gateway reconnects. A failure observed only after T3 has moved to a later turn cannot be reconstructed from the current snapshot. Previous-turn assistant messages are never returned as the failed run's response.
+Failed run, thread, and overview records include a structured `failure`. At upstream T3 commit `d15210cd3da79f9a1a495a6309d912d76362a046` (checked 2026-09-28), the orchestration thread snapshot provides `latestTurn.state`, and its session provides `lastError`, provider identity, and `activeTurnId`. The snapshot does not provide a failure code, category, reset time, or retry delay. The gateway therefore reports `category: "unknown"`, `code: null`, `resetAt: null`, and `retryAfter: null` for those V1 failures, even for a 429-looking message. On V2, the gateway maps structured `usage_limit` failures to `quota`, `provider_error` to `provider_internal`, and passes through the supplied code and reset time. Other classes remain `unknown`; no category is guessed from error text. If a later T3 response explicitly supplies those structured fields, the gateway passes through recognized categories and valid supplied times; it never derives quota or a reset time from HTTP status or message text. `source` identifies whether the message came from the matching T3 session or whether the gateway supplied a generic message for an errored T3 turn. Observed terminal turn failures are retained in the local journal, including after the session clears its error or the gateway reconnects. A failure observed only after T3 has moved to a later turn cannot be reconstructed from the current snapshot. Previous-turn assistant messages are never returned as the failed run's response.
 
-`t3_thread_interrupt` works on threads started in T3's UI or by another client, without requiring a gateway `runId`. Read the thread and supply `threadId`, `expectedTurnId` (the `observedTarget.turnId`), and an `idempotencyKey`. The gateway rejects a changed or finished turn before dispatch (`turn_changed`/`thread_not_running` with current target details) and never automatically replays an uncertain interruption. Acceptance returns post-dispatch `verification` (`interrupted`/`still_running`/`target_changed`/`not_running`/`inconsistent`/`unknown`); acceptance alone never confirms a stop. T3 currently interrupts by provider session, so a turn change after the gateway's check remains a race; the expected turn ID is not an atomic upstream condition. Poll `t3_thread_get` to verify the outcome. Interruption does not archive or delete the conversation.
+`t3_thread_interrupt` works on threads started in T3's UI or by another client, without requiring a gateway `runId`. Read the thread and supply `threadId`, `expectedTurnId` (the `observedTarget.turnId`), and an `idempotencyKey`. The gateway rejects a changed or finished turn before dispatch (`turn_changed`/`thread_not_running` with current target details) and never automatically replays an uncertain interruption. Acceptance returns post-dispatch `verification` (`interrupted`/`still_running`/`target_changed`/`not_running`/`inconsistent`/`unknown`); acceptance alone never confirms a stop. V1 interrupts by provider session, so a turn change after the gateway's check remains a race. V2 sends `run.interrupt` with the observed T3 run ID. Poll `t3_thread_get` to verify the outcome. Interruption does not archive or delete the conversation.
 
 Snooze hides a thread from the inbox until its wake time; it never stops a running agent. `t3_thread_snooze` defaults to this evening (18:00 gateway-local) while meaningfully before evening, else tomorrow morning (09:00); presets `hour`, `three-hours`, `evening`, `tomorrow`, and `next-week` (Monday 09:00) match the T3 clients, or supply an explicit future ISO `snoozedUntil`. Threads blocked on you (pending approval/input) or with a queued turn start cannot be snoozed. `t3_thread_unsnooze` wakes immediately. `t3_thread_settle` marks a thread done and clears snooze and pin; it is blocked while the thread runs, has a pending approval, or has a queued turn start. `t3_thread_unsettle` reopens. All four are idempotent mutations with the same journal, read-only, and scope handling as the other control tools.
 
@@ -80,7 +80,7 @@ Thread deletion, workspace deletion, checkpoint rollback, and arbitrary terminal
 
 ## What is implemented
 
-The gateway uses T3’s authenticated HTTP orchestration API. The recorded integration target is T3 `v0.0.41-nightly.20260910.1507`; pin and test the version used by your deployment.
+The gateway supports T3 orchestration protocols 1 and 2. Protocol 2, introduced by [upstream PR #2829](https://github.com/pingdotgg/t3code/pull/2829), uses HTTP snapshot reads and authenticated WebSocket RPC for thread control. Protocol 1 retains HTTP dispatch for older deployments. The recorded live integration target is `v0.0.41-nightly.20260910.1507`; V2 has source-contract and local fixture coverage, with live verification still required. See [orchestrator compatibility](orchestrator-compatibility.md).
 
 - Project search and registration, thread search with lifecycle/execution/attention filters and deterministic sort, one-call bounded overviews with execution counts and highlights, provider discovery, thread creation with T3-accepted workspace, compact check-ins, and paginated messages with bounded text.
 - Direct read-only Git status, bounded staged/unstaged patches, and validated committed base-to-head comparison, resolved only from T3 project and thread workspace identity.
@@ -107,8 +107,58 @@ Preserve `T3_MCP_DATA_DIR` across gateway restarts. Run one gateway process per 
 
 ## Current limits
 
-Busy threads reject new turns; queueing and steering are not implemented. Pending-action details are inferred from T3 activity records and may include historical entries; the pending flags and available request IDs need to be considered together. The gateway does not provide a separate human-confirmation mechanism for approval responses. Composite task records cover only work started with `t3_task_start`; they do not reclassify every historical T3 thread as a task.
+Busy threads reject new turns; queueing and steering are not implemented. On V1, pending-action details are inferred from T3 activity records and may include historical entries; the pending flags and available request IDs need to be considered together. On V2, detail reads include only pending runtime requests with a live or message response capability. The gateway does not provide a separate human-confirmation mechanism for approval responses. Composite task records cover only work started with `t3_task_start`; they do not reclassify every historical T3 thread as a task.
 
 Run inspection relies on the journaled message/turn IDs and T3's latest-turn projection. Status for older runs or runs whose turn ID is not yet known can be incomplete. A provider-owned turn ID is not currently exposed.
 
 There are no terminal tools, managed command jobs, general file-reading tools, general-purpose Git mutation tools, MCP OAuth server, or multi-environment routing. The one scoped Git mutation is deterministic `git fetch`/`git worktree add` preparation for `workspaceMode=worktree`; worktrees are retained rather than automatically deleted because they may contain task changes. Git inspection and worktree preparation require the gateway and T3 workspaces to share a filesystem namespace; they do not work across an HTTP-only host boundary where T3's workspace paths are absent. Status item lists and diff bytes are bounded, and very large Git operations fail after 30 seconds instead of returning a partial result. The HTTP endpoint uses a static bearer token; use a trusted network, tunnel, or HTTPS reverse proxy for remote access. The gateway does not read T3's database or create provider sessions outside T3.
+
+## Launch settings and preflight
+
+Put a user's model and runtime preferences in `modelSelection` and `runtimeMode`, not in instruction prose. If no model preference exists, omission intentionally uses the project's default on creation or the current thread's model on follow-up. `t3_providers_list` reports observed selections; it is not a list of installed models or favorites. Do not guess provider option keys for reasoning effort. Use the keys supported by the configured T3 provider.
+
+An isolated assignment uses the **base branch** in `branch`; the gateway generates the task branch and path. For example, after resolving the real project ID and configured model:
+
+```json
+{
+  "projectId": "resolved-project-id",
+  "title": "Repair transient Undo",
+  "instruction": "Repair the owned Undo defect; reproduce it, verify the repair, and report evidence.",
+  "modelSelection": { "instanceId": "configured-instance", "model": "requested-model" },
+  "runtimeMode": "full-access",
+  "workspaceMode": "worktree",
+  "branch": "main",
+  "startFromOrigin": true,
+  "idempotencyKey": "unique-assignment-key"
+}
+```
+
+Fill placeholders from actual discovery. Omit `worktreePath` in worktree mode. Use `workspaceMode: "local"` to work in the current checkout; `startFromOrigin` applies only to worktree mode. Save the returned `taskRef`, `runId` and operation IDs. `t3_task_start` is the preferred composite task receipt; `t3_thread_create` provides the lower-level thread/run start without a composite task reference.
+
+New starts, sends and run observations include additive `settings` evidence. `requested` records explicit model/runtime arguments, `resolved` records the selection used to dispatch, and `modelSource`/`runtimeSource` distinguish explicit choices from project defaults and thread inheritance. `effective` is populated only when T3's snapshot attributes the settings to the matching current turn. `state: "unresolved"` does not claim provider acceptance or observed configuration; `matchesResolved: false` surfaces a mismatch. These are observed T3 thread settings, not independent proof of the provider execution model or effective reasoning effort. Historical receipts without settings remain readable. Provider options and reasoning effort are deliberately omitted from the receipt because the gateway cannot establish their effective meaning from the upstream projection.
+
+## Monitoring recipe
+
+1. Start once and retain the durable handles. Accepted intent is not completed work.
+2. For a known gateway run, call `t3_run_wait` for a bounded interval. It returns on status, response identity, approval/input, observation quality or connection changes. A response text update on the same assistant message ID is not a change trigger.
+3. Stop waiting when input/approval is needed, the run is terminal, or the connection is lost. Inspect pending actions or the changed response as appropriate. Fetch message history only when more context is needed.
+4. On unchanged windows, back off between calls, communicate useful progress, and continue independent work. Avoid multiple monitors for the same run. For project-wide triage use bounded `t3_threads_overview`, then fetch detail for changed or attention-requiring threads.
+5. On uncertainty reconcile the original handle using `t3_task_get` or `t3_run_get`; keep the original idempotency key and identical payload if a retry is necessary. A busy rejection is a reason to observe existing work, not create a duplicate thread. Do not interrupt work merely because a wait timed out.
+
+The gateway backs off from 500 ms to 1 second and then at most 2 seconds between healthy observations. Environment identity is checked at entry and exit and reused only within the bounded read. Independent reads and mutations retain their normal checks. `monitoring` reports observations, requested timeout and actual elapsed milliseconds. An in-flight request can extend the timeout; strict wall-clock cancellation and push notifications are not provided.
+
+## Usage analysis
+
+Run offline without T3/MCP credentials:
+
+```bash
+pnpm usage-summary --file ./data/audit.jsonl --since 2026-09-18T00:00:00Z --until 2026-09-30T21:13:16.337Z
+```
+
+The command reads a fixed byte snapshot without altering the log or contacting T3. It reports the window, invalid lines, explicit denominators, calls/errors/latency by tool and endpoint, model omissions, active wait timeouts, measured observation counts, and successive successful same-thread detail comparisons in file order (which can bridge failed reads). Omission may intentionally use defaults; unchanged state is not proof of waste. Tool completion is not independent task success, and request counts do not establish token or financial savings.
+
+New downstream audit events include `parentCorrelationId` and `parentOperation` from an async-local MCP context, keeping concurrent callers isolated. Historical events without parents remain explicitly unattributed. Median and p95 latencies are fixed-histogram upper bounds; means/minima/maxima are exact. Operation groups and tracked thread comparisons have fixed caps; thread-state evictions are reported. The audit tool streams filtering/pagination while preserving append order, filtered offsets, total matches and invalid-line counts. A query still scans the snapshot to compute totals but does not retain the full history. Appends are visible on the next query. Rotation/deletion is not performed.
+
+Run `pnpm build` then `pnpm benchmark:audit` for a disposable large-file benchmark under a 32 MB JavaScript heap. The benchmark never reads live history or dispatches tasks.
+
+See [task briefs and evaluation](task-briefs.md) for launch and continuation prompt examples.
