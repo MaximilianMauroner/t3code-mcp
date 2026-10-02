@@ -467,6 +467,19 @@ export class OperationJournal {
     return failure;
   }
 
+  async clearTerminalFailure(threadId: string, turnId: string): Promise<void> {
+    await this.init();
+    let changed = this.threadFailures.delete(`${threadId}\u0000${turnId}`);
+    for (const entry of this.entries.values()) {
+      if (entry.kind !== "thread.turn.start" || entry.threadId !== threadId ||
+        entry.turnId !== turnId || (entry.terminalRunStatus === undefined && entry.terminalFailure === undefined)) continue;
+      const { terminalRunStatus, terminalFailure, ...recovered } = entry;
+      this.entries.set(entry.idempotencyKey, { ...recovered, updatedAt: new Date().toISOString() });
+      changed = true;
+    }
+    if (changed) await this.persist();
+  }
+
   private async persist(): Promise<void> {
     const run = this.writing.then(async () => {
       const tempPath = join(dirname(this.filePath), `.${this.filePath.split("/").at(-1) ?? "journal"}.${randomUUID()}.tmp`);

@@ -1581,6 +1581,10 @@ export class T3Gateway {
           current.threadId, current.t3TurnId, current.failure, current.operationId,
         ) };
       }
+      if (current.threadId && current.t3TurnId &&
+        (current.runStatus === "completed" || current.runStatus === "interrupted")) {
+        await this.journal.clearTerminalFailure(current.threadId, current.t3TurnId);
+      }
     }
     const result: RunResult = {
       ...current,
@@ -2236,6 +2240,10 @@ export class T3Gateway {
   }
 
   private async withRetainedFailure<T extends ThreadSummary>(summary: T): Promise<T> {
+    if (summary.latestTurn?.state === "completed" || summary.latestTurn?.state === "interrupted") {
+      await this.journal.clearTerminalFailure(summary.id, summary.latestTurn.turnId);
+      return { ...summary, failure: null };
+    }
     if (summary.failure === null || summary.failure.turnId === null ||
       (summary.latestTurn !== null && summary.latestTurn.state !== "error")) return summary;
     const retained = await this.journal.retainTerminalFailure(
@@ -2263,6 +2271,8 @@ export class T3Gateway {
       }
       const latestTurn = thread.latestTurn ?? null;
       const sameTurn = latestTurn !== null && turnId !== null && latestTurn.turnId === turnId;
+      const recovered = sameTurn && (latestTurn.state === "completed" || latestTurn.state === "interrupted");
+      if (recovered && boundedEnvironmentId === undefined) await this.journal.clearTerminalFailure(thread.id, turnId);
       const matchingSessionFailure = latestTurn === null && turnId !== null
         ? failureInfo(thread, turnId)
         : null;
@@ -2280,12 +2290,12 @@ export class T3Gateway {
                 : "accepted";
       const observedFailure = turnId === null ? null : failureInfo(thread, turnId);
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
-      const failure = turnId !== null && (observedFailure !== null || priorFailure !== null)
+      const failure = recovered ? null : turnId !== null && (observedFailure !== null || priorFailure !== null)
         ? boundedEnvironmentId === undefined
           ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId)
           : observedFailure ?? priorFailure
         : record.terminalFailure ?? null;
-      const runStatus = record.terminalRunStatus === "failed" || failure !== null
+      const runStatus = !recovered && (record.terminalRunStatus === "failed" || failure !== null)
         ? "failed"
         : observedRunStatus;
       return {
@@ -2945,7 +2955,8 @@ function threadDetail(
       ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
         summary.latestTurn?.state === "error"));
   const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? thread : summary ?? thread;
-  const fullFailure = source.latestTurn?.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
+  const fullFailure = source.latestTurn?.state === "error" &&
+    source.latestTurn.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
   const shellFailure = failureInfo(source);
   return {
     ...threadSummary(source, projectTitle, environmentId, now),

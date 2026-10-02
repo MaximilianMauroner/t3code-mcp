@@ -133,11 +133,11 @@ describe("structured provider failures", () => {
     const turnId = thread.latestTurn!.turnId;
     thread.latestTurn = { ...thread.latestTurn!, state: "error" };
     thread.session = { status: "ready" };
-    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project /mnt/customer/project /opt/service/secret C:\\customer\\secret \\\\server\\share\\secret \"C:\\Program Files\\customer\\secret\" 10.2.3.4:8317 paths: [/mnt/customer/project/secret.ts] failed {/opt/service/secret} /mnt/customer/name,with,commas.ts', turnId));
+    thread.messages.push(assistantMessage('API Error: auth_unavailable: Basic private-basic refresh_token=private-refresh /home/private/project /mnt/customer/project /opt/service/secret C:\\customer\\secret \\\\server\\share\\secret \"C:\\Program Files\\customer\\secret\" 10.2.3.4:8317 paths: [/mnt/customer/project/secret.ts] failed {/opt/service/secret} /mnt/customer/name,with,commas.ts OPENAI_API_KEY=vendor-private ANTHROPIC_API_KEY: vendor-private MY_ACCESS_TOKEN=vendor-private {"MY_ACCESS_TOKEN":"vendor-private"}', turnId));
     const observed = await fixture.gateway.runGet(run.runId);
-    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
-    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
-    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(JSON.stringify(observed.failure)).not.toMatch(/private-basic|private-refresh|vendor-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(observed.latestResponse?.text).not.toMatch(/private-basic|private-refresh|vendor-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
+    expect(await readFile(join(fixture.directory, "operations.json"), "utf8")).not.toMatch(/private-basic|private-refresh|vendor-private|home\/private|customer|service\/secret|server|share|Program Files|10\.2\.3\.4/);
   });
 
   it("prefers a specific V1 provider error over a generic activity class", async () => {
@@ -180,7 +180,7 @@ describe("structured provider failures", () => {
   });
 
   it("clears an earlier same-turn shell failure after the full snapshot has recovered", async () => {
-    const { fixture, thread } = await setup(false);
+    const { fixture, thread, run, fake } = await setup(false);
     const turnId = thread.latestTurn!.turnId;
     thread.latestTurn = { ...thread.latestTurn!, state: "error" };
     thread.session = { status: "error", activeTurnId: turnId, lastError: "Older failure" };
@@ -193,6 +193,39 @@ describe("structured provider failures", () => {
     expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]).toMatchObject({ latestTurn: { state: "completed" }, failure: null });
     expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]).toMatchObject({ latestTurn: { state: "completed" }, failure: null });
     expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { state: "completed" }, failure: null });
+    expect(await fixture.gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
+    expect(await makeGateway(fixture.config).gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
+    await fake.close();
+    expect(await makeGateway(fixture.config).gateway.runGet(run.runId)).toMatchObject({ runStatus: "unknown", failure: null });
+  });
+
+  it.each(["completed", "interrupted"] as const)("clears a full failure when the later shell is %s", async (state) => {
+    const { fixture, thread, run, fake } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Earlier failure" };
+    const failed = structuredClone(await fixture.client.getThread(thread.id));
+    await fixture.gateway.runGet(run.runId);
+    thread.latestTurn = { ...thread.latestTurn!, state, completedAt: new Date().toISOString() };
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    thread.updatedAt = new Date(Date.now() + 1000).toISOString();
+    fixture.client.getThread = async () => failed;
+    expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { state }, failure: null });
+    await fake.close();
+    expect(await makeGateway(fixture.config).gateway.runGet(run.runId)).toMatchObject({ runStatus: "unknown", failure: null });
+  });
+
+  it("clears a retained run failure when a direct full read proves completion", async () => {
+    const { fixture, thread, run, fake } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Earlier run failure" };
+    await fixture.gateway.runGet(run.runId);
+    thread.latestTurn = { ...thread.latestTurn!, state: "completed", completedAt: new Date().toISOString() };
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    expect(await fixture.gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
+    await fake.close();
+    expect(await makeGateway(fixture.config).gateway.runGet(run.runId)).toMatchObject({ runStatus: "unknown", failure: null });
   });
 
   it("keeps a newer same-turn shell failure when the earlier full read was still running", async () => {
