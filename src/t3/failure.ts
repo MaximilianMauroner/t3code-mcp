@@ -17,6 +17,7 @@ const ErrorActivity = z.object({
 const ProviderError = z.object({ error: z.object({ type: z.string().optional(), code: z.string().optional() }) });
 
 export function categoryForFailure(errorClass?: string | null, code?: string | null, message?: string): FailureCategory {
+  code ??= message ? providerCode(message) : null;
   if (code === "credits_required" || code === "auth_unavailable" || code === "authentication_error" ||
       message === "API Error: Request rejected (429) · Usage credits are required for this model.") return "auth_billing";
   if (code === "api_error_429") return "unknown";

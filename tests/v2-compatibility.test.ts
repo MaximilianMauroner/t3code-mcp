@@ -349,6 +349,17 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ category: "quota", source: "t3_session", resetAt: providerFailures.codexUsageLimit.resetAt });
   });
 
+  it.each([
+    ["API Error: rate_limit_error: Too many requests", "rate_limit"],
+    ["API Error: 503 auth_unavailable: No available credentials", "auth_billing"],
+    ["API Error: 429", "unknown"],
+  ])("preserves explicit provider types in shell-only text: %s", async (message, category) => {
+    const { gateway, shell } = await setup();
+    Object.assign(shell.threads[0]!, { latestRunId: "failed-run", activeRunId: null, status: "failed", lastError: message, lastErrorClass: "usage_limit" });
+    const rows = await gateway.threadsList({ includeArchived: false, detail: "summary", limit: 5 });
+    expect(rows.page.items[0]?.failure).toMatchObject({ category, class: "usage_limit", source: "t3_session", resetAt: null });
+  });
+
   it("does not bind a distinct V2 session error to the shell's latest run", async () => {
     const { gateway, shell } = await setup();
     Object.assign(shell.threads[0]!, { latestRunId: "old-failed-run", activeRunId: null, status: "failed", lastError: "New unbound session error", lastErrorClass: null, usageLimitResetAt: null });
