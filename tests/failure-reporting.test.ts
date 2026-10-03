@@ -41,7 +41,7 @@ async function setup(previousResponse = true) {
 }
 
 describe("structured provider failures", () => {
-  it.each(["summary", "full", "overview"])("batches recovery persistence for a %s read", async (reader) => {
+  it.each(["summary", "full", "overview"] as const)("batches recovery persistence for a %s read", async (reader) => {
     const { fixture, fake, thread } = await setup(false);
     for (let index = 0; index < 24; index += 1) {
       fake.addThread({ id: `finished-${index}`, projectId: thread.projectId,
