@@ -424,6 +424,11 @@ export class OperationJournal {
     )?.terminalFailure ?? null;
   }
 
+  async getFailureEvidenceOrder(threadId: string, turnId: string): Promise<FailureEvidenceOrder | undefined> {
+    await this.init();
+    return this.threadFailures.get(`${threadId}\u0000${turnId}`)?.order;
+  }
+
   async orderFailureEvidence(threadId: string, turnId: string | null | undefined, order: FailureEvidenceOrder): Promise<FailureEvidenceOrder> {
     await this.init();
     const retained = turnId ? this.threadFailures.get(`${threadId}\u0000${turnId}`) : undefined;

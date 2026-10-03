@@ -1627,6 +1627,10 @@ export class T3Gateway {
       if (current.threadId && current.t3TurnId &&
         (current.runStatus === "completed" || current.runStatus === "interrupted")) {
         await this.journal.clearTerminalFailure(current.threadId, current.t3TurnId, current.runStatus, failureOrder);
+        const retainedFailure = await this.journal.getFailureByTurnId(current.threadId, current.t3TurnId);
+        current = { ...current, failure: retainedFailure,
+          runStatus: retainedFailure ? "failed" : await this.journal.getRecoveryByTurnId(current.threadId, current.t3TurnId) ?? current.runStatus,
+          latestResponse: retainedFailure ? null : current.latestResponse };
       }
     }
     const result: RunResult = {
@@ -2531,9 +2535,14 @@ export class T3Gateway {
         } else {
           observed = await this.withRetainedFailure(fullSummary, fullOrder);
         }
+        const retainedOrder = summary.observedTurnId
+          ? await this.journal.getFailureEvidenceOrder(summary.id, summary.observedTurnId) : undefined;
+        const fullIsNewer = retainedOrder === undefined || compareFailureOrder(
+          await this.journal.orderFailureEvidence(summary.id, summary.observedTurnId, fullOrder), retainedOrder,
+        ) >= 0;
         const enriched = sameTurn && sameState
           ? { ...summary, failure: observed.failure }
-          : { ...summary, failure: null };
+          : { ...summary, failure: fullIsNewer ? null : summary.failure };
         const latest = sameTurn && sameState ? latestAssistant(snapshot.thread.messages, summary.observedTurnId)
           ?? (summary.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
             ? latestAssistant(snapshot.thread.messages, null, true) : null) : null;
@@ -2544,7 +2553,13 @@ export class T3Gateway {
       }
     }
     await this.journal.clearTerminalFailures(recoveries);
-    return results;
+    // Reconcile after clearing: a concurrent newer failure can reject the
+    // recovery after the comparison used to enrich the row.
+    return Promise.all(results.map(async (result) => {
+      const turnId = result.latestTurn?.state === "error" ? result.latestTurn.turnId : null;
+      if (turnId === null || !recoveries.some((recovery) => recovery.threadId === result.id && recovery.turnId === turnId)) return result;
+      return { ...result, failure: await this.journal.getFailureByTurnId(result.id, turnId) };
+    }));
   }
 
   private async findRun(runId: string): Promise<OperationRecord | null> {
