@@ -48,6 +48,9 @@ describe("structured provider failures", () => {
     expect((await fixture.gateway.runGet(run.runId)).failure).not.toBeNull();
     thread.latestTurn = { ...thread.latestTurn!, state: "completed" };
     thread.session = { status: "ready", lastError: null };
+    const recoveredShell = structuredClone(await fixture.client.getShell());
+    recoveredShell.snapshotSequence += 1;
+    fixture.client.getShell = async () => recoveredShell;
     if (reader === "list") {
       expect((await fixture.gateway.threadsList({ includeArchived: false, activity: "failed", limit: 5 })).page.items).toHaveLength(0);
     } else {
