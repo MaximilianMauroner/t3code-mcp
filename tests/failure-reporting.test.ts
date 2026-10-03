@@ -659,6 +659,42 @@ describe("structured provider failures", () => {
     expect(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId)).toMatchObject(expected);
   });
 
+  it.each([
+    ["run", "updated"], ["thread", "updated"], ["list", "updated"], ["overview", "updated"],
+    ["run", "cleared"], ["run", "omitted"],
+  ] as const)("replaces same-reason V1 full session metadata through %s (%s)", async (reader, metadata) => {
+    const { fixture, fake, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Provider refusal", lastErrorClass: "provider_error",
+      failureCode: "rate_limit_error", resetAt: "2026-10-04T00:00:00Z", retryAfter: "300" };
+    const older = structuredClone(await fixture.client.getThread(thread.id));
+    older.snapshotSequence = 100;
+    fixture.client.getThread = async () => older;
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ code: "rate_limit_error", category: "rate_limit" });
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Provider refusal", lastErrorClass: "provider_error",
+      ...(metadata === "updated" ? { failureCode: "credits_required", resetAt: "2026-10-05T00:00:00Z", retryAfter: "600" }
+        : metadata === "cleared" ? { failureCode: null, resetAt: null, retryAfter: null } : {}) };
+    const newer = { ...older, snapshotSequence: 101, thread: structuredClone(thread) };
+    fixture.client.getThread = async () => newer;
+    const expected = { source: "t3_session", turnId, message: "Provider refusal", class: "provider_error",
+      category: metadata === "updated" ? "auth_billing" : "provider_error",
+      code: metadata === "updated" ? "credits_required" : null,
+      resetAt: metadata === "updated" ? "2026-10-05T00:00:00.000Z" : null,
+      retryAfter: metadata === "updated" ? "600" : null };
+    if (reader === "run") expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    else if (reader === "thread") expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    else if (reader === "list") expect((await fixture.gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
+    else expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject(expected);
+    fixture.client.getThread = async () => older;
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    const restarted = makeGateway(fixture.config);
+    expect(await restarted.journal.getFailureByTurnId(thread.id, turnId)).toMatchObject(expected);
+    expect(await restarted.journal.getFailureEvidenceOrder(thread.id, turnId)).toMatchObject({ snapshotSequence: 101 });
+    await fake.close();
+    expect((await restarted.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+  });
+
   it.each([99, 100])("keeps V1 full session evidence when shell sequence %s is not newer", async (sequence) => {
     const { fixture, thread } = await setup(false);
     const turnId = thread.latestTurn!.turnId;

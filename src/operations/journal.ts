@@ -472,7 +472,7 @@ export class OperationJournal {
     const laterV1Evidence = comparison !== null && comparison > 0 &&
       candidate.source === existing?.source &&
       (candidate.source === "t3_activity" || candidate.source === "t3_message" ||
-        (candidate.source === "t3_session" && (!sameReason || candidate.class !== existing.class)));
+        (candidate.source === "t3_session" && (order?.scope === "full" || !sameReason || candidate.class !== existing.class)));
     const matchingShell = order?.scope === "shell" && existing != null &&
       (order.protocolVersion === 2 || (candidate.source === "t3_session" && existing.source === "t3_session")) &&
       sameReason &&
