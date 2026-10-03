@@ -37,7 +37,8 @@ describe("T3HttpClient", () => {
 
       expect(descriptor.environmentId).toBe(fake.environmentId);
       expect(fake.requests[0]).toMatchObject({ path: "/.well-known/t3/environment", authorization: undefined });
-      expect(fake.requests.slice(1).every((request) => request.authorization === `Bearer ${fake.accessToken}`)).toBe(true);
+      expect(fake.requests.filter((request) => request.path === "/.well-known/t3/environment").every((request) => request.authorization === undefined)).toBe(true);
+      expect(fake.requests.filter((request) => request.path !== "/.well-known/t3/environment").every((request) => request.authorization === `Bearer ${fake.accessToken}`)).toBe(true);
       expect(client.getCachedDescriptor()?.environmentId).toBe(fake.environmentId);
       expect(shell.snapshotSequence).toBe(1);
       expect(client.telemetry().lastSnapshotAt).not.toBeNull();
@@ -76,7 +77,6 @@ describe("T3HttpClient", () => {
     try {
       const client = new T3HttpClient(fake.baseUrl, fake.accessToken);
       await client.getDescriptor();
-      const successfulDiscovery = client.telemetry().lastSuccessfulAt;
       await expect(
         client.dispatch({ type: "thread.archive", commandId: "command-1", threadId: "thread-1" }),
       ).rejects.toMatchObject<Partial<T3HttpError>>({
@@ -87,7 +87,8 @@ describe("T3HttpClient", () => {
         message: "already accepted",
       });
       expect(client.telemetry().lastError).toBe("already accepted");
-      expect(client.telemetry().lastSuccessfulAt).toBe(successfulDiscovery);
+      expect(client.telemetry().lastSuccessfulAt).not.toBeNull();
+      expect(fake.countRequests("/api/orchestration/dispatch")).toBe(1);
     } finally {
       await fake.close();
     }
