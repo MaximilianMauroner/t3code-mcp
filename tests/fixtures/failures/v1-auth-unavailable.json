@@ -1,0 +1,7 @@
+{
+  "id": "provider-error",
+  "role": "assistant",
+  "turnId": "failed-turn",
+  "text": "API Error: 503 auth_unavailable: no auth available (providers=claude, model=claude-opus-5-5; last upstream error: token: [REDACTED] \"error_description\": \"Refresh token: [REDACTED]); check Claude auth/key session and cooldown state via /v0/management/auth-files. This is a server-side issue, usually temporary; try again in a moment. If it persists, check your inference gateway ([REDACTED HOST]).",
+  "createdAt": "2026-09-27T07:30:16.657Z"
+}

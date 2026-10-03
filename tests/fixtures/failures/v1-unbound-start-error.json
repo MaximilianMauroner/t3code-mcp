@@ -1,0 +1,41 @@
+{
+  "latestTurn": {
+    "turnId": "failed-turn",
+    "state": "error",
+    "requestedAt": "2026-09-29T20:21:50.814Z",
+    "startedAt": "2026-09-29T20:21:50.814Z",
+    "completedAt": "2026-09-29T20:47:27.058Z",
+    "assistantMessageId": null
+  },
+  "session": {
+    "status": "error",
+    "activeTurnId": null,
+    "lastError": "ProviderUnsupportedError: Provider 'codex' is not implemented",
+    "updatedAt": "2026-09-29T20:48:17.904Z"
+  },
+  "activities": [
+    {
+      "id": "error-0",
+      "tone": "error",
+      "kind": "provider.turn.start.failed",
+      "summary": "Provider turn start failed",
+      "payload": {
+        "detail": "ProviderUnsupportedError: Provider 'codex' is not implemented"
+      },
+      "turnId": null,
+      "createdAt": "2026-09-29T20:48:08.246Z"
+    },
+    {
+      "id": "error-1",
+      "tone": "error",
+      "kind": "provider.turn.start.failed",
+      "summary": "Provider turn start failed",
+      "payload": {
+        "detail": "ProviderUnsupportedError: Provider 'codex' is not implemented"
+      },
+      "turnId": null,
+      "createdAt": "2026-09-29T20:48:17.904Z"
+    }
+  ],
+  "messages": []
+}

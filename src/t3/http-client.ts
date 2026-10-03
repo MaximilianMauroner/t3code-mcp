@@ -118,13 +118,16 @@ export class T3HttpClient {
     if (await this.protocolVersion(signal) === 2) {
       const snapshot = await this.request("GET", "/api/orchestration/shell", undefined, V2ShellSchema, signal, true);
       const archived = await this.rpc("orchestration.getArchivedShellSnapshot", {}, V2ArchivedShellSchema, signal);
-      const threads = [...snapshot.threads, ...snapshot.archivedThreads, ...archived.threads];
+      const threads = [
+        ...[...snapshot.threads, ...snapshot.archivedThreads].map((thread) => normalizeV2ShellThread(thread, snapshot.snapshotSequence)),
+        ...archived.threads.map((thread) => normalizeV2ShellThread(thread, archived.snapshotSequence)),
+      ];
       const unique = new Map(threads.map((thread) => [thread.id, thread]));
       this.lastSnapshotAt = Date.now();
       return {
         snapshotSequence: Math.max(snapshot.snapshotSequence, archived.snapshotSequence),
         projects: snapshot.projects,
-        threads: [...unique.values()].map(normalizeV2ShellThread),
+        threads: [...unique.values()],
         updatedAt: new Date(this.lastSnapshotAt).toISOString(),
       };
     }
