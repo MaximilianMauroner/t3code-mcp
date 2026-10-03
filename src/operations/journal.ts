@@ -485,7 +485,11 @@ export class OperationJournal {
     let nextOrder = reasonOrder && runIdentity ? { ...reasonOrder, runIdentity } : reasonOrder;
     if (nextOrder && retained?.order?.protocolVersion === nextOrder.protocolVersion &&
       (retained.order.protocolStartedAt ?? 0) === (nextOrder.protocolStartedAt ?? 0)) {
-      nextOrder = { ...nextOrder, readStartedAt: Math.max(nextOrder.readStartedAt ?? 0, retained.order.readStartedAt ?? 0) };
+      // A matching shell proves the protocol admission even when the full
+      // record still supplies stronger failure fields and item ordering.
+      const shellAdmission = matchingShell && order?.protocolVersion === nextOrder.protocolVersion &&
+        (order.protocolStartedAt ?? 0) === (nextOrder.protocolStartedAt ?? 0) ? order.readStartedAt ?? 0 : 0;
+      nextOrder = { ...nextOrder, readStartedAt: Math.max(nextOrder.readStartedAt ?? 0, retained.order.readStartedAt ?? 0, shellAdmission) };
     }
     if (runIdentity) merged = { ...merged, ...runIdentity };
     const admittedModel = operation?.settings?.resolved.modelSelection;

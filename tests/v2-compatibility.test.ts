@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
@@ -395,6 +395,28 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.projection.turnItems[0]!.failure = { class: failure.class, code: "api_error_429", message: "Different older error", retryable: true };
     expect((await gateway.runGet(sent.runId)).failure).toMatchObject(expected);
     expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+  });
+
+  it("uses matching weaker shell admission to reject a delayed other-protocol reason without a rewrite", async () => {
+    const { gateway, snapshot, journal, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "shell-admission" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "admission", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    const fullFailure = (await gateway.runGet(sent.runId)).failure!;
+    const admission = Date.now() + 10_000;
+    await journal.retainTerminalFailure("thread-1", run.id, fullFailure, undefined,
+      { protocolVersion: 2, scope: "full", snapshotSequence: 10, readStartedAt: admission });
+    const path = join(config.dataDir, "operations.json");
+    const before = await readFile(path, "utf8");
+    expect(await journal.retainTerminalFailure("thread-1", run.id,
+      { ...fullFailure, source: "t3_session", code: null, retry: null, retryable: null }, undefined,
+      { protocolVersion: 2, scope: "shell", snapshotSequence: 10, readStartedAt: admission + 200 })).toEqual(fullFailure);
+    expect(await journal.retainTerminalFailure("thread-1", run.id,
+      { ...fullFailure, source: "t3_session", message: "Delayed old-protocol failure", code: null }, undefined,
+      { protocolVersion: 1, scope: "full", snapshotSequence: 100, readStartedAt: admission + 100 })).toEqual(fullFailure);
+    expect(await readFile(path, "utf8")).toBe(before);
   });
 
   it("replaces an older root with a newer bound shell reason without mixing failure metadata", async () => {
