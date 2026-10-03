@@ -132,17 +132,7 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
       (host) => isIP(host) === 6 ? "[REDACTED HOST]" : host)
     .replace(/\b(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z][a-z\d-]*(?::\d+)?\b/gi, "[REDACTED HOST]")
     .replace(/\b[a-z][a-z\d-]*:\d{1,5}\b/gi, "[REDACTED HOST]");
-  return sanitizeFailureIdentifierText(redacted, maxLength);
-}
-
-// Provider and model IDs can contain dots, slashes, and colons. They are
-// structured attribution, so only redact secrets and remove control characters.
-export function sanitizeFailureIdentifier(value: string): string {
-  return sanitizeFailureIdentifierText(value, 200);
-}
-
-function sanitizeFailureIdentifierText(value: string, maxLength: number): string {
-  return value
+  return redacted
     .replace(/(["'])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [REDACTED]")
@@ -150,4 +140,10 @@ function sanitizeFailureIdentifierText(value: string, maxLength: number): string
     .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .slice(0, maxLength);
+}
+
+// Structured provider/model IDs can contain dots, slashes, colons, and
+// credential words. Bound their size and remove controls without changing identity.
+export function sanitizeFailureIdentifier(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 200);
 }

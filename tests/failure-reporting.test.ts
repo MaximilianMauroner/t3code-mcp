@@ -158,8 +158,7 @@ describe("structured provider failures", () => {
       { protocolVersion: firstProtocol, scope: "full", snapshotSequence: 100, readStartedAt: 1 })).toBeNull();
   });
 
-  it("preserves dotted model identity on admitted V1 failures", async () => {
-    const model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
+  it.each(["anthropic.claude-3-5-sonnet-20240620-v1:0", "vendor.token:0", "azure.openai.api-key:deployment"])("preserves structured V1 model ID %s", async (model) => {
     const { fixture, thread, run } = await setup(false, model);
     thread.latestTurn = { ...thread.latestTurn!, state: "error" };
     thread.session = { status: "error", activeTurnId: thread.latestTurn.turnId, lastError: "API Error: auth_unavailable: db.internal" };

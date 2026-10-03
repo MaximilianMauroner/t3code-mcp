@@ -303,11 +303,10 @@ describe("merged orchestrator V2 boundary", () => {
     expect(normalized.latestTurn?.turnId).toBe("cancelled-successor");
   });
 
-  it("preserves structured dotted V2 run identity through shell enrichment and restart", async () => {
+  it.each(["anthropic.claude-3-5-sonnet-20240620-v1:0", "vendor.token:0", "azure.openai.api-key:deployment"])("preserves structured V2 model ID %s through shell enrichment and restart", async (model) => {
     const { gateway, snapshot, shell, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "dotted-model" });
     const run = snapshot.projection.runs[0]!;
-    const model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
     Object.assign(run, { status: "failed", providerInstanceId: "bedrock.instance", modelSelection: { model }, completedAt: now });
     snapshot.projection.turnItems.push({ id: "dotted", type: "error", ordinal: 1, status: "failed", runId: run.id,
       nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
