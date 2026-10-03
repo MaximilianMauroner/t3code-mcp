@@ -108,8 +108,8 @@ function buildFailure(
     class: payload.class ? sanitizeFailureText(payload.class, 200) : null,
     code: code ? sanitizeFailureText(code, 200) : null,
     message: sanitizeFailureText(message, 2_000),
-    provider: provider === null ? null : sanitizeFailureText(provider, 200),
-    model: sanitizeFailureText(model, 200), turnId,
+    provider: provider === null ? null : sanitizeFailureIdentifier(provider),
+    model: sanitizeFailureIdentifier(model), turnId,
     resetAt: payload.resetAt && Number.isFinite(Date.parse(payload.resetAt))
       ? new Date(Date.parse(payload.resetAt)).toISOString() : null,
     retryAfter: payload.retryAfter == null ? null : sanitizeFailureText(String(payload.retryAfter), 200),
@@ -120,7 +120,7 @@ function buildFailure(
 }
 
 export function sanitizeFailureText(value: string, maxLength: number): string {
-  return value
+  const redacted = value
     .replace(/\n\s+at\s[^\n]*/g, "")
     .replace(/(?:https?|file):\/\/[^\s)]+/gi, "[REDACTED URL]")
     .replace(/(["'])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1/g, "$1[REDACTED PATH]$1")
@@ -131,7 +131,18 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
     .replace(/(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f:.]+(?:%[\w.-]+)?(?![\w:])/gi,
       (host) => isIP(host) === 6 ? "[REDACTED HOST]" : host)
     .replace(/\b(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z][a-z\d-]*(?::\d+)?\b/gi, "[REDACTED HOST]")
-    .replace(/\b[a-z][a-z\d-]*:\d{1,5}\b/gi, "[REDACTED HOST]")
+    .replace(/\b[a-z][a-z\d-]*:\d{1,5}\b/gi, "[REDACTED HOST]");
+  return sanitizeFailureIdentifierText(redacted, maxLength);
+}
+
+// Provider and model IDs can contain dots, slashes, and colons. They are
+// structured attribution, so only redact secrets and remove control characters.
+export function sanitizeFailureIdentifier(value: string): string {
+  return sanitizeFailureIdentifierText(value, 200);
+}
+
+function sanitizeFailureIdentifierText(value: string, maxLength: number): string {
+  return value
     .replace(/(["'])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [REDACTED]")

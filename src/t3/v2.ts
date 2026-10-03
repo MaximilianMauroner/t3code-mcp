@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { ModelSelectionSchema, ProjectSchema, ProviderFailureSchema, ProviderRetrySchema, ThreadSchema, ThreadShellSchema, type ThreadShell } from "./types.js";
-import { categoryForFailure, sanitizeFailureText } from "./failure.js";
+import { categoryForFailure, sanitizeFailureIdentifier } from "./failure.js";
 
 const Id = z.string().min(1);
 const Time = z.string().min(1);
@@ -139,8 +139,8 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
     return {
       order: { protocolVersion: 2, scope: "full", snapshotSequence: snapshot.snapshotSequence,
         updatedAt: Number.isFinite(Date.parse(projection.thread.updatedAt)) ? new Date(projection.thread.updatedAt).toISOString() : undefined,
-        runIdentity: { provider: sanitizeFailureText(run.providerInstanceId, 200),
-          model: sanitizeFailureText(run.modelSelection.model, 200) },
+        runIdentity: { provider: sanitizeFailureIdentifier(run.providerInstanceId),
+          model: sanitizeFailureIdentifier(run.modelSelection.model) },
         item: item ? { updatedAt: item.updatedAt, ordinal: item.ordinal, id: item.id } : undefined },
       turnId: run.id, provider: run.providerInstanceId,
       modelSelection: run.modelSelection, failure: item?.failure ?? null, retry: item?.retry,

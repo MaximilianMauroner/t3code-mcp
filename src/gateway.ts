@@ -1,6 +1,7 @@
+import { compareFailureOrder } from "./t3/failure-order.js";
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import { failureInfo, sanitizeFailureText } from "./t3/failure.js";
+import { failureInfo, sanitizeFailureIdentifier, sanitizeFailureText } from "./t3/failure.js";
 import { observeSettings, safeModelSelection, type SettingsReceipt, type SettingsObservation } from "./operations/settings.js";
 import { isAbsolute, join } from "node:path";
 import {
@@ -3037,22 +3038,22 @@ function threadDetail(
     thread.latestTurn.turnId !== summary.latestTurn.turnId &&
     Date.parse(thread.latestTurn.requestedAt) > Date.parse(summary.latestTurn.requestedAt);
   const sameTurn = thread.latestTurn?.turnId === summary?.latestTurn?.turnId;
+  const differentProtocols = fullOrder != null && shellOrder != null && fullOrder.protocolVersion !== shellOrder.protocolVersion;
   const fullHasNewerState = sameTurn && summary != null &&
-    ((fullOrder?.protocolVersion === 2 && shellOrder?.protocolVersion === 2 &&
+    (differentProtocols ? compareFailureOrder(fullOrder, shellOrder) > 0 :
+      ((fullOrder?.protocolVersion === 2 && shellOrder?.protocolVersion === 2 &&
         fullOrder.snapshotSequence > shellOrder.snapshotSequence) ||
       Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
       ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
-        summary.latestTurn?.state === "error"));
+        summary.latestTurn?.state === "error")));
   const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? withShellMetadata(thread, summary ?? {}) : summary ?? thread;
   const fullFailure = source.latestTurn?.state === "error" &&
     source.latestTurn.turnId === thread.latestTurn?.turnId ? failureInfo(thread) : null;
   const shellFailure = failureInfo(source);
   let failure = fullFailure ?? shellFailure;
   let failureOrder = fullFailure ? fullOrder : source === summary ? shellOrder : fullOrder;
-  const newerShell = source === summary && shellOrder?.protocolVersion === 2 &&
-    (shellOrder.snapshotSequence > (fullOrder?.snapshotSequence ?? -1) ||
-      (shellOrder.snapshotSequence === fullOrder?.snapshotSequence &&
-        Date.parse(summary.updatedAt ?? "") > Date.parse(thread.updatedAt ?? "")));
+  const newerShell = source === summary && shellOrder != null && fullOrder != null &&
+    (shellOrder.protocolVersion === 2 || differentProtocols) && compareFailureOrder(shellOrder, fullOrder) > 0;
   if (newerShell && shellFailure) {
     const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
     if (fullFailure && fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
@@ -3060,8 +3061,8 @@ function threadDetail(
         retryAfter: shellFailure.retryAfter ?? fullFailure.retryAfter };
     } else {
       // The run identity is immutable even when a later shell supplies the reason.
-      failure = run ? { ...shellFailure, provider: sanitizeFailureText(run.provider, 200),
-        model: sanitizeFailureText(run.modelSelection.model, 200) } : shellFailure;
+      failure = run ? { ...shellFailure, provider: sanitizeFailureIdentifier(run.provider),
+        model: sanitizeFailureIdentifier(run.modelSelection.model) } : shellFailure;
     }
     failureOrder = { ...shellOrder, ...(run?.order?.runIdentity ? { runIdentity: run.order.runIdentity } : {}) };
   } else if (fullFailure?.source === "t3_turn" && fullOrder?.protocolVersion !== 2) {

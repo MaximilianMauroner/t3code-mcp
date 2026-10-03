@@ -303,6 +303,23 @@ describe("merged orchestrator V2 boundary", () => {
     expect(normalized.latestTurn?.turnId).toBe("cancelled-successor");
   });
 
+  it("preserves structured dotted V2 run identity through shell enrichment and restart", async () => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "dotted-model" });
+    const run = snapshot.projection.runs[0]!;
+    const model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
+    Object.assign(run, { status: "failed", providerInstanceId: "bedrock.instance", modelSelection: { model }, completedAt: now });
+    snapshot.projection.turnItems.push({ id: "dotted", type: "error", ordinal: 1, status: "failed", runId: run.id,
+      nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    const expected = { model, provider: "bedrock.instance" };
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
+    expect((await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
+    expect((await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id))).toMatchObject(expected);
+  });
+
   it("rejects V2 error items without the required status instead of guessing terminal state", async () => {
     const { snapshot } = await setup();
     const payload = { ...snapshot, projection: { ...snapshot.projection, turnItems: [{ id: "missing-status", type: "error", ordinal: 1, runId: "run-v2", nodeId: "node-root", title: null, updatedAt: now, failure: providerFailures.codexUsageLimit }] } };

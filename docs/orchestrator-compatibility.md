@@ -8,7 +8,7 @@ The source target is merge commit [`de343914273eceb852a1d1d739cd1d38df7796ee`](h
 
 ## Gateway behavior
 
-The public MCP tools and journal version stay the same. Failure fields and optional internal evidence ordering are additive; older journal records remain readable. The T3 boundary selects its transport from the public descriptor's `orchestrationProtocolVersion`. An absent version means V1. Unknown versions fail before dispatch.
+The public MCP tools and journal version stay the same. Failure fields and optional internal evidence ordering, including protocol transition boundaries, are additive; older journal records remain readable. These fields stay optional until stored records migrate. Equal observations do not rewrite the journal. The T3 boundary selects its transport from the public descriptor's `orchestrationProtocolVersion`. An absent version means V1. Unknown versions fail before dispatch.
 
 | Operation | V1 | V2 |
 | --- | --- | --- |

@@ -20,7 +20,7 @@ afterEach(async () => {
   await Promise.all(fakes.splice(0).map((fake) => fake.close()));
 });
 
-async function setup(previousResponse = true) {
+async function setup(previousResponse = true, model?: string) {
   const fake = new FakeT3();
   fakes.push(fake);
   await fake.start();
@@ -30,6 +30,7 @@ async function setup(previousResponse = true) {
   const thread = fake.addThread({
     id: "failure-thread",
     projectId: "failure-project",
+    ...(model ? { modelSelection: { model, provider: "bedrock" } } : {}),
     messages: previousResponse ? [assistantMessage("previous success", "old-turn")] : [],
   });
   const run = await fixture.gateway.threadSend({
@@ -91,6 +92,108 @@ describe("structured provider failures", () => {
         turnId: failed.thread.latestTurn!.turnId, model: thread.modelSelection.model, provider: null,
         resetAt: null, retryAfter: null, source: "t3_session" }, undefined,
       { protocolVersion: oldProtocol, scope: "full", snapshotSequence: 100, readStartedAt: 1 })).toBeNull();
+  });
+
+  it.each([[1, 2], [2, 1]] as const)("uses later protocol %s shell evidence after a protocol %s full read", async (shellProtocol, fullProtocol) => {
+    const { fixture, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    full.snapshotSequence = 100;
+    full.thread.orchestrationProtocolVersion = fullProtocol;
+    full.thread.latestTurn = { ...full.thread.latestTurn!, state: "error" };
+    full.thread.session = { status: "error", activeTurnId: full.thread.latestTurn.turnId, lastError: "Old full failure" };
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = 1;
+    const row = shell.threads[0]!;
+    row.orchestrationProtocolVersion = shellProtocol;
+    row.latestTurn = full.thread.latestTurn;
+    row.session = { status: "error", activeTurnId: row.latestTurn.turnId, lastError: "New shell failure", lastErrorClass: "provider_error" };
+    if (fullProtocol === 2) {
+      full.thread.turnFailures = [{ turnId: full.thread.latestTurn.turnId, provider: "old-provider", modelSelection: { model: "old-model" },
+        failure: { class: "provider_error", code: "old-code", message: "Old full failure", retryable: false },
+        order: { protocolVersion: 2, scope: "full", snapshotSequence: 100 } }];
+    }
+    fixture.client.getThread = async () => full;
+    fixture.client.getShell = async () => shell;
+    expect((await fixture.gateway.runGet(run.runId)).failure?.message).toBe("Old full failure");
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure?.message).toBe("New shell failure");
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, row.latestTurn.turnId))?.message).toBe("New shell failure");
+  });
+
+  it.each([[1, 2], [2, 1]] as const)("rejects a first protocol %s read after switching to %s and back", async (firstProtocol, middleProtocol) => {
+    const { fixture, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
+    const failed = structuredClone(await fixture.client.getThread(thread.id));
+    failed.snapshotSequence = 100;
+    failed.thread.orchestrationProtocolVersion = firstProtocol;
+    failed.thread.latestTurn = { ...failed.thread.latestTurn!, state: "error" };
+    failed.thread.session = { status: "error", activeTurnId: failed.thread.latestTurn.turnId, lastError: "Old era failure" };
+    const recovered = structuredClone(failed);
+    recovered.snapshotSequence = 1;
+    recovered.thread.orchestrationProtocolVersion = middleProtocol;
+    recovered.thread.latestTurn = { ...recovered.thread.latestTurn!, state: "completed" };
+    recovered.thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    const final = structuredClone(recovered);
+    final.thread.orchestrationProtocolVersion = firstProtocol;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    fixture.client.getThread = async () => {
+      if (++calls === 1) { entered(); await gate; return failed; }
+      return calls === 2 ? recovered : final;
+    };
+    const delayed = fixture.gateway.runGet(run.runId);
+    await started;
+    expect((await fixture.gateway.runGet(run.runId)).failure).toBeNull();
+    expect((await fixture.gateway.runGet(run.runId)).failure).toBeNull();
+    release();
+    expect(await delayed).toMatchObject({ runStatus: "completed", failure: null });
+    const restarted = makeGateway(fixture.config);
+    expect(await restarted.journal.retainTerminalFailure(thread.id, failed.thread.latestTurn!.turnId,
+      { category: "unknown", code: null, message: "Old era failure", class: null, retry: null, retryable: null,
+        turnId: failed.thread.latestTurn!.turnId, model: thread.modelSelection.model, provider: null,
+        resetAt: null, retryAfter: null, source: "t3_session" }, undefined,
+      { protocolVersion: firstProtocol, scope: "full", snapshotSequence: 100, readStartedAt: 1 })).toBeNull();
+  });
+
+  it("preserves dotted model identity on admitted V1 failures", async () => {
+    const model = "anthropic.claude-3-5-sonnet-20240620-v1:0";
+    const { fixture, thread, run } = await setup(false, model);
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: thread.latestTurn.turnId, lastError: "API Error: auth_unavailable: db.internal" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ model, provider: "bedrock", message: "API Error: auth_unavailable: [REDACTED HOST]" });
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure?.model).toBe(model);
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, thread.latestTurn.turnId))?.model).toBe(model);
+  });
+
+  it.each(["list", "overview"] as const)("does not rewrite unchanged failed and recovered rows on a %s poll", async (reader) => {
+    const { fixture, fake, thread } = await setup(false);
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: thread.latestTurn.turnId, lastError: "Unchanged failure" };
+    for (let index = 0; index < 12; index += 1) {
+      fake.addThread({ id: `unchanged-failed-${index}`, projectId: thread.projectId,
+        latestTurn: thread.latestTurn, session: thread.session });
+      fake.addThread({ id: `unchanged-recovered-${index}`, projectId: thread.projectId,
+        latestTurn: { ...thread.latestTurn!, turnId: `recovered-${index}`, state: "completed" }, session: { status: "ready" } });
+    }
+    const poll = () => reader === "list" ? fixture.gateway.threadsList({ includeArchived: false, limit: 50 })
+      : fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+    await poll();
+    const path = join(fixture.directory, "operations.json");
+    const original = await readFile(path, "utf8");
+    let writes = 0;
+    const watcher = watch(fixture.directory, (event, filename) => {
+      if (event === "rename" && filename === "operations.json") writes += 1;
+    });
+    try {
+      await poll();
+      await poll();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(writes).toBe(0);
+      expect(await readFile(path, "utf8")).toBe(original);
+    } finally { watcher.close(); }
   });
 
   it.each(["summary", "full", "overview"] as const)("batches recovery persistence for a %s read", async (reader) => {
