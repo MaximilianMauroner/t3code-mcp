@@ -424,6 +424,12 @@ export class OperationJournal {
     )?.terminalFailure ?? null;
   }
 
+  async orderFailureEvidence(threadId: string, turnId: string | null | undefined, order: FailureEvidenceOrder): Promise<FailureEvidenceOrder> {
+    await this.init();
+    const retained = turnId ? this.threadFailures.get(`${threadId}\u0000${turnId}`) : undefined;
+    return failureOrderWithEra(order, retained?.order);
+  }
+
   async retainTerminalFailure(
     threadId: string,
     turnId: string,
@@ -460,15 +466,19 @@ export class OperationJournal {
     const laterV1Evidence = comparison !== null && comparison > 0 &&
       candidate.source === existing?.source &&
       (candidate.source === "t3_activity" || candidate.source === "t3_message");
+    const matchingShell = order?.protocolVersion === 2 && order.scope === "shell" && existing != null &&
+      existing.message === candidate.message && existing.class === candidate.class;
     let merged = stale && existing ? existing
+      : matchingShell ? { ...existing, resetAt: candidate.resetAt ?? existing.resetAt,
+        retryAfter: candidate.retryAfter ?? existing.retryAfter }
       : authoritativeV2 || laterV1Evidence || newerProtocol
         ? mergeOrderedFailure(existing, candidate, comparison === 0)
         : mergeTerminalFailure(existing, candidate);
     if (!stale && order?.protocolVersion === 2 && order.scope === "shell" && existing) {
       merged = { ...merged, provider: existing.provider, model: existing.model };
     }
-    const reasonOrder = !stale && merged.source === candidate.source && merged.message === candidate.message &&
-      merged.category === candidate.category ? order ?? retained?.order : retained?.order;
+    const reasonOrder = !stale && (matchingShell || (merged.source === candidate.source && merged.message === candidate.message &&
+      merged.category === candidate.category)) ? order ?? retained?.order : retained?.order;
     // Run attribution is immutable. An older full read can supply it without
     // replacing the newer shell reason, and later shell reads cannot change it.
     const runIdentity = order?.runIdentity ?? retained?.order?.runIdentity;

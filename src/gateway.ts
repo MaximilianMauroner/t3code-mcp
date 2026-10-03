@@ -1143,9 +1143,13 @@ export class T3Gateway {
     const environmentId = await this.environmentId();
     const summary = shell.threads.find((thread) => thread.id === threadId);
     const projectTitle = shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ?? null;
-    const observed = threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now(),
-      failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full", undefined, fullReadStartedAt),
-      summary ? failureEvidenceOrder(summary, shell.snapshotSequence, "shell", undefined, shellReadStartedAt) : undefined);
+    // The journal can know a protocol transition that occurred while the full
+    // read was in flight. Annotate both observations before selecting response state.
+    const fullOrder = await this.journal.orderFailureEvidence(threadId, snapshot.thread.latestTurn?.turnId,
+      failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full", undefined, fullReadStartedAt));
+    const shellOrder = summary ? await this.journal.orderFailureEvidence(threadId, summary.latestTurn?.turnId,
+      failureEvidenceOrder(summary, shell.snapshotSequence, "shell", undefined, shellReadStartedAt)) : undefined;
+    const observed = threadDetail(snapshot.thread, summary, projectTitle, environmentId, Date.now(), fullOrder, shellOrder);
     let detail = await this.withRetainedFailure(observed.detail, observed.failureOrder);
     if (detail.failure === null && snapshot.thread.latestTurn == null) {
       const latestUserTurnId = snapshot.thread.messages.filter((message) => message.role === "user").at(-1)?.turnId;
@@ -3038,9 +3042,11 @@ function threadDetail(
     thread.latestTurn.turnId !== summary.latestTurn.turnId &&
     Date.parse(thread.latestTurn.requestedAt) > Date.parse(summary.latestTurn.requestedAt);
   const sameTurn = thread.latestTurn?.turnId === summary?.latestTurn?.turnId;
-  const differentProtocols = fullOrder != null && shellOrder != null && fullOrder.protocolVersion !== shellOrder.protocolVersion;
+  const differentEras = fullOrder != null && shellOrder != null &&
+    (fullOrder.protocolVersion !== shellOrder.protocolVersion ||
+      (fullOrder.protocolStartedAt ?? 0) !== (shellOrder.protocolStartedAt ?? 0));
   const fullHasNewerState = sameTurn && summary != null &&
-    (differentProtocols ? compareFailureOrder(fullOrder, shellOrder) > 0 :
+    (differentEras ? compareFailureOrder(fullOrder, shellOrder) > 0 :
       ((fullOrder?.protocolVersion === 2 && shellOrder?.protocolVersion === 2 &&
         fullOrder.snapshotSequence > shellOrder.snapshotSequence) ||
       Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
@@ -3053,7 +3059,7 @@ function threadDetail(
   let failure = fullFailure ?? shellFailure;
   let failureOrder = fullFailure ? fullOrder : source === summary ? shellOrder : fullOrder;
   const newerShell = source === summary && shellOrder != null && fullOrder != null &&
-    (shellOrder.protocolVersion === 2 || differentProtocols) && compareFailureOrder(shellOrder, fullOrder) > 0;
+    (shellOrder.protocolVersion === 2 || differentEras) && compareFailureOrder(shellOrder, fullOrder) > 0;
   if (newerShell && shellFailure) {
     const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
     if (fullFailure && fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {

@@ -195,6 +195,53 @@ describe("structured provider failures", () => {
     } finally { watcher.close(); }
   });
 
+  it.each([[1, 2], [2, 1]] as const)("selects the current shell after a delayed protocol %s completion and protocol %s failure", async (firstProtocol, middleProtocol) => {
+    const { fixture, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
+    const oldCompletion = structuredClone(await fixture.client.getThread(thread.id));
+    oldCompletion.snapshotSequence = 100;
+    oldCompletion.thread.orchestrationProtocolVersion = firstProtocol;
+    oldCompletion.thread.latestTurn = { ...oldCompletion.thread.latestTurn!, state: "completed" };
+    oldCompletion.thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    const current = structuredClone(oldCompletion);
+    current.snapshotSequence = 1;
+    current.thread.orchestrationProtocolVersion = middleProtocol;
+    current.thread.latestTurn = { ...current.thread.latestTurn!, state: "error" };
+    current.thread.session = { status: "error", activeTurnId: current.thread.latestTurn.turnId,
+      lastError: "Current failure", lastErrorClass: "provider_error" };
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = 1;
+    Object.assign(shell.threads[0]!, { orchestrationProtocolVersion: firstProtocol,
+      latestTurn: current.thread.latestTurn, session: current.thread.session });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    fixture.client.getThread = async () => {
+      if (++calls === 1) { entered(); await gate; return oldCompletion; }
+      return current;
+    };
+    fixture.client.getShell = async () => shell;
+    const delayed = fixture.gateway.threadGet(thread.id);
+    await started;
+    expect((await fixture.gateway.runGet(run.runId)).failure?.message).toBe("Current failure");
+    release();
+    expect((await delayed).thread).toMatchObject({ activity: "failed", latestTurn: { state: "error" },
+      failure: { message: "Current failure" } });
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, current.thread.latestTurn.turnId))?.message).toBe("Current failure");
+  });
+
+  it.each([{ type: "rate_limit_error", code: null }, { type: null, code: "rate_limit_error" }])("uses explicit JSON subtype with nullable companion field: %j", async (error) => {
+    const { fixture, thread, run } = await setup(false);
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: thread.latestTurn.turnId, lastError: JSON.stringify({ error }) };
+    const expected = { category: "rate_limit", code: "rate_limit_error" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, thread.latestTurn.turnId))).toMatchObject(expected);
+  });
+
   it.each(["summary", "full", "overview"] as const)("batches recovery persistence for a %s read", async (reader) => {
     const { fixture, fake, thread } = await setup(false);
     for (let index = 0; index < 24; index += 1) {

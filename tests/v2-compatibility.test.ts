@@ -372,6 +372,31 @@ describe("merged orchestrator V2 boundary", () => {
     expect(await journal.getFailureByTurnId("thread-1", run.id)).toMatchObject({ resetAt: providerFailures.codexUsageLimit.resetAt });
   });
 
+  it.each(["list", "overview"] as const)("preserves full V2 metadata across newer matching %s shell polls", async (reader) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "matching-shell-metadata" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    const failure = providerFailures.codexUsageLimit;
+    const retry = { attempt: 2, maxAttempts: 3, retryDelayMs: 500 };
+    snapshot.projection.turnItems.push({ id: "metadata", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure, retry });
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ code: failure.code, retry });
+    shell.snapshotSequence = 100;
+    const resetAt = "2026-10-04T00:00:00.000Z";
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: failure.message, lastErrorClass: failure.class, usageLimitResetAt: resetAt });
+    const expected = { source: "t3_v2_turn_item", category: "quota", message: failure.message,
+      code: failure.code, retryable: failure.retryable, retry, resetAt };
+    const observed = reader === "list" ? (await gateway.threadsList({ includeArchived: false, limit: 5 })).page.items[0]?.failure
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure;
+    expect(observed).toMatchObject(expected);
+    snapshot.snapshotSequence = 50;
+    snapshot.projection.turnItems[0]!.failure = { class: failure.class, code: "api_error_429", message: "Different older error", retryable: true };
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+  });
+
   it("replaces an older root with a newer bound shell reason without mixing failure metadata", async () => {
     const { gateway, client, snapshot, shell, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "changed-shell" });

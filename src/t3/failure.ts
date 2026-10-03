@@ -15,7 +15,7 @@ const ErrorActivity = z.object({
   kind: z.enum(["runtime.error", "provider.turn.start.failed"]),
   turnId: z.string(), payload: ErrorPayload,
 });
-const ProviderError = z.object({ error: z.object({ type: z.string().optional(), code: z.string().optional() }) });
+const ProviderError = z.object({ error: z.object({ type: z.string().nullable().optional(), code: z.string().nullable().optional() }) });
 
 export function categoryForFailure(errorClass?: string | null, code?: string | null, message?: string): FailureCategory {
   code ??= message ? providerCode(message) : null;
