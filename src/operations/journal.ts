@@ -466,14 +466,16 @@ export class OperationJournal {
     const laterV1Evidence = comparison !== null && comparison > 0 &&
       candidate.source === existing?.source &&
       (candidate.source === "t3_activity" || candidate.source === "t3_message");
+    const sameReason = order?.failureIdentity != null && order.failureIdentity === retained?.order?.failureIdentity;
     const matchingShell = order?.protocolVersion === 2 && order.scope === "shell" && existing != null &&
+      sameReason &&
       existing.message === candidate.message && existing.class === candidate.class;
     let merged = stale && existing ? existing
       : matchingShell ? { ...existing, resetAt: candidate.resetAt ?? existing.resetAt,
         retryAfter: candidate.retryAfter ?? existing.retryAfter }
       : authoritativeV2 || laterV1Evidence || newerProtocol
-        ? mergeOrderedFailure(existing, candidate, comparison === 0)
-        : mergeTerminalFailure(existing, candidate);
+        ? mergeOrderedFailure(existing, candidate, comparison === 0 && sameReason)
+        : mergeTerminalFailure(existing, candidate, sameReason);
     if (!stale && order?.protocolVersion === 2 && order.scope === "shell" && existing) {
       merged = { ...merged, provider: existing.provider, model: existing.model };
     }
@@ -675,7 +677,7 @@ function mergeOrderedFailure(existing: FailureInfo | null | undefined, candidate
   } : candidate;
 }
 
-function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo): FailureInfo {
+function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo, sameReason: boolean): FailureInfo {
   if (!existing) return candidate;
   // Full V2 reads already select the authoritative root item. Replace older
   // attempts, including their reset metadata, rather than mixing two errors.
@@ -686,7 +688,7 @@ function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidat
   const preferred = upgradesUnknown || (!losesKnownCategory &&
     failureSourcePriority[candidate.source] > failureSourcePriority[existing.source]) ? candidate : existing;
   const other = preferred === candidate ? existing : candidate;
-  if (preferred.message !== other.message || preferred.class !== other.class) return preferred;
+  if (!sameReason || preferred.message !== other.message || preferred.class !== other.class) return preferred;
   return {
     ...preferred,
     category: preferred.category === "unknown" && preferred.source === other.source ? other.category : preferred.category,

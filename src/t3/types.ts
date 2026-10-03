@@ -58,6 +58,9 @@ export const FailureEvidenceOrderSchema = z.object({
   snapshotSequence: z.number().int().nonnegative(),
   readStartedAt: z.number().int().nonnegative().optional(),
   protocolStartedAt: z.number().int().nonnegative().optional(),
+  // Private digest of the unsanitized provider reason. It prevents a
+  // redaction collision from making two V2 shell reasons look identical.
+  failureIdentity: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
   updatedAt: z.iso.datetime({ offset: true }).optional(),
   runIdentity: z.object({ provider: z.string().nullable(), model: z.string() }).optional(),
   item: z.object({

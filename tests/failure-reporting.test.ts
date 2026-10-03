@@ -232,7 +232,8 @@ describe("structured provider failures", () => {
     expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, current.thread.latestTurn.turnId))?.message).toBe("Current failure");
   });
 
-  it.each([{ type: "rate_limit_error", code: null }, { type: null, code: "rate_limit_error" }])("uses explicit JSON subtype with nullable companion field: %j", async (error) => {
+  it.each([{ type: "rate_limit_error", code: null }, { type: null, code: "rate_limit_error" },
+    { type: "api_error", code: "rate_limit_error" }])("uses explicit JSON subtype with nullable companion field: %j", async (error) => {
     const { fixture, thread, run } = await setup(false);
     thread.latestTurn = { ...thread.latestTurn!, state: "error" };
     thread.session = { status: "error", activeTurnId: thread.latestTurn.turnId, lastError: JSON.stringify({ error }) };

@@ -1,7 +1,7 @@
 import { compareFailureOrder } from "./t3/failure-order.js";
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import { failureInfo, sanitizeFailureIdentifier, sanitizeFailureText } from "./t3/failure.js";
+import { failureIdentityFor, failureInfo, sanitizeFailureIdentifier, sanitizeFailureText } from "./t3/failure.js";
 import { observeSettings, safeModelSelection, type SettingsReceipt, type SettingsObservation } from "./operations/settings.js";
 import { isAbsolute, join } from "node:path";
 import {
@@ -3020,13 +3020,15 @@ function failureEvidenceOrder(
   thread: ThreadShell, snapshotSequence: number, scope: "full" | "shell", turnId: string | null | undefined = thread.latestTurn?.turnId,
   readStartedAt?: number,
 ): FailureEvidenceOrder {
-  if (scope === "shell" && thread.evidenceOrder) return { ...thread.evidenceOrder, readStartedAt };
+  const observedFailure = failureInfo(thread, turnId);
+  const failureIdentity = observedFailure ? failureIdentityFor(observedFailure) : undefined;
+  if (scope === "shell" && thread.evidenceOrder) return { ...thread.evidenceOrder, readStartedAt, failureIdentity };
   const persisted = "turnFailures" in thread
     ? (thread as Thread).turnFailures?.find((entry) => entry.turnId === turnId)?.order : undefined;
   const recovery = "turnRecoveries" in thread
     ? (thread as Thread).turnRecoveries?.find((entry) => entry.turnId === turnId)?.order : undefined;
   return { ...(persisted ?? recovery ?? { protocolVersion: thread.orchestrationProtocolVersion === 2 ? 2 : 1, scope, snapshotSequence,
-    updatedAt: Number.isFinite(Date.parse(thread.updatedAt ?? "")) ? new Date(thread.updatedAt!).toISOString() : undefined }), readStartedAt };
+    updatedAt: Number.isFinite(Date.parse(thread.updatedAt ?? "")) ? new Date(thread.updatedAt!).toISOString() : undefined }), readStartedAt, failureIdentity };
 }
 
 function threadDetail(
@@ -3062,7 +3064,9 @@ function threadDetail(
     (shellOrder.protocolVersion === 2 || differentEras) && compareFailureOrder(shellOrder, fullOrder) > 0;
   if (newerShell && shellFailure) {
     const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
-    if (fullFailure && fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
+    if (fullFailure && fullOrder?.failureIdentity != null &&
+      fullOrder.failureIdentity === shellOrder.failureIdentity &&
+      fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
       failure = { ...fullFailure, resetAt: shellFailure.resetAt ?? fullFailure.resetAt,
         retryAfter: shellFailure.retryAfter ?? fullFailure.retryAfter };
     } else {

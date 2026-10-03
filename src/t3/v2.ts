@@ -198,8 +198,9 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
       })],
       checkpoints: projection.checkpoints,
       turnFailures,
-      turnRecoveries: runs.flatMap((run) => run.status === "completed" || run.status === "interrupted" ? [{
-        turnId: run.id, state: run.status,
+      turnRecoveries: runs.flatMap((run) => run.status === "completed" || run.status === "interrupted" ||
+        run.status === "cancelled" || run.status === "rolled_back" ? [{
+        turnId: run.id, state: run.status === "completed" ? "completed" : "interrupted",
         order: { protocolVersion: 2, scope: "full", snapshotSequence: snapshot.snapshotSequence,
           updatedAt: Number.isFinite(Date.parse(projection.thread.updatedAt)) ? new Date(projection.thread.updatedAt).toISOString() : undefined },
       }] : []),

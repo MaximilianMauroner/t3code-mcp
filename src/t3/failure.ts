@@ -1,7 +1,10 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import type { FailureCategory, FailureInfo } from "../gateway.js";
 import { ProviderRetrySchema, type Thread, type ThreadShell } from "./types.js";
+
+const failureIdentities = new WeakMap<FailureInfo, string>();
 
 const ErrorPayload = z.object({
   message: z.string().optional(), detail: z.string().optional(),
@@ -16,6 +19,10 @@ const ErrorActivity = z.object({
   turnId: z.string(), payload: ErrorPayload,
 });
 const ProviderError = z.object({ error: z.object({ type: z.string().nullable().optional(), code: z.string().nullable().optional() }) });
+
+export function failureIdentityFor(failure: FailureInfo): string | undefined {
+  return failureIdentities.get(failure);
+}
 
 export function categoryForFailure(errorClass?: string | null, code?: string | null, message?: string): FailureCategory {
   code ??= message ? providerCode(message) : null;
@@ -34,7 +41,10 @@ export function categoryForFailure(errorClass?: string | null, code?: string | n
 function providerCode(message: string): string | null {
   try {
     const parsed = ProviderError.safeParse(JSON.parse(message));
-    if (parsed.success) return parsed.data.error.type ?? parsed.data.error.code ?? null;
+    if (parsed.success) {
+      const candidates = [parsed.data.error.type, parsed.data.error.code].filter((value): value is string => value != null);
+      return candidates.find((candidate) => categoryForFailure(null, candidate) !== "unknown") ?? candidates[0] ?? null;
+    }
   } catch { /* Non-JSON provider messages are normal. */ }
   if (!message.startsWith("API Error:")) return null;
   return /^API Error:\s*(?:\d{3}\s+)?(rate_limit_error|auth_unavailable|authentication_error|credits_required)\s*:/u.exec(message)?.[1] ??
@@ -87,9 +97,9 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
     }, turnId, identity, thread.modelSelection.model, "t3_session");
     const category = session.failureCategory;
     if (category === "quota" || category === "rate_limit" || category === "auth_billing" ||
-        category === "provider_internal" || category === "provider_error") return { ...failure, category };
+        category === "provider_internal" || category === "provider_error") return withFailureCategory(failure, category);
     if (category === "unknown" && session.lastErrorClass === "usage_limit") {
-      return { ...failure, category: categoryForFailure(null, code, session.lastError) };
+      return withFailureCategory(failure, categoryForFailure(null, code, session.lastError));
     }
     return failure;
   }
@@ -103,7 +113,7 @@ function buildFailure(
 ): FailureInfo {
   const message = payload.message ?? payload.detail ?? "T3 reported that the provider turn failed without an error message.";
   const code = payload.code ?? payload.type ?? providerCode(message);
-  return {
+  const result: FailureInfo = {
     category: categoryForFailure(payload.class, code, message),
     class: payload.class ? sanitizeFailureText(payload.class, 200) : null,
     code: code ? sanitizeFailureText(code, 200) : null,
@@ -117,6 +127,15 @@ function buildFailure(
     retry: payload.retry ?? null,
     source,
   };
+  failureIdentities.set(result, createHash("sha256").update(message).digest("hex"));
+  return result;
+}
+
+function withFailureCategory(failure: FailureInfo, category: FailureCategory): FailureInfo {
+  const result = { ...failure, category };
+  const identity = failureIdentities.get(failure);
+  if (identity) failureIdentities.set(result, identity);
+  return result;
 }
 
 export function sanitizeFailureText(value: string, maxLength: number): string {

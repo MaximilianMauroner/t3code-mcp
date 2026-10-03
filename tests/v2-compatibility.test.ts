@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -397,6 +398,30 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
   });
 
+  it.each(["get", "list", "overview"] as const)("does not preserve full V2 metadata across a shell redaction collision in %s", async (reader) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "shell-redaction-collision" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    const fullFailure = { ...providerFailures.codexUsageLimit, message: "Provider failed at https://one.example/private" };
+    snapshot.projection.turnItems.push({ id: "collision", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: fullFailure,
+      retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 500 } });
+    await gateway.runGet(sent.runId);
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: "Provider failed at https://two.example/private", lastErrorClass: fullFailure.class,
+      usageLimitResetAt: null, updatedAt: "2026-10-02T20:00:01.000Z" });
+    const observed = reader === "get" ? (await gateway.threadGet("thread-1")).thread.failure
+      : reader === "list" ? (await gateway.threadsList({ includeArchived: false, limit: 5 })).page.items[0]?.failure
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure;
+    expect(observed).toMatchObject({ source: "t3_session", message: "Provider failed at [REDACTED URL]",
+      code: null, retry: null, resetAt: null });
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject({
+      source: "t3_session", message: "Provider failed at [REDACTED URL]", code: null, retry: null, resetAt: null,
+    });
+  });
+
   it("uses matching weaker shell admission to reject a delayed other-protocol reason without a rewrite", async () => {
     const { gateway, snapshot, journal, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "shell-admission" });
@@ -405,14 +430,15 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.projection.turnItems.push({ id: "admission", type: "error", status: "failed", ordinal: 1,
       runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
     const fullFailure = (await gateway.runGet(sent.runId)).failure!;
+    const failureIdentity = createHash("sha256").update(providerFailures.codexUsageLimit.message).digest("hex");
     const admission = Date.now() + 10_000;
     await journal.retainTerminalFailure("thread-1", run.id, fullFailure, undefined,
-      { protocolVersion: 2, scope: "full", snapshotSequence: 10, readStartedAt: admission });
+      { protocolVersion: 2, scope: "full", snapshotSequence: 10, readStartedAt: admission, failureIdentity });
     const path = join(config.dataDir, "operations.json");
     const before = await readFile(path, "utf8");
     expect(await journal.retainTerminalFailure("thread-1", run.id,
       { ...fullFailure, source: "t3_session", code: null, retry: null, retryable: null }, undefined,
-      { protocolVersion: 2, scope: "shell", snapshotSequence: 10, readStartedAt: admission + 200 })).toEqual(fullFailure);
+      { protocolVersion: 2, scope: "shell", snapshotSequence: 10, readStartedAt: admission + 200, failureIdentity })).toEqual(fullFailure);
     expect(await journal.retainTerminalFailure("thread-1", run.id,
       { ...fullFailure, source: "t3_session", message: "Delayed old-protocol failure", code: null }, undefined,
       { protocolVersion: 1, scope: "full", snapshotSequence: 100, readStartedAt: admission + 100 })).toEqual(fullFailure);
@@ -523,7 +549,10 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await restarted.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toBeNull();
   });
 
-  it.each(["completed", "interrupted"] as const)("clears a historical V2 failure corrected to %s", async (state) => {
+  it.each([
+    ["completed", "completed"], ["interrupted", "interrupted"],
+    ["cancelled", "interrupted"], ["rolled_back", "interrupted"],
+  ] as const)("clears a historical V2 failure corrected to %s", async (state, expectedState) => {
     const { gateway, client, snapshot, shell, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "historical-recovery" });
     const run = snapshot.projection.runs[0]!;
@@ -538,11 +567,11 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.projection.runs.push({ ...run, id: "successor", rootNodeId: "successor-root", ordinal: 2, status: "running",
       requestedAt: "2026-10-02T20:00:02.000Z", startedAt: "2026-10-02T20:00:02.000Z", completedAt: null });
     Object.assign(shell.threads[0]!, { latestRunId: "successor", activeRunId: "successor", status: "running", lastError: null, lastErrorClass: null });
-    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: state, failure: null, t3TurnId: run.id });
-    expect(await gateway.runWait(sent.runId, 0.1)).toMatchObject({ runStatus: state, failure: null });
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: expectedState, failure: null, t3TurnId: run.id });
+    expect(await gateway.runWait(sent.runId, 0.1)).toMatchObject({ runStatus: expectedState, failure: null });
     const restarted = makeGateway(config);
     restarted.client.getThread = async () => older;
-    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: state, failure: null });
+    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: expectedState, failure: null });
   });
 
   it("invalidates a retained root when a newer full snapshot marks that error recovered", async () => {
