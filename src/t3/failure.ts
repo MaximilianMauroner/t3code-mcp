@@ -98,10 +98,12 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   if (activity && Object.values(activity).some((value) => value !== null && value !== undefined && value !== "")) {
     return buildFailure(activity, turnId, identity, thread.modelSelection.model, "t3_activity");
   }
-  if (sessionMatches && session?.lastError?.trim()) {
-    const code = session.failureCode ?? providerCode(session.lastError);
+  if (sessionMatches && session && (session.lastError?.trim() || session.lastErrorClass ||
+    session.failureCode || session.resetAt || session.retryAfter != null)) {
+    const message = session.lastError?.trim() ? session.lastError : undefined;
+    const code = session.failureCode ?? (message ? providerCode(message) : null);
     const failure = buildFailure({
-      message: session.lastError, class: session.lastErrorClass,
+      message, class: session.lastErrorClass,
       code,
       resetAt: session.resetAt, retryAfter: session.retryAfter,
     }, turnId, identity, thread.modelSelection.model, "t3_session");
@@ -109,7 +111,7 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
     if (category === "quota" || category === "rate_limit" || category === "auth_billing" ||
         category === "provider_internal" || category === "provider_error") return withFailureCategory(failure, category);
     if (category === "unknown" && session.lastErrorClass === "usage_limit") {
-      return withFailureCategory(failure, categoryForFailure(null, code, session.lastError));
+      return withFailureCategory(failure, categoryForFailure(null, code, message));
     }
     return failure;
   }

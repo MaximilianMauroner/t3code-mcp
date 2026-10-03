@@ -600,6 +600,92 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await restarted.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toBeNull();
   });
 
+  it.each([
+    ["summary", "completed"], ["summary", "interrupted"],
+    ["full", "completed"], ["full", "interrupted"],
+    ["overview", "completed"], ["overview", "interrupted"],
+    ["thread", "completed"], ["thread", "interrupted"],
+  ] as const)("retains a newer failure when %s rejects stale %s recovery", async (reader, state) => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "summary-recovery-order" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = state;
+    snapshot.snapshotSequence = 3;
+    snapshot.projection.messages.push({ id: "stale-success", role: "assistant", runId: run.id, nodeId: run.rootNodeId,
+      text: "Stale successful response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    const recovery = await client.getThread("thread-1");
+    run.status = "failed";
+    snapshot.snapshotSequence = 4;
+    snapshot.projection.turnItems.push({ id: "latest-root", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    expect((await gateway.runGet(sent.runId)).failure?.code).toBe("usageLimitExceeded");
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: state, lastError: null, lastErrorClass: null });
+    client.getThread = async () => recovery;
+    const observed = reader === "thread" ? (await gateway.threadGet("thread-1")).thread
+      : reader === "overview" ? (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]
+      : (await gateway.threadsList({ includeArchived: false, detail: reader, limit: 5 })).page.items[0];
+    expect(observed).toMatchObject({ latestTurn: { turnId: run.id, state }, activity: "idle",
+      failure: { turnId: run.id, source: "t3_v2_turn_item", code: "usageLimitExceeded" } });
+    if (reader === "thread") expect(observed).toMatchObject({ latestResponse: null });
+    if (reader === "full" || reader === "overview") expect(observed).toMatchObject({ latestResponseExcerpt: null });
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => recovery;
+    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", failure: { code: "usageLimitExceeded" } });
+  });
+
+  it.each([
+    ["shell", "running"], ["shell", "completed"], ["shell", "failed"],
+    ["full", "running"], ["full", "completed"], ["full", "failed"],
+  ] as const)("selects the newer %s V2 turn over fallback request times with a %s shell", async (newer, state) => {
+    const { gateway, snapshot, shell } = await setup();
+    await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "different-turn-order" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.thread.createdAt = "2026-01-01T00:00:00.000Z";
+    snapshot.projection.turnItems.push({ id: "old-error", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    snapshot.projection.messages.push({ id: "old-answer", role: "assistant", runId: run.id, nodeId: run.rootNodeId,
+      text: "Old turn output", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    snapshot.snapshotSequence = newer === "full" ? 4 : 3;
+    shell.snapshotSequence = newer === "shell" ? 4 : 3;
+    Object.assign(shell.threads[0]!, { createdAt: snapshot.projection.thread.createdAt, latestRunId: "successor",
+      activeRunId: state === "running" ? "successor" : null, status: state,
+      lastError: state === "failed" ? "Successor error" : null, lastErrorClass: state === "failed" ? "provider_error" : null });
+    if (newer === "full") shell.threads[0]!.latestRunRequestedAt = "2026-10-02T21:00:00.000Z";
+    const detail = (await gateway.threadGet("thread-1")).thread;
+    if (newer === "shell") {
+      expect(detail.latestTurn?.turnId).toBe("successor");
+      expect(detail.latestResponse).toBeNull();
+      if (state === "failed") expect(detail.failure).toMatchObject({ turnId: "successor", message: "Successor error" });
+      else expect(detail.failure).toBeNull();
+    } else {
+      expect(detail).toMatchObject({ latestTurn: { turnId: run.id, state: "error" }, failure: { turnId: run.id, code: "usageLimitExceeded" } });
+    }
+  });
+
+  it.each([
+    ["list", "provider_error"], ["list", "usage_limit"],
+    ["overview", "provider_error"], ["overview", "usage_limit"],
+    ["thread", "provider_error"], ["thread", "usage_limit"],
+  ] as const)("retains textless bound V2 %s shell metadata with class %s", async (reader, errorClass) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "textless-shell" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: null,
+      lastErrorClass: errorClass, usageLimitResetAt: "2026-10-04T00:00:00Z" });
+    const observed = reader === "thread" ? (await gateway.threadGet("thread-1")).thread
+      : reader === "overview" ? (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]
+      : (await gateway.threadsList({ includeArchived: false, detail: "summary", limit: 5 })).page.items[0];
+    const expected = { source: "t3_session", turnId: run.id, class: errorClass,
+      category: errorClass === "provider_error" ? "provider_error" : "unknown", code: null,
+      resetAt: "2026-10-04T00:00:00.000Z", message: "T3 reported that the provider turn failed without an error message." };
+    expect(observed?.failure).toMatchObject(expected);
+    expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toMatchObject(expected);
+  });
+
   it.each(["completed", "interrupted"] as const)("keeps a newer failure when a bounded wait poll sees stale %s", async (state) => {
     const { gateway, client, snapshot, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "wait-stale-recovery" });
