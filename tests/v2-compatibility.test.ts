@@ -666,6 +666,62 @@ describe("merged orchestrator V2 boundary", () => {
     expect(rows.page.items[0]?.failure).toMatchObject({ category, class: "usage_limit", source: "t3_session", resetAt: null });
   });
 
+  it.each(["get", "list", "overview"] as const)("keeps a retained V2 root reason through an unbound %s shell error", async (reader) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "unbound-shell-retention" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    const failure = providerFailures.codexUsageLimit;
+    const retry = { attempt: 2, maxAttempts: 3, retryDelayMs: 500 };
+    snapshot.projection.turnItems.push({ id: "root-reason", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure, retry });
+    const expected = { category: "quota", source: "t3_v2_turn_item", code: failure.code, retry,
+      message: failure.message, resetAt: failure.resetAt };
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    shell.snapshotSequence = 100;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: "Unrelated session error", lastErrorClass: null, usageLimitResetAt: null });
+    const observed = reader === "get" ? (await gateway.threadGet("thread-1")).thread.failure
+      : reader === "list" ? (await gateway.threadsList({ includeArchived: false, detail: "summary", limit: 5 })).page.items[0]?.failure
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure;
+    expect(observed).toMatchObject(expected);
+    snapshot.snapshotSequence = 50;
+    snapshot.projection.turnItems = [];
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    // A newer authoritative full absence can still invalidate the old root reason.
+    snapshot.snapshotSequence = 101;
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ source: "t3_turn", code: null, retry: null });
+  });
+
+  it("keeps available full V2 root evidence when the first shell reason is unbound", async () => {
+    const { gateway, snapshot, shell } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "fresh-unbound-shell" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "root-reason", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    shell.snapshotSequence = 100;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: "Unrelated session error", lastErrorClass: null, usageLimitResetAt: null });
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ source: "t3_v2_turn_item", code: "usageLimitExceeded" });
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ source: "t3_v2_turn_item", code: "usageLimitExceeded" });
+  });
+
+  it.each([["rate_limit_error", "provider_error", "rate_limit"], ["api_error_429", "usage_limit", "unknown"]])("uses explicit JSON subtype %s despite a generic V2 root code", async (type, errorClass, category) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "generic-root-code" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "json-reason", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now,
+      failure: { class: errorClass, code: "api_error", message: JSON.stringify({ error: { type } }) } });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: null, lastErrorClass: null });
+    const expected = { source: "t3_v2_turn_item", category, code: type };
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+  });
+
   it("does not bind a distinct V2 session error to the shell's latest run", async () => {
     const { gateway, shell } = await setup();
     Object.assign(shell.threads[0]!, { latestRunId: "old-failed-run", activeRunId: null, status: "failed", lastError: "New unbound session error", lastErrorClass: null, usageLimitResetAt: null });

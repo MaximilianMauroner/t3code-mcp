@@ -243,6 +243,40 @@ describe("structured provider failures", () => {
     expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, thread.latestTurn.turnId))).toMatchObject(expected);
   });
 
+  it("uses an explicit JSON subtype despite a generic V1 activity code", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities.push({ kind: "runtime.error", turnId, payload: {
+      class: "provider_error", code: "api_error", message: JSON.stringify({ error: { type: "rate_limit_error" } }),
+    } });
+    const expected = { category: "rate_limit", code: "rate_limit_error", source: "t3_activity" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId))).toMatchObject(expected);
+  });
+
+  it.each(["other-turn", null])("does not fail an unprojected historical run from session turn %s", async (activeTurnId) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = null;
+    thread.session = { status: "error", activeTurnId, lastError: "Unrelated session error" };
+    expect(await fixture.gateway.runGet(run.runId)).toMatchObject({ t3TurnId: turnId, runStatus: "accepted", failure: null });
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toBeNull();
+    expect(await fixture.journal.getFailureByTurnId(thread.id, turnId)).toBeNull();
+  });
+
+  it("retains an explicitly bound activity without the turn projection despite another session error", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = null;
+    thread.session = { status: "error", activeTurnId: "other-turn", lastError: "Unrelated session error" };
+    thread.activities.push({ kind: "runtime.error", turnId, payload: { code: "rate_limit_error", message: "Bound provider failure" } });
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({
+      turnId, category: "rate_limit", source: "t3_activity", message: "Bound provider failure",
+    });
+  });
+
   it.each(["summary", "full", "overview"] as const)("batches recovery persistence for a %s read", async (reader) => {
     const { fixture, fake, thread } = await setup(false);
     for (let index = 0; index < 24; index += 1) {

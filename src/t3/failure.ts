@@ -25,7 +25,7 @@ export function failureIdentityFor(failure: FailureInfo): string | undefined {
 }
 
 export function categoryForFailure(errorClass?: string | null, code?: string | null, message?: string): FailureCategory {
-  code ??= message ? providerCode(message) : null;
+  if (message) code = codeForFailure(code, message);
   if (code === "credits_required" || code === "auth_unavailable" || code === "authentication_error" ||
       message === "API Error: Request rejected (429) · Usage credits are required for this model.") return "auth_billing";
   if (code === "api_error_429") return "unknown";
@@ -36,6 +36,13 @@ export function categoryForFailure(errorClass?: string | null, code?: string | n
   // provider_error includes refusals and configuration failures, not just crashes.
   if (errorClass === "provider_error") return "provider_error";
   return "unknown";
+}
+
+function codeForFailure(code: string | null | undefined, message: string): string | null {
+  // A known code remains authoritative, including an explicitly ambiguous 429.
+  if (code && (code === "api_error_429" || categoryForFailure(null, code) !== "unknown")) return code;
+  const parsed = providerCode(message);
+  return parsed && (parsed === "api_error_429" || categoryForFailure(null, parsed) !== "unknown") ? parsed : code ?? parsed;
 }
 
 function providerCode(message: string): string | null {
@@ -104,6 +111,7 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
     return failure;
   }
   if (assistant) return buildFailure({ message: assistant.text, code: assistantCode }, turnId, identity, thread.modelSelection.model, "t3_message");
+  if (!turn && session?.activeTurnId !== turnId) return null;
   return buildFailure({}, turnId, identity, thread.modelSelection.model, "t3_turn");
 }
 
@@ -112,7 +120,7 @@ function buildFailure(
   model: string, source: FailureInfo["source"],
 ): FailureInfo {
   const message = payload.message ?? payload.detail ?? "T3 reported that the provider turn failed without an error message.";
-  const code = payload.code ?? payload.type ?? providerCode(message);
+  const code = codeForFailure(payload.code ?? payload.type, message);
   const result: FailureInfo = {
     category: categoryForFailure(payload.class, code, message),
     class: payload.class ? sanitizeFailureText(payload.class, 200) : null,

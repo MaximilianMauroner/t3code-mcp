@@ -3064,7 +3064,10 @@ function threadDetail(
     (shellOrder.protocolVersion === 2 || differentEras) && compareFailureOrder(shellOrder, fullOrder) > 0;
   if (newerShell && shellFailure) {
     const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
-    if (fullFailure && fullOrder?.failureIdentity != null &&
+    if (shellOrder.protocolVersion === 2 && shellFailure.source === "t3_turn" && fullFailure) {
+      // A classless shell error is unbound session text, not a new root reason.
+      failure = fullFailure;
+    } else if (fullFailure && fullOrder?.failureIdentity != null &&
       fullOrder.failureIdentity === shellOrder.failureIdentity &&
       fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
       failure = { ...fullFailure, resetAt: shellFailure.resetAt ?? fullFailure.resetAt,
@@ -3074,7 +3077,9 @@ function threadDetail(
       failure = run ? { ...shellFailure, provider: sanitizeFailureIdentifier(run.provider),
         model: sanitizeFailureIdentifier(run.modelSelection.model) } : shellFailure;
     }
-    failureOrder = { ...shellOrder, ...(run?.order?.runIdentity ? { runIdentity: run.order.runIdentity } : {}) };
+    failureOrder = { ...shellOrder,
+      failureIdentity: failure === fullFailure ? fullOrder?.failureIdentity : shellOrder.failureIdentity,
+      ...(run?.order?.runIdentity ? { runIdentity: run.order.runIdentity } : {}) };
   } else if (fullFailure?.source === "t3_turn" && fullOrder?.protocolVersion !== 2) {
     failure = shellFailure ?? fullFailure;
     failureOrder = shellFailure ? shellOrder : fullOrder;
