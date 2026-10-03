@@ -37,7 +37,7 @@ async function setup() {
   let disconnect = false;
   let hold = false;
   let rejectRpc = false;
-  let protocolVersion: 1 | 2 = 2;
+  let protocolVersion = 2;
   const server = createServer(async (request, response) => {
     const path = request.url ?? "/";
     requests.push({ path, protocol: request.headers["x-t3-orchestration-protocol"]?.toString(), authorization: request.headers.authorization });
@@ -119,15 +119,35 @@ async function setup() {
   const directory = await mkdtemp(join(tmpdir(), "t3-v2-test-"));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   const made = makeGateway({ t3HttpBaseUrl: baseUrl, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 });
-  return { ...made, snapshot, shell, commands, requests, baseUrl, setProtocol: (version: 1 | 2) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
+  return { ...made, snapshot, shell, commands, requests, baseUrl, setProtocol: (version: number) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
 }
 
 describe("merged orchestrator V2 boundary", () => {
-  it("switches between V2 and V1 in both directions after descriptor refresh", async () => {
+  it.each(["shell", "thread", "snooze"] as const)("recovers the first %s after an upgrade", async (operation) => {
     const { client, setProtocol, requests, commands } = await setup();
+    setProtocol(1);
+    await client.getDescriptor();
+    setProtocol(2);
+    if (operation === "shell") expect((await client.getShell()).threads).toHaveLength(2);
+    if (operation === "thread") expect((await client.getThread("thread-1")).thread.id).toBe("thread-1");
+    if (operation === "snooze") {
+      await client.dispatch({ type: "thread.snooze", commandId: "snooze-1", threadId: "thread-1", snoozedUntil: "2026-10-04T08:47:00.000Z" });
+      expect(commands).toHaveLength(1);
+      expect(commands[0]?.type).toBe("thread.snooze");
+      expect(requests.some((request) => request.path === "/api/orchestration/dispatch")).toBe(false);
+      expect(requests.some((request) => request.path.startsWith("/ws?"))).toBe(true);
+    }
+    expect(requests.filter((request) => request.path === "/.well-known/t3/environment")).toHaveLength(2);
+    const reads = requests.filter((request) => request.path.startsWith("/api/orchestration/"));
+    if (operation !== "snooze") expect(reads.map((request) => request.protocol)).toEqual([undefined, "2"]);
+  });
+
+  it("detects upgrades and rollbacks on the same client without an explicit refresh", async () => {
+    const { client, setProtocol, requests, commands } = await setup();
+    setProtocol(1);
+    await client.getDescriptor(); // The gateway's startup discovery.
     for (const version of [2, 1, 2] as const) {
       setProtocol(version);
-      await client.getDescriptor();
       const start = requests.length;
       expect((await client.getShell()).projects[0]?.id).toBe("project-1");
       expect((await client.getThread("thread-1")).thread.id).toBe("thread-1");
@@ -135,7 +155,9 @@ describe("merged orchestrator V2 boundary", () => {
       const observed = requests.slice(start);
       expect(observed.some((request) => request.path === "/api/orchestration/dispatch")).toBe(version === 1);
       expect(observed.some((request) => request.path.startsWith("/ws?"))).toBe(version === 2);
-      expect(observed.filter((request) => request.path.startsWith("/api/orchestration/")).every((request) => request.protocol === (version === 2 ? "2" : undefined))).toBe(true);
+      const reads = observed.filter((request) => request.path.startsWith("/api/orchestration/"));
+      expect(reads[0]?.protocol).toBe(version === 2 ? undefined : "2");
+      expect(reads.slice(1).every((request) => request.protocol === (version === 2 ? "2" : undefined))).toBe(true);
     }
     expect(commands).toHaveLength(3);
   });
@@ -217,10 +239,10 @@ describe("merged orchestrator V2 boundary", () => {
   });
 
   it("rejects unknown orchestration versions before sending a command", async () => {
-    const { baseUrl, commands } = await setup();
+    const { baseUrl, commands, setProtocol } = await setup();
     const client = new T3HttpClient(baseUrl, "test-token");
-    const descriptor = await client.getDescriptor();
-    descriptor.orchestrationProtocolVersion = 3;
+    await client.getDescriptor();
+    setProtocol(3);
     await expect(client.dispatch({ type: "thread.archive", commandId: "archive", threadId: "thread-1" })).rejects.toThrow("Unsupported T3 orchestration protocol 3");
     expect(commands).toEqual([]);
   });
