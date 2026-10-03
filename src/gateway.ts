@@ -3002,16 +3002,16 @@ function threadDetail(
       (shellOrder.snapshotSequence === fullOrder?.snapshotSequence &&
         Date.parse(summary.updatedAt ?? "") > Date.parse(thread.updatedAt ?? "")));
   if (newerShell && shellFailure) {
+    const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
     if (fullFailure && fullFailure.message === shellFailure.message && fullFailure.class === shellFailure.class) {
       failure = { ...fullFailure, resetAt: shellFailure.resetAt ?? fullFailure.resetAt,
         retryAfter: shellFailure.retryAfter ?? fullFailure.retryAfter };
     } else {
       // The run identity is immutable even when a later shell supplies the reason.
-      const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
       failure = run ? { ...shellFailure, provider: sanitizeFailureText(run.provider, 200),
         model: sanitizeFailureText(run.modelSelection.model, 200) } : shellFailure;
     }
-    failureOrder = shellOrder;
+    failureOrder = { ...shellOrder, ...(run?.order?.runIdentity ? { runIdentity: run.order.runIdentity } : {}) };
   } else if (fullFailure?.source === "t3_turn" && fullOrder?.protocolVersion !== 2) {
     failure = shellFailure ?? fullFailure;
     failureOrder = shellFailure ? shellOrder : fullOrder;

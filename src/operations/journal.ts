@@ -454,8 +454,13 @@ export class OperationJournal {
     if (!stale && authoritativeV2 && order.scope === "shell" && existing) {
       merged = { ...merged, provider: existing.provider, model: existing.model };
     }
-    const nextOrder = !stale && merged.source === candidate.source && merged.message === candidate.message &&
+    const reasonOrder = !stale && merged.source === candidate.source && merged.message === candidate.message &&
       merged.category === candidate.category ? order ?? retained?.order : retained?.order;
+    // Run attribution is immutable. An older full read can supply it without
+    // replacing the newer shell reason, and later shell reads cannot change it.
+    const runIdentity = order?.runIdentity ?? retained?.order?.runIdentity;
+    const nextOrder = reasonOrder && runIdentity ? { ...reasonOrder, runIdentity } : reasonOrder;
+    if (runIdentity) merged = { ...merged, ...runIdentity };
     const admittedModel = operation?.settings?.resolved.modelSelection;
     // A V1 snapshot carries mutable thread settings. The run receipt records
     // the settings admitted for this operation; V2 root items use run metadata.

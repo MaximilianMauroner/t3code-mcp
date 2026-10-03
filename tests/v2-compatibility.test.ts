@@ -379,6 +379,32 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await restarted.gateway.runGet(sent.runId)).failure).toMatchObject(expected);
   });
 
+  it.each(["list", "overview"])("uses immutable run identity on a fresh %s with a newer shell failure", async (reader) => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "fresh-shell-identity" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    const older = await client.getThread("thread-1");
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: "New provider failure", lastErrorClass: "provider_error", usageLimitResetAt: null,
+      modelSelection: { instanceId: "changed-provider", model: "changed-model" }, updatedAt: "2026-10-02T20:00:01.000Z" });
+    const expected = { category: "provider_error", message: "New provider failure", code: null, resetAt: null,
+      provider: run.providerInstanceId, model: run.modelSelection.model };
+    const failure = reader === "list"
+      ? (await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]?.failure
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure;
+    expect(failure).toMatchObject(expected);
+    expect(failure).not.toHaveProperty("runIdentity");
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => older;
+    expect((await restarted.gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+    expect((await restarted.gateway.threadsList({ includeArchived: false, limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
+  });
+
   it("invalidates a retained root when a newer full snapshot marks that error recovered", async () => {
     const { gateway, client, snapshot, shell, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "recovered-item" });

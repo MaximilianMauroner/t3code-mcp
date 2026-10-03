@@ -56,6 +56,7 @@ export const FailureEvidenceOrderSchema = z.object({
   protocolVersion: z.union([z.literal(1), z.literal(2)]),
   scope: z.enum(["full", "shell"]),
   snapshotSequence: z.number().int().nonnegative(),
+  runIdentity: z.object({ provider: z.string().nullable(), model: z.string() }).optional(),
   item: z.object({
     updatedAt: z.iso.datetime({ offset: true }),
     ordinal: z.number().int().nonnegative(),
