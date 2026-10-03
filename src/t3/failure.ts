@@ -92,7 +92,7 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   if (assistant && categoryForFailure(null, assistantCode, assistant.text) !== "unknown") {
     const matchingActivity = activities.filter(({ payload }) =>
       (payload.message ?? payload.detail) === assistant.text).at(-1)?.payload;
-    return buildFailure({ ...matchingActivity, message: assistant.text, code: assistantCode },
+    return buildFailure({ ...matchingActivity, message: assistant.text, code: assistantCode ?? matchingActivity?.code },
       turnId, identity, thread.modelSelection.model, "t3_message");
   }
   if (activity && Object.values(activity).some((value) => value !== null && value !== undefined && value !== "")) {

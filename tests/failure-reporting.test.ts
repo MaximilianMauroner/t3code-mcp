@@ -475,6 +475,19 @@ describe("structured provider failures", () => {
     expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ category: "auth_billing", source: "t3_message" });
   });
 
+  it.each(["code", "type"] as const)("keeps a matching activity %s when the V1 credit refusal has no parsed subtype", async (field) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    const message = creditsRequired.messages[0]!.text;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities.push({ kind: "runtime.error", turnId, payload: { message, [field]: "credits_required" } });
+    thread.messages.push(assistantMessage(message, turnId));
+    const expected = { source: "t3_message", category: "auth_billing", code: "credits_required", turnId };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId))).toMatchObject(expected);
+  });
+
   it.each(["message", "detail"] as const)("keeps matching activity %s metadata on a specific V1 provider message", async (field) => {
     const { fixture, thread, run } = await setup(false);
     const turnId = thread.latestTurn!.turnId;
@@ -520,22 +533,37 @@ describe("structured provider failures", () => {
     expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject({ model: admittedModel, provider: "codex_openai" });
   });
 
-  it("keeps list selection and overview counts on the shell snapshot when a newer turn replaces it", async () => {
-    const { fixture, thread } = await setup(false);
+  it.each([
+    ["list", "running"], ["list", "completed"], ["list", "interrupted"], ["list", "error"],
+    ["overview", "running"], ["overview", "completed"], ["overview", "interrupted"], ["overview", "error"],
+  ] as const)("keeps a V1 shell failure when %s enrichment sees a %s successor", async (reader, state) => {
+    const { fixture, fake, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
     const oldTurn = thread.latestTurn!;
     thread.latestTurn = { ...oldTurn, state: "error" };
     thread.session = { status: "error", activeTurnId: oldTurn.turnId, lastError: "Older failure" };
     const oldShell = structuredClone(await fixture.client.getShell());
-    thread.latestTurn = { turnId: "new-turn", state: "running", requestedAt: new Date(Date.parse(oldTurn.requestedAt) + 1000).toISOString() };
-    thread.session = { status: "running", activeTurnId: "new-turn", lastError: null };
+    thread.latestTurn = { turnId: "new-turn", state, requestedAt: new Date(Date.parse(oldTurn.requestedAt) + 1000).toISOString() };
+    thread.session = { status: state === "error" ? "error" : "ready", activeTurnId: "new-turn",
+      lastError: state === "error" ? "Successor failure" : null };
+    thread.messages.push(assistantMessage("Successor response", "new-turn"));
     fixture.client.getShell = async () => oldShell;
-    const list = await fixture.gateway.threadsList({ includeArchived: false, detail: "full", activity: "failed", needsAttention: true, limit: 5 });
-    expect(list.page.items[0]).toMatchObject({ latestTurn: { turnId: oldTurn.turnId }, activity: "failed", failure: null });
-    const overview = await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
-    expect(overview.highlights[0]).toMatchObject({ latestTurn: { turnId: oldTurn.turnId }, activity: "failed", failure: null });
-    expect(overview.executionCounts.failed).toBe(1);
-    expect(overview.runningCount).toBe(0);
-    expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { turnId: "new-turn" }, failure: null });
+    const failure = { message: "Older failure", turnId: oldTurn.turnId, source: "t3_session" };
+    if (reader === "list") {
+      const list = await fixture.gateway.threadsList({ includeArchived: false, detail: "full", activity: "failed", needsAttention: true, limit: 5 });
+      expect(list.page.items[0]).toMatchObject({ latestTurn: { turnId: oldTurn.turnId }, activity: "failed", failure, latestResponseExcerpt: null });
+    } else {
+      const overview = await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+      expect(overview.highlights[0]).toMatchObject({ latestTurn: { turnId: oldTurn.turnId }, activity: "failed", failure, latestResponseExcerpt: null });
+      expect(overview.executionCounts.failed).toBe(1);
+      expect(overview.runningCount).toBe(0);
+    }
+    const detail = (await fixture.gateway.threadGet(thread.id)).thread;
+    expect(detail.latestTurn?.turnId).toBe("new-turn");
+    if (state === "error") expect(detail.failure).toMatchObject({ message: "Successor failure", turnId: "new-turn" });
+    else expect(detail.failure).toBeNull();
+    await fake.close();
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject(failure);
   });
 
   it("keeps overview recovery order when full enrichment fails for a V1 session-only error", async () => {

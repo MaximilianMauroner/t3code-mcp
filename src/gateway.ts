@@ -2551,6 +2551,9 @@ export class T3Gateway {
             failure = null;
           } else if (historicalFailure) {
             failure = await this.journal.retainTerminalFailure(summary.id, turnId, historicalFailure, undefined, historicalOrder);
+          } else if (fullOrder.protocolVersion === 1) {
+            // V1's successor carries no evidence of the selected turn's recovery.
+            failure = await this.journal.getFailureByTurnId(summary.id, turnId);
           }
         }
         const enriched = { ...summary, failure };
