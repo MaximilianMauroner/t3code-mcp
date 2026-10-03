@@ -1048,7 +1048,11 @@ export class T3Gateway {
       .filter(isThreadRunning)
       .map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
     const highlights = await Promise.all((await this.buildHighlights(filtered, projectTitles, environmentId, now))
-      .map((highlight) => this.withRetainedFailure(highlight)));
+      .map((highlight) => {
+        const thread = filtered.find((candidate) => candidate.id === highlight.id);
+        return this.withRetainedFailure(highlight,
+          thread ? failureEvidenceOrder(thread, shell.snapshotSequence, "shell") : undefined);
+      }));
     return {
       environmentId,
       observedAt,

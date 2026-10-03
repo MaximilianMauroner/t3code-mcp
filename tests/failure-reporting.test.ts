@@ -196,6 +196,27 @@ describe("structured provider failures", () => {
     expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { turnId: "new-turn" }, failure: null });
   });
 
+  it("keeps overview recovery order when full enrichment fails for a V1 session-only error", async () => {
+    const { fixture, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
+    const turn = thread.latestTurn!;
+    thread.latestTurn = null;
+    thread.session = { status: "error", activeTurnId: turn.turnId, lastError: "Old session refusal" };
+    const older = structuredClone(await fixture.client.getThread(thread.id));
+    fixture.client.getThread = async () => { throw new Error("Full read unavailable"); };
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure)
+      .toMatchObject({ source: "t3_session", message: "Old session refusal" });
+    thread.latestTurn = { ...turn, state: "completed", completedAt: new Date().toISOString() };
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    const recoveredShell = structuredClone(await fixture.client.getShell());
+    recoveredShell.snapshotSequence = older.snapshotSequence + 1;
+    fixture.client.getShell = async () => recoveredShell;
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toBeNull();
+    const restarted = makeGateway(fixture.config);
+    restarted.client.getThread = async () => older;
+    expect(await restarted.gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
+  });
+
   it("clears an earlier same-turn shell failure after the full snapshot has recovered", async () => {
     const { fixture, thread, run, fake } = await setup(false);
     const turnId = thread.latestTurn!.turnId;
