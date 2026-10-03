@@ -90,7 +90,10 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   const identity = provider ?? thread.modelSelection.provider ?? thread.modelSelection.instanceId ?? null;
   // A provider type is more specific than V1's generic usage-limit sentence.
   if (assistant && categoryForFailure(null, assistantCode, assistant.text) !== "unknown") {
-    return buildFailure({ message: assistant.text, code: assistantCode }, turnId, identity, thread.modelSelection.model, "t3_message");
+    const matchingActivity = activities.filter(({ payload }) =>
+      (payload.message ?? payload.detail) === assistant.text).at(-1)?.payload;
+    return buildFailure({ ...matchingActivity, message: assistant.text, code: assistantCode },
+      turnId, identity, thread.modelSelection.model, "t3_message");
   }
   if (activity && Object.values(activity).some((value) => value !== null && value !== undefined && value !== "")) {
     return buildFailure(activity, turnId, identity, thread.modelSelection.model, "t3_activity");

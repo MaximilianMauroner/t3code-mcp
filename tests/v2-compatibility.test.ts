@@ -252,6 +252,57 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await gateway.threadGet("thread-1")).thread.failure).toBeNull();
   });
 
+  it.each([
+    ["list", "running"], ["list", "completed"],
+    ["overview", "running"], ["overview", "completed"],
+  ] as const)("keeps a historical V2 failure when %s enrichment sees a %s successor", async (reader, successorState) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "historical-shell-enrichment" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    const retry = { attempt: 2, maxAttempts: 3, retryDelayMs: 500 };
+    snapshot.projection.turnItems.push({ id: "historical-error", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit, retry });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    snapshot.snapshotSequence = 3;
+    snapshot.projection.runs.push({ ...run, id: "successor", ordinal: 2, rootNodeId: "successor-root",
+      status: successorState, modelSelection: { instanceId: "other-provider", model: "other-model" }, providerInstanceId: "other-provider" });
+    snapshot.projection.messages.push({ id: "successor-answer", role: "assistant", runId: "successor", nodeId: "successor-root",
+      text: "Successor response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    const expected = { turnId: run.id, source: "t3_v2_turn_item", category: "quota", code: "usageLimitExceeded",
+      provider: "codex_openai", model: selection.model, retry };
+    const row = reader === "list" ? (await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0];
+    expect(row).toMatchObject({ activity: "failed", observedTurnId: run.id, latestTurn: { turnId: run.id, state: "error" }, failure: expected });
+    expect(row).toMatchObject({ latestResponseExcerpt: null });
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+  });
+
+  it.each([
+    ["list", "completed"], ["list", "interrupted"],
+    ["overview", "completed"], ["overview", "interrupted"],
+  ] as const)("clears a historical recovered V2 failure when %s enrichment sees its %s record", async (reader, recoveredState) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "historical-enrichment-recovery" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "historical-error", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    expect((await gateway.runGet(sent.runId)).failure?.code).toBe("usageLimitExceeded");
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    snapshot.snapshotSequence = 3;
+    run.status = recoveredState;
+    snapshot.projection.runs.push({ ...run, id: "successor", ordinal: 2, rootNodeId: "successor-root", status: "running" });
+    const row = reader === "list" ? (await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0];
+    expect(row?.failure).toBeNull();
+    const restarted = makeGateway(config);
+    expect(await restarted.journal.getRecoveryByTurnId("thread-1", run.id)).toBe(recoveredState);
+    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: recoveredState, failure: null });
+  });
+
   it("ignores V2 child failures and recovered retry items, even in a failed run", async () => {
     const { gateway, snapshot } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "root-only" });

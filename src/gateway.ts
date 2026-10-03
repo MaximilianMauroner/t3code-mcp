@@ -2540,9 +2540,20 @@ export class T3Gateway {
         const fullIsNewer = retainedOrder === undefined || compareFailureOrder(
           await this.journal.orderFailureEvidence(summary.id, summary.observedTurnId, fullOrder), retainedOrder,
         ) >= 0;
-        const enriched = sameTurn && sameState
-          ? { ...summary, failure: observed.failure }
-          : { ...summary, failure: fullIsNewer ? null : summary.failure };
+        let failure = sameTurn && sameState ? observed.failure : fullIsNewer ? null : summary.failure;
+        if (!sameTurn && summary.latestTurn?.state === "error") {
+          const turnId = summary.latestTurn.turnId;
+          const historicalOrder = failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full", turnId, readStartedAt);
+          const historicalRecovery = snapshot.thread.turnRecoveries?.find((entry) => entry.turnId === turnId)?.state;
+          const historicalFailure = failureInfo(snapshot.thread, turnId);
+          if (historicalRecovery) {
+            recoveries.push({ threadId: summary.id, turnId, state: historicalRecovery, order: historicalOrder });
+            failure = null;
+          } else if (historicalFailure) {
+            failure = await this.journal.retainTerminalFailure(summary.id, turnId, historicalFailure, undefined, historicalOrder);
+          }
+        }
+        const enriched = { ...summary, failure };
         const latest = sameTurn && sameState ? latestAssistant(snapshot.thread.messages, summary.observedTurnId)
           ?? (summary.observedTurnId === null && enriched.failure === null && snapshot.thread.latestTurn == null
             ? latestAssistant(snapshot.thread.messages, null, true) : null) : null;

@@ -475,6 +475,37 @@ describe("structured provider failures", () => {
     expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ category: "auth_billing", source: "t3_message" });
   });
 
+  it.each(["message", "detail"] as const)("keeps matching activity %s metadata on a specific V1 provider message", async (field) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    const message = claudeRateLimit.messages[0]!.text;
+    const retry = { attempt: 2, maxAttempts: 3, retryDelayMs: 500 };
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities.push({ kind: "runtime.error", turnId, payload: {
+      [field]: message, class: "usage_limit", code: "api_error", retryable: true, retry,
+      resetAt: "2026-10-04T00:00:00Z", retryAfter: 120,
+    } });
+    thread.messages.push(assistantMessage(message, turnId));
+    const expected = { source: "t3_message", category: "rate_limit", code: "rate_limit_error", class: "usage_limit",
+      retryable: true, retry, resetAt: "2026-10-04T00:00:00.000Z", retryAfter: "120" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId))).toMatchObject(expected);
+  });
+
+  it.each(["raw_reason", "turn"] as const)("does not mix V1 activity metadata when the %s differs", async (difference) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    const message = "API Error: rate_limit_error: Failed at https://one.example/private";
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities.push({ kind: "runtime.error", turnId: difference === "turn" ? "other-turn" : turnId,
+      payload: { message: difference === "raw_reason" ? message.replace("one.example", "two.example") : message,
+        class: "usage_limit", retryable: true, retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 500 }, resetAt: "2026-10-04T00:00:00Z" } });
+    thread.messages.push(assistantMessage(message, turnId));
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ source: "t3_message", category: "rate_limit",
+      code: "rate_limit_error", class: null, retryable: null, retry: null, resetAt: null });
+  });
+
   it("uses admitted V1 run settings after the thread model changes, including on reconnect", async () => {
     const { fixture, fake, thread, run } = await setup(false);
     const admittedModel = thread.modelSelection.model;
