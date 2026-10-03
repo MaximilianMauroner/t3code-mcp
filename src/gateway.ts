@@ -212,7 +212,13 @@ export interface ThreadDetail extends ThreadSummary {
 
 export interface MessagePage {
   readonly threadId: string;
-  readonly messages: ReadonlyArray<Message>;
+  readonly messages: ReadonlyArray<Message & {
+    readonly textRange: {
+      readonly offset: number;
+      readonly totalChars: number;
+      readonly nextOffset: number | null;
+    };
+  }>;
   readonly nextCursor: string | null;
   readonly hasMore: boolean;
   readonly total: number;
@@ -1126,17 +1132,33 @@ export class T3Gateway {
 
   async threadMessages(
     threadId: string,
-    input: { readonly cursor?: string; readonly limit: number; readonly maxChars: number },
+    input: { readonly cursor?: string; readonly limit: number; readonly maxChars: number; readonly messageId?: string; readonly textOffset?: number },
   ): Promise<{ readonly environmentId: string; readonly page: MessagePage }> {
     const snapshot = await this.client.getThread(threadId);
-    const { items, ...page } = paginate(snapshot.thread.messages, input.cursor, input.limit);
+    const history = input.messageId === undefined
+      ? snapshot.thread.messages
+      : snapshot.thread.messages.filter((message) => message.id === input.messageId);
+    if (input.messageId !== undefined && history.length === 0) {
+      throw new GatewayError("message_not_found", "The requested message is not in this thread.");
+    }
+    const offset = input.textOffset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0 || (offset > 0 && input.messageId === undefined)) {
+      throw new GatewayError("invalid_text_offset", "textOffset must be a non-negative safe integer; a positive offset requires messageId.");
+    }
+    const { items, ...page } = paginate(history, input.cursor, input.limit);
     let truncated = false;
     const messages = items.map((message) => {
-      if (message.text.length <= input.maxChars) {
-        return message;
+      if (offset > message.text.length) {
+        throw new GatewayError("invalid_text_offset", "textOffset exceeds the message length. Read the message again from offset 0.");
       }
-      truncated = true;
-      return { ...message, text: `${message.text.slice(0, input.maxChars)}\n[truncated]` };
+      const end = Math.min(message.text.length, offset + input.maxChars);
+      const nextOffset = end < message.text.length ? end : null;
+      truncated ||= offset > 0 || nextOffset !== null;
+      return {
+        ...message,
+        text: message.text.slice(offset, end) + (nextOffset === null ? "" : "\n[truncated]"),
+        textRange: { offset, totalChars: message.text.length, nextOffset },
+      };
     });
     return {
       environmentId: await this.environmentId(),

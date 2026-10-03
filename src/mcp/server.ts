@@ -423,7 +423,13 @@ const threadMessagesOutputSchema = {
   page: z
     .object({
       threadId: z.string(),
-      messages: z.array(messageOutput),
+      messages: z.array(messageOutput.extend({
+        textRange: z.object({
+          offset: z.number().int().nonnegative(),
+          totalChars: z.number().int().nonnegative(),
+          nextOffset: z.number().int().nonnegative().nullable(),
+        }),
+      })),
       nextCursor: z.string().nullable(),
       hasMore: z.boolean(),
       total: z.number(),
@@ -920,18 +926,20 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_thread_messages",
     {
       title: "Read T3 thread messages",
-      description: "Read paginated thread history. Message text is bounded by maxChars and reports truncation explicitly.",
+      description: "Read paginated thread history. Use limit=1 and a small maxChars for large transcripts. Each message reports textRange; read remaining text with messageId and textOffset=textRange.nextOffset until null. Offsets count JavaScript UTF-16 code units.",
       inputSchema: {
         threadId: z.string().trim().min(1),
         cursor,
         limit,
         maxChars: z.number().int().min(100).max(100_000).default(20_000),
+        messageId: z.string().trim().min(1).optional(),
+        textOffset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
       },
       outputSchema: threadMessagesOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async (args) =>
-      runTool(auditLog, "t3_thread_messages", args, () => gateway.threadMessages(args.threadId, { cursor: args.cursor, limit: args.limit, maxChars: args.maxChars })),
+      runTool(auditLog, "t3_thread_messages", args, () => gateway.threadMessages(args.threadId, { cursor: args.cursor, limit: args.limit, maxChars: args.maxChars, messageId: args.messageId, textOffset: args.textOffset })),
   );
 
   server.registerTool(

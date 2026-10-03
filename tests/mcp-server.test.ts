@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { createMcpServer } from "../src/mcp/server.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
 import { FakeT3 } from "./support/fake-t3.js";
@@ -16,6 +17,14 @@ const clients: Client[] = [];
 const servers: Array<{ close: () => Promise<void> }> = [];
 const directories: string[] = [];
 const execute = promisify(execFile);
+const messageResultSchema = z.object({
+  page: z.object({
+    messages: z.array(z.object({
+      id: z.string(), text: z.string(),
+      textRange: z.object({ offset: z.number(), totalChars: z.number(), nextOffset: z.number().nullable() }),
+    })),
+  }).passthrough(),
+});
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close().catch(() => undefined)));
@@ -42,6 +51,51 @@ async function connectedClient(): Promise<{ readonly fake: FakeT3; readonly clie
 }
 
 describe("MCP tool contract", () => {
+  it("recovers a long correction through MCP chunks without losing text or advancing history", async () => {
+    const { fake, client } = await connectedClient();
+    const original = "a".repeat(100_001) + "😀 Correction: 6 sessions, 5 projects.\n[truncated]";
+    const thread = fake.addThread({ messages: [
+      { id: "long", role: "user", text: original },
+      { id: "after", role: "assistant", text: "next message" },
+    ] });
+    let offset = 0;
+    let recovered = "";
+    for (;;) {
+      const result = await client.callTool({ name: "t3_thread_messages", arguments: {
+        threadId: thread.id, messageId: "long", textOffset: offset, limit: 1, maxChars: 20_000,
+      } });
+      expect(result.isError).not.toBe(true);
+      const page = messageResultSchema.parse(result.structuredContent).page;
+      expect(page).toMatchObject({ total: 1, hasMore: false, nextCursor: null });
+      const message = page.messages[0]!;
+      expect(message.id).toBe("long");
+      expect(message.textRange).toMatchObject({ offset, totalChars: original.length });
+      const end = message.textRange.nextOffset ?? original.length;
+      recovered += message.text.slice(0, end - offset);
+      if (message.textRange.nextOffset === null) break;
+      expect(end).toBeGreaterThan(offset);
+      offset = end;
+    }
+    expect(recovered).toBe(original);
+    const next = await client.callTool({ name: "t3_thread_messages", arguments: {
+      threadId: thread.id, cursor: "1", limit: 1,
+    } });
+    expect(messageResultSchema.parse(next.structuredContent).page).toMatchObject({ messages: [{ id: "after", text: "next message" }] });
+    for (const args of [
+      { textOffset: 1 },
+      { messageId: "missing" },
+      { messageId: "long", textOffset: original.length + 1 },
+      { messageId: "long", textOffset: -1 },
+    ]) {
+      const result = await client.callTool({ name: "t3_thread_messages", arguments: { threadId: thread.id, ...args } });
+      expect(result.isError).toBe(true);
+    }
+    const end = await client.callTool({ name: "t3_thread_messages", arguments: {
+      threadId: thread.id, messageId: "long", textOffset: original.length,
+    } });
+    expect(messageResultSchema.parse(end.structuredContent).page).toMatchObject({ messages: [{ text: "", textRange: { nextOffset: null } }] });
+  });
+
   it("publishes only the task-specific gateway tools", async () => {
     const { client } = await connectedClient();
     const result = await client.listTools();
