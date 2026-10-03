@@ -94,7 +94,8 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>, snap
   const hasBoundFailure = status === "failed" && thread.lastErrorClass != null;
   return ThreadShellSchema.parse({
     ...thread,
-    evidenceOrder: snapshotSequence === undefined ? undefined : { protocolVersion: 2, scope: "shell", snapshotSequence },
+    evidenceOrder: snapshotSequence === undefined ? undefined : { protocolVersion: 2, scope: "shell", snapshotSequence,
+      updatedAt: Number.isFinite(Date.parse(thread.updatedAt)) ? new Date(thread.updatedAt).toISOString() : undefined },
     title: thread.title || "Untitled",
     orchestrationProtocolVersion: 2,
     latestTurn: runId ? {
@@ -137,6 +138,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
       .at(-1);
     return {
       order: { protocolVersion: 2, scope: "full", snapshotSequence: snapshot.snapshotSequence,
+        updatedAt: Number.isFinite(Date.parse(projection.thread.updatedAt)) ? new Date(projection.thread.updatedAt).toISOString() : undefined,
         runIdentity: { provider: sanitizeFailureText(run.providerInstanceId, 200),
           model: sanitizeFailureText(run.modelSelection.model, 200) },
         item: item ? { updatedAt: item.updatedAt, ordinal: item.ordinal, id: item.id } : undefined },
@@ -196,6 +198,11 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
       })],
       checkpoints: projection.checkpoints,
       turnFailures,
+      turnRecoveries: runs.flatMap((run) => run.status === "completed" || run.status === "interrupted" ? [{
+        turnId: run.id, state: run.status,
+        order: { protocolVersion: 2, scope: "full", snapshotSequence: snapshot.snapshotSequence,
+          updatedAt: Number.isFinite(Date.parse(projection.thread.updatedAt)) ? new Date(projection.thread.updatedAt).toISOString() : undefined },
+      }] : []),
       proposedPlans: projection.plans.filter((plan) => plan.kind === "proposed_plan").map((plan) => ({
         ...plan, turnId: plan.runId, planMarkdown: plan.markdown,
         implementedAt: plan.status === "completed" ? projection.updatedAt : null,

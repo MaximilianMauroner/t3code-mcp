@@ -40,6 +40,21 @@ async function setup(previousResponse = true) {
 }
 
 describe("structured provider failures", () => {
+  it.each(["runtime.error", "provider.turn.start.failed"])("retains structured %s metadata without text", async (kind) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    thread.activities.push({ kind, turnId, payload: { code: "rate_limit_error", retryable: true,
+      retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 500 } } });
+    const expected = { source: "t3_activity", category: "rate_limit", code: "rate_limit_error",
+      retryable: true, retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 500 },
+      message: "T3 reported that the provider turn failed without an error message." };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject(expected);
+  });
+
   it.each([
     ["rate limit", claudeRateLimit, "rate_limit", "rate_limit_error", "t3_message"],
     ["Codex usage limit", codexUsageLimit, "quota", null, "t3_activity"],

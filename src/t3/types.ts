@@ -56,6 +56,7 @@ export const FailureEvidenceOrderSchema = z.object({
   protocolVersion: z.union([z.literal(1), z.literal(2)]),
   scope: z.enum(["full", "shell"]),
   snapshotSequence: z.number().int().nonnegative(),
+  updatedAt: z.iso.datetime({ offset: true }).optional(),
   runIdentity: z.object({ provider: z.string().nullable(), model: z.string() }).optional(),
   item: z.object({
     updatedAt: z.iso.datetime({ offset: true }),
@@ -134,6 +135,11 @@ export const ThreadSchema = ThreadShellSchema.extend({
     modelSelection: ModelSelectionSchema,
     failure: ProviderFailureSchema.nullable(),
     retry: ProviderRetrySchema.optional(),
+  })).optional(),
+  turnRecoveries: z.array(z.object({
+    turnId: NonEmptyString,
+    state: z.enum(["completed", "interrupted"]),
+    order: FailureEvidenceOrderSchema,
   })).optional(),
 }).catchall(z.unknown());
 export type Thread = z.infer<typeof ThreadSchema>;

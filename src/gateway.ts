@@ -1584,13 +1584,15 @@ export class T3Gateway {
         await this.journal.update(record.operationId, { turnId: current.t3TurnId });
       }
       if (current.failure && current.threadId) {
-        current = { ...current, failure: await this.journal.retainTerminalFailure(
+        const retained = await this.journal.retainTerminalFailure(
           current.threadId, current.t3TurnId, current.failure, current.operationId, failureOrder,
-        ) };
+        );
+        current = { ...current, failure: retained,
+          runStatus: retained ? "failed" : await this.journal.getRecoveryByTurnId(current.threadId, current.t3TurnId) ?? current.runStatus };
       }
       if (current.threadId && current.t3TurnId &&
         (current.runStatus === "completed" || current.runStatus === "interrupted")) {
-        await this.journal.clearTerminalFailure(current.threadId, current.t3TurnId);
+        await this.journal.clearTerminalFailure(current.threadId, current.t3TurnId, current.runStatus, failureOrder);
       }
     }
     const result: RunResult = {
@@ -2248,7 +2250,7 @@ export class T3Gateway {
 
   private async withRetainedFailure<T extends ThreadSummary>(summary: T, order?: FailureEvidenceOrder): Promise<T> {
     if (summary.latestTurn?.state === "completed" || summary.latestTurn?.state === "interrupted") {
-      await this.journal.clearTerminalFailure(summary.id, summary.latestTurn.turnId);
+      await this.journal.clearTerminalFailure(summary.id, summary.latestTurn.turnId, summary.latestTurn.state, order);
       return { ...summary, failure: null };
     }
     if (summary.failure === null || summary.failure.turnId === null ||
@@ -2280,8 +2282,13 @@ export class T3Gateway {
       }
       const latestTurn = thread.latestTurn ?? null;
       const sameTurn = latestTurn !== null && turnId !== null && latestTurn.turnId === turnId;
-      const recovered = sameTurn && (latestTurn.state === "completed" || latestTurn.state === "interrupted");
-      if (recovered && boundedEnvironmentId === undefined) await this.journal.clearTerminalFailure(thread.id, turnId);
+      const failureOrder = failureEvidenceOrder(thread, snapshot.snapshotSequence, "full", turnId);
+      const historicalRecovery = thread.turnRecoveries?.find((entry) => entry.turnId === turnId)?.state;
+      const recoveryState = historicalRecovery ?? (sameTurn &&
+        (latestTurn.state === "completed" || latestTurn.state === "interrupted") ? latestTurn.state : null);
+      if (recoveryState && turnId && boundedEnvironmentId === undefined) {
+        await this.journal.clearTerminalFailure(thread.id, turnId, recoveryState, failureOrder);
+      }
       const matchingSessionFailure = latestTurn === null && turnId !== null
         ? failureInfo(thread, turnId)
         : null;
@@ -2298,16 +2305,17 @@ export class T3Gateway {
                 ? "completed"
                 : "accepted";
       const observedFailure = turnId === null ? null : failureInfo(thread, turnId);
-      const failureOrder = failureEvidenceOrder(thread, snapshot.snapshotSequence, "full", turnId);
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
-      const failure = recovered ? null : turnId !== null && (observedFailure !== null || priorFailure !== null)
+      const retainedRecovery = turnId ? await this.journal.getRecoveryByTurnId(thread.id, turnId) : null;
+      const failure = recoveryState ? (boundedEnvironmentId === undefined ? priorFailure : null)
+        : turnId !== null && (observedFailure !== null || priorFailure !== null)
         ? boundedEnvironmentId === undefined
           ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId, failureOrder)
           : observedFailure ?? priorFailure
-        : record.terminalFailure ?? null;
-      const runStatus = !recovered && (record.terminalRunStatus === "failed" || failure !== null)
+        : retainedRecovery ? null : record.terminalFailure ?? null;
+      const runStatus = failure !== null || (!recoveryState && !retainedRecovery && record.terminalRunStatus === "failed")
         ? "failed"
-        : observedRunStatus;
+        : recoveryState ?? (turnId ? await this.journal.getRecoveryByTurnId(thread.id, turnId) : null) ?? observedRunStatus;
       const run: RunResult = {
         environmentId: boundedEnvironmentId ?? await this.environmentId(),
         ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings, sameTurn ? thread : undefined) }),
@@ -2969,7 +2977,10 @@ function failureEvidenceOrder(
   if (scope === "shell" && thread.evidenceOrder) return thread.evidenceOrder;
   const persisted = "turnFailures" in thread
     ? (thread as Thread).turnFailures?.find((entry) => entry.turnId === turnId)?.order : undefined;
-  return persisted ?? { protocolVersion: thread.orchestrationProtocolVersion === 2 ? 2 : 1, scope, snapshotSequence };
+  const recovery = "turnRecoveries" in thread
+    ? (thread as Thread).turnRecoveries?.find((entry) => entry.turnId === turnId)?.order : undefined;
+  return persisted ?? recovery ?? { protocolVersion: thread.orchestrationProtocolVersion === 2 ? 2 : 1, scope, snapshotSequence,
+    updatedAt: Number.isFinite(Date.parse(thread.updatedAt ?? "")) ? new Date(thread.updatedAt!).toISOString() : undefined };
 }
 
 function threadDetail(

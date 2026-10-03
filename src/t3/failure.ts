@@ -74,7 +74,7 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
   if (assistant && categoryForFailure(null, assistantCode, assistant.text) !== "unknown") {
     return buildFailure({ message: assistant.text, code: assistantCode }, turnId, identity, thread.modelSelection.model, "t3_message");
   }
-  if (activity && (activity.message || activity.detail)) {
+  if (activity && Object.values(activity).some((value) => value !== null && value !== undefined && value !== "")) {
     return buildFailure(activity, turnId, identity, thread.modelSelection.model, "t3_activity");
   }
   if (sessionMatches && session?.lastError?.trim()) {

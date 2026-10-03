@@ -56,7 +56,8 @@ export interface OperationRecord {
 interface ThreadFailureRecord {
   readonly threadId: string;
   readonly turnId: string;
-  readonly failure: FailureInfo;
+  readonly failure: FailureInfo | null;
+  readonly recoveredState?: "completed" | "interrupted";
   readonly order?: FailureEvidenceOrder;
 }
 
@@ -421,7 +422,7 @@ export class OperationJournal {
     candidate: FailureInfo,
     operationId?: string,
     order?: FailureEvidenceOrder,
-  ): Promise<FailureInfo> {
+  ): Promise<FailureInfo | null> {
     await this.init();
     if (candidate.turnId !== turnId) {
       throw new Error("A terminal failure must match its turn.");
@@ -439,8 +440,10 @@ export class OperationJournal {
       entry.turnId === turnId && entry.terminalFailure?.turnId === turnId
     )?.terminalFailure ?? null;
     const retained = this.threadFailures.get(key);
-    const existing = retained?.failure ?? operation?.terminalFailure ?? legacyFailure;
     const comparison = order && retained?.order ? compareFailureOrder(order, retained.order) : null;
+    if (retained?.recoveredState && (order === undefined ||
+      (comparison !== null && comparison <= 0))) return null;
+    const existing = retained?.failure ?? operation?.terminalFailure ?? legacyFailure;
     const stale = retained?.order !== undefined &&
       (order === undefined || (comparison !== null && comparison < 0));
     const authoritativeV2 = order?.protocolVersion === 2;
@@ -491,9 +494,22 @@ export class OperationJournal {
     return failure;
   }
 
-  async clearTerminalFailure(threadId: string, turnId: string): Promise<void> {
+  async getRecoveryByTurnId(threadId: string, turnId: string): Promise<"completed" | "interrupted" | null> {
     await this.init();
-    let changed = this.threadFailures.delete(`${threadId}\u0000${turnId}`);
+    return this.threadFailures.get(`${threadId}\u0000${turnId}`)?.recoveredState ?? null;
+  }
+
+  async clearTerminalFailure(
+    threadId: string, turnId: string, state: "completed" | "interrupted",
+    order?: FailureEvidenceOrder,
+  ): Promise<void> {
+    await this.init();
+    const key = `${threadId}\u0000${turnId}`;
+    const retained = this.threadFailures.get(key);
+    if (retained?.order && (!order || compareFailureOrder(order, retained.order) < 0)) return;
+    const tombstone = { threadId, turnId, failure: null, recoveredState: state, order };
+    let changed = JSON.stringify(retained) !== JSON.stringify(tombstone);
+    this.threadFailures.set(key, tombstone);
     for (const entry of this.entries.values()) {
       if (entry.kind !== "thread.turn.start" || entry.threadId !== threadId ||
         entry.turnId !== turnId || (entry.terminalRunStatus === undefined && entry.terminalFailure === undefined)) continue;
@@ -573,7 +589,9 @@ function isThreadFailureRecord(value: unknown): value is ThreadFailureRecord {
   if (typeof value !== "object" || value === null) return false;
   const item = value as Record<string, unknown>;
   return typeof item.threadId === "string" && typeof item.turnId === "string" &&
-    isFailureInfo(item.failure) && item.failure.turnId === item.turnId &&
+    (item.failure === null
+      ? (item.recoveredState === "completed" || item.recoveredState === "interrupted")
+      : isFailureInfo(item.failure) && item.failure.turnId === item.turnId && item.recoveredState === undefined) &&
     (item.order === undefined || FailureEvidenceOrderSchema.safeParse(item.order).success);
 }
 
@@ -599,6 +617,7 @@ const failureSourcePriority = {
 function compareFailureOrder(candidate: FailureEvidenceOrder, existing: FailureEvidenceOrder): number {
   if (candidate.protocolVersion !== existing.protocolVersion) return 1;
   return candidate.snapshotSequence - existing.snapshotSequence ||
+    (candidate.updatedAt && existing.updatedAt ? Date.parse(candidate.updatedAt) - Date.parse(existing.updatedAt) : 0) ||
     Number(candidate.scope === "full") - Number(existing.scope === "full") ||
     (candidate.item && existing.item
       ? Date.parse(candidate.item.updatedAt) - Date.parse(existing.item.updatedAt) ||

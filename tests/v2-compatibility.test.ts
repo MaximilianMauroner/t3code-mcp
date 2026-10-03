@@ -405,6 +405,83 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await restarted.gateway.threadsList({ includeArchived: false, limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
   });
 
+  it.each(["reason", "reset"])("accepts same-sequence newer shell %s evidence", async (change) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "same-sequence-shell" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    const failure = { ...providerFailures.codexUsageLimit, resetAt: null };
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure });
+    expect((await gateway.runGet(sent.runId)).failure?.resetAt).toBeNull();
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: change === "reason" ? "Changed bound reason" : failure.message,
+      lastErrorClass: change === "reason" ? "provider_error" : failure.class,
+      usageLimitResetAt: change === "reason" ? null : providerFailures.codexUsageLimit.resetAt,
+      updatedAt: "2026-10-02T20:00:01.000Z" });
+    const expected = change === "reason" ? { message: "Changed bound reason", category: "provider_error", code: null, resetAt: null }
+      : { message: failure.message, code: failure.code, resetAt: providerFailures.codexUsageLimit.resetAt };
+    expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject(expected);
+  });
+
+  it.each(["run", "thread", "overview"])("rejects a delayed failed %s read after ordered recovery and restart", async (reader) => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "recovery-race" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: providerFailures.codexUsageLimit.message, lastErrorClass: "usage_limit" });
+    const older = await client.getThread("thread-1");
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const getThread = client.getThread.bind(client);
+    let calls = 0;
+    client.getThread = async (id) => { if (++calls === 1) { entered(); await gate; return older; } return getThread(id); };
+    const delayed = reader === "run" ? gateway.runGet(sent.runId).then((result) => result.failure)
+      : reader === "thread" ? gateway.threadGet("thread-1").then((result) => result.thread.failure)
+      : gateway.threadsOverview({ includeArchived: false, runningLimit: 5 }).then((result) => result.highlights[0]?.failure);
+    await started;
+    run.status = "completed";
+    run.completedAt = "2026-10-02T20:00:01.000Z";
+    snapshot.snapshotSequence = 3;
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { status: "completed", lastError: null, lastErrorClass: null });
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "completed", failure: null });
+    release();
+    expect(await delayed).toBeNull();
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => older;
+    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: "completed", failure: null });
+    expect((await restarted.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toBeNull();
+  });
+
+  it.each(["completed", "interrupted"] as const)("clears a historical V2 failure corrected to %s", async (state) => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "historical-recovery" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "first", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    const older = await client.getThread("thread-1");
+    expect((await gateway.runGet(sent.runId)).failure?.category).toBe("quota");
+    run.status = state;
+    run.completedAt = "2026-10-02T20:00:01.000Z";
+    snapshot.snapshotSequence = 3;
+    snapshot.projection.runs.push({ ...run, id: "successor", rootNodeId: "successor-root", ordinal: 2, status: "running",
+      requestedAt: "2026-10-02T20:00:02.000Z", startedAt: "2026-10-02T20:00:02.000Z", completedAt: null });
+    Object.assign(shell.threads[0]!, { latestRunId: "successor", activeRunId: "successor", status: "running", lastError: null, lastErrorClass: null });
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: state, failure: null, t3TurnId: run.id });
+    expect(await gateway.runWait(sent.runId, 0.1)).toMatchObject({ runStatus: state, failure: null });
+    const restarted = makeGateway(config);
+    restarted.client.getThread = async () => older;
+    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: state, failure: null });
+  });
+
   it("invalidates a retained root when a newer full snapshot marks that error recovered", async () => {
     const { gateway, client, snapshot, shell, config } = await setup();
     const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "recovered-item" });
