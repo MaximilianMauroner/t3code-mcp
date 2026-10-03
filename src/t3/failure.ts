@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isIP } from "node:net";
 import type { FailureCategory, FailureInfo } from "../gateway.js";
 import { ProviderRetrySchema, type Thread, type ThreadShell } from "./types.js";
 
@@ -125,6 +126,12 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
     .replace(/(["'])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1/g, "$1[REDACTED PATH]$1")
     .replace(/(^|[^\p{L}\p{N}_\\/])(?:\/[^\s"'<>\])}]+|[A-Za-z]:[\\/][^\s"'<>\])}]+|\\\\[^\s"'<>\])}]+)/gu, "$1[REDACTED PATH]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, "[REDACTED HOST]")
+    .replace(/\[([\da-f:.]+(?:%[\w.-]+)?)\](?::\d+)?/gi,
+      (match, host: string) => isIP(host) === 6 ? "[REDACTED HOST]" : match)
+    .replace(/(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f:.]+(?:%[\w.-]+)?(?![\w:])/gi,
+      (host) => isIP(host) === 6 ? "[REDACTED HOST]" : host)
+    .replace(/\b(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z][a-z\d-]*(?::\d+)?\b/gi, "[REDACTED HOST]")
+    .replace(/\b[a-z][a-z\d-]*:\d{1,5}\b/gi, "[REDACTED HOST]")
     .replace(/(["'])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [REDACTED]")

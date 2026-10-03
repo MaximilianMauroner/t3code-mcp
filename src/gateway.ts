@@ -35,6 +35,7 @@ import {
   type OperationRecord,
   type TaskRecord,
   type TaskStage,
+  type TerminalRecovery,
 } from "./operations/journal.js";
 import { AuditLog, type AuditLogPage, type AuditQueryInput } from "./operations/audit-log.js";
 import {
@@ -989,6 +990,13 @@ export class T3Gateway {
       return input.includeArchived || !thread.archivedAt;
     });
     const sorted = sortThreads(filtered, input.sort ?? "recent", now);
+    await this.journal.clearTerminalFailures(sorted.flatMap((thread) => {
+      const turn = thread.latestTurn;
+      return turn?.state === "completed" || turn?.state === "interrupted" ? [{
+        threadId: thread.id, turnId: turn.turnId, state: turn.state,
+        order: failureEvidenceOrder(thread, shell.snapshotSequence, "shell"),
+      }] : [];
+    }));
     const summaries = await Promise.all(sorted.map(async (thread) => this.withRetainedFailure(
       threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
       failureEvidenceOrder(thread, shell.snapshotSequence, "shell"),
@@ -1044,6 +1052,13 @@ export class T3Gateway {
         threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
         failureEvidenceOrder(thread, shell.snapshotSequence, "shell"),
       )));
+    await this.journal.clearTerminalFailures(filtered.flatMap((thread) => {
+      const turn = thread.latestTurn;
+      return turn?.state === "completed" || turn?.state === "interrupted" ? [{
+        threadId: thread.id, turnId: turn.turnId, state: turn.state,
+        order: failureEvidenceOrder(thread, shell.snapshotSequence, "shell"),
+      }] : [];
+    }));
     const running = filtered
       .filter(isThreadRunning)
       .map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
@@ -2480,6 +2495,7 @@ export class T3Gateway {
     excerptChars: number,
   ): Promise<Array<T & { latestResponseExcerpt: string | null }>> {
     const results: Array<T & { latestResponseExcerpt: string | null }> = [];
+    const recoveries: TerminalRecovery[] = [];
     for (const summary of summaries) {
       try {
         const snapshot = await this.client.getThread(summary.id);
@@ -2490,7 +2506,14 @@ export class T3Gateway {
         const fullOrder = failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full");
         // Observe full evidence privately, but keep selection, sorting and counts
         // on the shell snapshot that selected this row.
-        const observed = await this.withRetainedFailure(fullSummary, fullOrder);
+        const turn = fullSummary.latestTurn;
+        let observed: ThreadSummary;
+        if (turn?.state === "completed" || turn?.state === "interrupted") {
+          recoveries.push({ threadId: fullSummary.id, turnId: turn.turnId, state: turn.state, order: fullOrder });
+          observed = { ...fullSummary, failure: null };
+        } else {
+          observed = await this.withRetainedFailure(fullSummary, fullOrder);
+        }
         const enriched = sameTurn && sameState
           ? { ...summary, failure: observed.failure }
           : { ...summary, failure: null };
@@ -2503,6 +2526,7 @@ export class T3Gateway {
         results.push({ ...summary, latestResponseExcerpt: null });
       }
     }
+    await this.journal.clearTerminalFailures(recoveries);
     return results;
   }
 

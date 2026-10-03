@@ -61,6 +61,13 @@ interface ThreadFailureRecord {
   readonly order?: FailureEvidenceOrder;
 }
 
+export interface TerminalRecovery {
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly state: "completed" | "interrupted";
+  readonly order?: FailureEvidenceOrder;
+}
+
 export interface TaskRecord {
   readonly taskRef: string;
   readonly idempotencyKey: string;
@@ -503,16 +510,27 @@ export class OperationJournal {
     threadId: string, turnId: string, state: "completed" | "interrupted",
     order?: FailureEvidenceOrder,
   ): Promise<void> {
+    return this.clearTerminalFailures([{ threadId, turnId, state, order }]);
+  }
+
+  async clearTerminalFailures(recoveries: ReadonlyArray<TerminalRecovery>): Promise<void> {
     await this.init();
-    const key = `${threadId}\u0000${turnId}`;
-    const retained = this.threadFailures.get(key);
-    if (retained?.order && (!order || compareFailureOrder(order, retained.order) < 0)) return;
-    const tombstone = { threadId, turnId, failure: null, recoveredState: state, order };
-    let changed = JSON.stringify(retained) !== JSON.stringify(tombstone);
-    this.threadFailures.set(key, tombstone);
+    let changed = false;
+    const cleared = new Set<string>();
+    for (const { threadId, turnId, state, order } of recoveries) {
+      const key = `${threadId}\u0000${turnId}`;
+      const retained = this.threadFailures.get(key);
+      if (retained?.order && (!order || compareFailureOrder(order, retained.order) < 0)) continue;
+      const tombstone = { threadId, turnId, failure: null, recoveredState: state, order };
+      if (JSON.stringify(retained) === JSON.stringify(tombstone)) continue;
+      changed = true;
+      this.threadFailures.set(key, tombstone);
+      cleared.add(key);
+    }
+    if (cleared.size === 0) return;
     for (const entry of this.entries.values()) {
-      if (entry.kind !== "thread.turn.start" || entry.threadId !== threadId ||
-        entry.turnId !== turnId || (entry.terminalRunStatus === undefined && entry.terminalFailure === undefined)) continue;
+      if (entry.kind !== "thread.turn.start" || !cleared.has(`${entry.threadId}\u0000${entry.turnId}`) ||
+        (entry.terminalRunStatus === undefined && entry.terminalFailure === undefined)) continue;
       const { terminalRunStatus, terminalFailure, ...recovered } = entry;
       this.entries.set(entry.idempotencyKey, { ...recovered, updatedAt: new Date().toISOString() });
       changed = true;
@@ -646,6 +664,7 @@ function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidat
   const preferred = upgradesUnknown || (!losesKnownCategory &&
     failureSourcePriority[candidate.source] > failureSourcePriority[existing.source]) ? candidate : existing;
   const other = preferred === candidate ? existing : candidate;
+  if (preferred.message !== other.message || preferred.class !== other.class) return preferred;
   return {
     ...preferred,
     category: preferred.category === "unknown" && preferred.source === other.source ? other.category : preferred.category,

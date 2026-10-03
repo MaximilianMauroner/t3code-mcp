@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { readFile } from "node:fs/promises";
+import { watch } from "node:fs";
 import { join } from "node:path";
 import { FakeT3, assistantMessage } from "./support/fake-t3.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
@@ -40,6 +41,59 @@ async function setup(previousResponse = true) {
 }
 
 describe("structured provider failures", () => {
+  it.each(["summary", "full", "overview"])("batches recovery persistence for a %s read", async (reader) => {
+    const { fixture, fake, thread } = await setup(false);
+    for (let index = 0; index < 24; index += 1) {
+      fake.addThread({ id: `finished-${index}`, projectId: thread.projectId,
+        latestTurn: { turnId: `finished-turn-${index}`, state: "completed", requestedAt: "2026-01-01T00:00:00.000Z",
+          completedAt: "2026-01-01T00:01:00.000Z" } });
+    }
+    let writes = 0;
+    const watcher = watch(fixture.directory, (event, filename) => {
+      if (event === "rename" && filename === "operations.json") writes += 1;
+    });
+    try {
+      if (reader === "overview") await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+      else await fixture.gateway.threadsList({ includeArchived: false, detail: reader, limit: 50 });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(writes).toBeGreaterThan(0);
+      expect(writes).toBeLessThanOrEqual(2);
+      const restarted = makeGateway(fixture.config);
+      expect(await restarted.journal.getRecoveryByTurnId("finished-0", "finished-turn-0")).toBe("completed");
+    } finally {
+      watcher.close();
+    }
+  });
+
+  it("replaces superseded V1 reason metadata without inheriting an ambiguous code", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "API Error: 429", failureCode: "api_error_429",
+      resetAt: "2026-10-04T00:00:00.000Z", retryAfter: "300" };
+    expect((await fixture.gateway.threadsList({ includeArchived: false, limit: 5 })).page.items[0]?.failure)
+      .toMatchObject({ category: "unknown", code: "api_error_429" });
+    thread.activities.push({ kind: "runtime.error", turnId,
+      payload: { message: "Codex usage limit reached. Send the message again once the limit resets." } });
+    const expected = { category: "quota", source: "t3_activity", code: null, resetAt: null, retryAfter: null, retry: null };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject(expected);
+  });
+
+  it("redacts bare DNS and IPv6 endpoints from failure, response, and journal", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "ready" };
+    thread.messages.push(assistantMessage("API Error: auth_unavailable: db.internal:5432 [fd00::1]:8080 fd00::2 [fe80::3%eth0]:8000 at 13:55:45", turnId));
+    const result = await fixture.gateway.runGet(run.runId);
+    for (const text of [JSON.stringify(result.failure), result.latestResponse!.text,
+      await readFile(join(fixture.directory, "operations.json"), "utf8")]) {
+      expect(text).not.toMatch(/db\.internal|fd00|fe80|eth0/);
+      expect(text).toContain("13:55:45");
+    }
+  });
+
   it.each(["runtime.error", "provider.turn.start.failed"])("retains structured %s metadata without text", async (kind) => {
     const { fixture, thread, run } = await setup(false);
     const turnId = thread.latestTurn!.turnId;
