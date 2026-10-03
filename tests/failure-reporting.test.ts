@@ -41,6 +41,55 @@ async function setup(previousResponse = true) {
 }
 
 describe("structured provider failures", () => {
+  it.each(["list", "overview"])("records recovery outside %s filters before disconnection", async (reader) => {
+    const { fixture, fake, thread, run } = await setup(false);
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: thread.latestTurn.turnId, lastError: "Old failure" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).not.toBeNull();
+    thread.latestTurn = { ...thread.latestTurn!, state: "completed" };
+    thread.session = { status: "ready", lastError: null };
+    if (reader === "list") {
+      expect((await fixture.gateway.threadsList({ includeArchived: false, activity: "failed", limit: 5 })).page.items).toHaveLength(0);
+    } else {
+      expect((await fixture.gateway.threadsOverview({ includeArchived: false, query: "no match", runningLimit: 5 })).total).toBe(0);
+    }
+    await fake.close();
+    expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toBeNull();
+  });
+
+  it.each([[1, 2], [2, 1]] as const)("rejects a delayed protocol %s failure after protocol %s recovery", async (oldProtocol, newProtocol) => {
+    const { fixture, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
+    const failed = structuredClone(await fixture.client.getThread(thread.id));
+    failed.snapshotSequence = 100;
+    failed.thread.orchestrationProtocolVersion = oldProtocol;
+    failed.thread.latestTurn = { ...failed.thread.latestTurn!, state: "error" };
+    failed.thread.session = { status: "error", activeTurnId: failed.thread.latestTurn.turnId, lastError: "Old protocol failure" };
+    const recovered = structuredClone(failed);
+    recovered.snapshotSequence = 1;
+    recovered.thread.orchestrationProtocolVersion = newProtocol;
+    recovered.thread.latestTurn = { ...recovered.thread.latestTurn!, state: "completed" };
+    recovered.thread.session = { status: "ready", activeTurnId: null, lastError: null };
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    fixture.client.getThread = async () => { if (++calls === 1) { entered(); await gate; return failed; } return recovered; };
+    const delayed = fixture.gateway.runGet(run.runId);
+    await started;
+    expect(await fixture.gateway.runGet(run.runId)).toMatchObject({ runStatus: "completed", failure: null });
+    release();
+    expect(await delayed).toMatchObject({ runStatus: "completed", failure: null });
+    const restarted = makeGateway(fixture.config);
+    // Repeat the prior candidate's recorded order through the journal, as a delayed in-flight observer would.
+    expect(await restarted.journal.retainTerminalFailure(thread.id, failed.thread.latestTurn!.turnId,
+      { category: "unknown", code: null, message: "Old protocol failure", class: null, retry: null, retryable: null,
+        turnId: failed.thread.latestTurn!.turnId, model: thread.modelSelection.model, provider: null,
+        resetAt: null, retryAfter: null, source: "t3_session" }, undefined,
+      { protocolVersion: oldProtocol, scope: "full", snapshotSequence: 100, readStartedAt: 1 })).toBeNull();
+  });
+
   it.each(["summary", "full", "overview"] as const)("batches recovery persistence for a %s read", async (reader) => {
     const { fixture, fake, thread } = await setup(false);
     for (let index = 0; index < 24; index += 1) {

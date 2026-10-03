@@ -633,7 +633,9 @@ const failureSourcePriority = {
 };
 
 function compareFailureOrder(candidate: FailureEvidenceOrder, existing: FailureEvidenceOrder): number {
-  if (candidate.protocolVersion !== existing.protocolVersion) return 1;
+  if (candidate.protocolVersion !== existing.protocolVersion) {
+    return (candidate.readStartedAt ?? 0) - (existing.readStartedAt ?? 0);
+  }
   return candidate.snapshotSequence - existing.snapshotSequence ||
     (candidate.updatedAt && existing.updatedAt ? Date.parse(candidate.updatedAt) - Date.parse(existing.updatedAt) : 0) ||
     Number(candidate.scope === "full") - Number(existing.scope === "full") ||
