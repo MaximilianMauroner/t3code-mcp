@@ -277,6 +277,27 @@ describe("structured provider failures", () => {
     });
   });
 
+  it("does not relabel a retained V1 reason with a colliding incoming raw identity", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    const getThread = fixture.client.getThread.bind(fixture.client);
+    let sequence = 100;
+    fixture.client.getThread = async (id) => ({ ...await getThread(id), snapshotSequence: sequence++ });
+    thread.session = { status: "error", activeTurnId: turnId, lastErrorClass: "provider_error",
+      lastError: "Provider failed at https://one.example/private", failureCode: "first_error", resetAt: "2026-10-04T00:00:00Z" };
+    expect((await fixture.gateway.runGet(run.runId)).failure?.code).toBe("first_error");
+    thread.session.lastError = "Provider failed at https://two.example/private";
+    thread.session.failureCode = null;
+    thread.session.resetAt = null;
+    await fixture.gateway.runGet(run.runId);
+    thread.activities.push({ kind: "runtime.error", turnId,
+      payload: { class: "provider_error", message: thread.session.lastError } });
+    const expected = { source: "t3_activity", code: null, resetAt: null, message: "Provider failed at [REDACTED URL]" };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect((await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId))).toMatchObject(expected);
+  });
+
   it.each(["summary", "full", "overview"] as const)("batches recovery persistence for a %s read", async (reader) => {
     const { fixture, fake, thread } = await setup(false);
     for (let index = 0; index < 24; index += 1) {

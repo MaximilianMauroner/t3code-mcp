@@ -478,10 +478,13 @@ export class OperationJournal {
       : authoritativeV2 || laterV1Evidence || newerProtocol
         ? mergeOrderedFailure(existing, candidate, comparison === 0 && sameReason)
         : mergeTerminalFailure(existing, candidate, sameReason);
+    // A newer observation can retain the stronger old reason. Keep that
+    // reason's raw identity before attribution copies obscure its selection.
+    const candidateOrder = merged === existing && order
+      ? { ...order, failureIdentity: retained?.order?.failureIdentity } : order;
     if (!stale && order?.protocolVersion === 2 && order.scope === "shell" && existing) {
       merged = { ...merged, provider: existing.provider, model: existing.model };
     }
-    const candidateOrder = unboundShell && order ? { ...order, failureIdentity: retained?.order?.failureIdentity } : order;
     const reasonOrder = !stale && (unboundShell || matchingShell || (merged.source === candidate.source && merged.message === candidate.message &&
       merged.category === candidate.category)) ? candidateOrder ?? retained?.order : retained?.order;
     // Run attribution is immutable. An older full read can supply it without
