@@ -468,11 +468,13 @@ export class OperationJournal {
       (order === undefined || (comparison !== null && comparison < 0));
     const authoritativeV2 = order?.protocolVersion === 2;
     const newerProtocol = comparison !== null && comparison > 0 && order?.protocolVersion !== retained?.order?.protocolVersion;
+    const sameReason = order?.failureIdentity != null && order.failureIdentity === retained?.order?.failureIdentity;
     const laterV1Evidence = comparison !== null && comparison > 0 &&
       candidate.source === existing?.source &&
-      (candidate.source === "t3_activity" || candidate.source === "t3_message");
-    const sameReason = order?.failureIdentity != null && order.failureIdentity === retained?.order?.failureIdentity;
-    const matchingShell = order?.protocolVersion === 2 && order.scope === "shell" && existing != null &&
+      (candidate.source === "t3_activity" || candidate.source === "t3_message" ||
+        (candidate.source === "t3_session" && (!sameReason || candidate.class !== existing.class)));
+    const matchingShell = order?.scope === "shell" && existing != null &&
+      (order.protocolVersion === 2 || (candidate.source === "t3_session" && existing.source === "t3_session")) &&
       sameReason &&
       existing.message === candidate.message && existing.class === candidate.class;
     const unboundShell = order?.protocolVersion === 2 && order.scope === "shell" &&

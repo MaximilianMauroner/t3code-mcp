@@ -3117,7 +3117,9 @@ function threadDetail(
   let failure = fullFailure ?? shellFailure;
   let failureOrder = fullFailure ? fullOrder : source === summary ? shellOrder : fullOrder;
   const newerShell = source === summary && shellOrder != null && fullOrder != null &&
-    (shellOrder.protocolVersion === 2 || differentEras) && compareFailureOrder(shellOrder, fullOrder) > 0;
+    (shellOrder.protocolVersion === 2 || differentEras ||
+      (fullFailure?.source === "t3_session" && shellFailure?.source === "t3_session")) &&
+    compareFailureOrder(shellOrder, fullOrder) > 0;
   if (newerShell && shellFailure) {
     const run = thread.turnFailures?.find((entry) => entry.turnId === shellFailure.turnId);
     if (shellOrder.protocolVersion === 2 && shellFailure.source === "t3_turn" && fullFailure) {

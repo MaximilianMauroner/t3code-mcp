@@ -582,6 +582,117 @@ describe("structured provider failures", () => {
       failure: { turnId: row.latestTurn.turnId, source: "t3_session", message: "Current V1 shell error" } });
   });
 
+  it.each([
+    [false, "changed"], [true, "changed"],
+    [false, "matching"], [true, "matching"],
+    [false, "matching reset"], [true, "matching reset"],
+    [false, "redaction collision"], [true, "redaction collision"],
+    [false, "known to unknown"], [true, "known to unknown"],
+  ] as const)("orders newer V1 shell session evidence (retained=%s, reason=%s)", async (retained, reason) => {
+    const { fixture, fake, thread, run } = await setup(false);
+    await fixture.gateway.runGet(run.runId);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    const oldMessage = reason === "redaction collision" ? "Failure at https://one.example/private" : "Old session failure";
+    const matching = reason === "matching" || reason === "matching reset";
+    const newMessage = matching ? oldMessage
+      : reason === "redaction collision" ? "Failure at https://two.example/private" : "New session failure";
+    thread.session = { status: "error", activeTurnId: turnId, lastError: oldMessage,
+      failureCode: reason === "known to unknown" ? "usage_limit_error" : "old_code",
+      ...(reason === "known to unknown" ? { failureCategory: "quota" } : {}),
+      resetAt: "2026-10-04T00:00:00Z", retryAfter: "300" };
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    full.snapshotSequence = 100;
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = 101;
+    shell.threads[0]!.session = { status: "error", activeTurnId: turnId, lastError: newMessage,
+      ...(reason === "matching reset" ? { resetAt: "2026-10-05T00:00:00Z", retryAfter: "600" } : {}) };
+    fixture.client.getThread = async () => full;
+    if (retained) expect((await fixture.gateway.runGet(run.runId)).failure?.code).toBe(thread.session.failureCode);
+    fixture.client.getShell = async () => shell;
+    const expected = { source: "t3_session", turnId, category: "unknown",
+      message: reason === "redaction collision" ? "Failure at [REDACTED URL]" : newMessage,
+      code: matching ? "old_code" : null,
+      resetAt: reason === "matching reset" ? "2026-10-05T00:00:00.000Z" : matching ? "2026-10-04T00:00:00.000Z" : null,
+      retryAfter: reason === "matching reset" ? "600" : matching ? "300" : null };
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    const restarted = makeGateway(fixture.config);
+    expect(await restarted.journal.getFailureByTurnId(thread.id, turnId)).toMatchObject(expected);
+    expect(await restarted.journal.getFailureEvidenceOrder(thread.id, turnId)).toMatchObject({ snapshotSequence: 101 });
+    await fake.close();
+    expect((await restarted.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+  });
+
+  it.each(["t3_activity", "t3_message"] as const)("keeps richer V1 full %s evidence over a newer shell session", async (source) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Old session failure" };
+    const message = source === "t3_message" ? "API Error: auth_unavailable: No credentials" : "Older activity refusal";
+    if (source === "t3_message") thread.messages.push(assistantMessage(message, turnId));
+    else thread.activities.push({ kind: "runtime.error", turnId, payload: { message } });
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    full.snapshotSequence = 100;
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = 101;
+    shell.threads[0]!.session = { status: "error", activeTurnId: turnId, lastError: "New shell session failure" };
+    fixture.client.getThread = async () => full;
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject({ source, message });
+    fixture.client.getShell = async () => shell;
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject({ source, message });
+    expect(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId)).toMatchObject({ source, message });
+  });
+
+  it("replaces ordered V1 full session reasons without retaining obsolete metadata", async () => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Old full session failure",
+      failureCode: "old_code", resetAt: "2026-10-04T00:00:00Z" };
+    const getThread = fixture.client.getThread.bind(fixture.client);
+    let sequence = 100;
+    fixture.client.getThread = async (id) => ({ ...await getThread(id), snapshotSequence: sequence++ });
+    expect((await fixture.gateway.runGet(run.runId)).failure?.code).toBe("old_code");
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "New full session failure" };
+    const expected = { source: "t3_session", message: "New full session failure", code: null, resetAt: null };
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
+    expect(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId)).toMatchObject(expected);
+  });
+
+  it.each([99, 100])("keeps V1 full session evidence when shell sequence %s is not newer", async (sequence) => {
+    const { fixture, thread } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Current full session failure" };
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    full.snapshotSequence = 100;
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = sequence;
+    shell.threads[0]!.session = { status: "error", activeTurnId: turnId, lastError: "Stale shell session failure" };
+    fixture.client.getThread = async () => full;
+    fixture.client.getShell = async () => shell;
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject({ message: "Current full session failure" });
+    expect(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId)).toMatchObject({ message: "Current full session failure" });
+  });
+
+  it.each([false, true])("keeps bound V1 full session evidence over a newer generic shell (retained=%s)", async (retained) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.session = { status: "error", activeTurnId: turnId, lastError: "Bound full session failure" };
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    full.snapshotSequence = 100;
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = 101;
+    shell.threads[0]!.session = { status: "ready", activeTurnId: null, lastError: null };
+    fixture.client.getThread = async () => full;
+    if (retained) await fixture.gateway.runGet(run.runId);
+    fixture.client.getShell = async () => shell;
+    const expected = { source: "t3_session", message: "Bound full session failure" };
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId)).toMatchObject(expected);
+  });
+
   it.each(["vendor.example", "/namespace/error", "vendor:api_error", "vendor.token:0"])("preserves structured failure namespace %s and redacts message text", async (namespace) => {
     const { fixture, thread, run } = await setup(false);
     const turnId = thread.latestTurn!.turnId;
