@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { T3HttpClient } from "../src/t3/http-client.js";
+import { FakeT3 } from "./support/fake-t3.js";
+import { gatewayFixture } from "./support/gateway-fixture.js";
 
 const descriptor = { environmentId: "test-env", label: "Test", serverVersion: "test" };
 const shell = { snapshotSequence: 1, projects: [], threads: [], updatedAt: "2026-10-03T08:47:00.000Z" };
@@ -95,12 +97,52 @@ describe("protocol discovery during gateway uptime", () => {
       .mockResolvedValueOnce(json(shell));
     const client = new T3HttpClient("http://test.invalid", "token");
     await client.getDescriptor();
-    await expect(client.dispatch(command)).rejects.toThrow("discovery unavailable");
+    await expect(client.dispatch(command)).rejects.toMatchObject({
+      status: 400,
+      code: "protocol_discovery_failed",
+      reason: "command_not_sent",
+      message: expect.stringContaining("T3 command not sent: discovery unavailable"),
+    });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(client.telemetry().lastError).toBe("discovery unavailable");
+    expect(client.telemetry().lastError).toContain("discovery unavailable");
     await client.getDescriptor();
     await expect(client.getShell()).resolves.toEqual(shell);
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["network", "HTTP", "schema", "unsupported"] as const)("records a %s preflight failure as rejected and permits safe fresh-key retry", async (failure) => {
+    const fake = new FakeT3();
+    await fake.start();
+    const fixture = await gatewayFixture(fake);
+    try {
+      fake.addThread({ id: "thread-1" });
+      await fixture.client.getDescriptor();
+      const fetch = globalThis.fetch;
+      let failDiscovery = true;
+      vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
+        if (String(url).endsWith("/.well-known/t3/environment") && failDiscovery) {
+          failDiscovery = false;
+          if (failure === "network") return Promise.reject(new Error("descriptor offline"));
+          if (failure === "HTTP") return Promise.resolve(json({ message: "descriptor offline" }, 503));
+          if (failure === "schema") return Promise.resolve(json({ invalid: true }));
+          return Promise.resolve(json({ ...descriptor, orchestrationProtocolVersion: 3 }));
+        }
+        return fetch(url, init);
+      });
+      const input = { threadId: "thread-1", idempotencyKey: "not-sent" };
+      const rejected = await fixture.gateway.threadArchive(input);
+      expect(rejected).toMatchObject({ status: "rejected", reason: expect.stringContaining("command not sent") });
+      expect(rejected).toMatchObject({ reason: expect.stringContaining("new idempotency key") });
+      expect(fake.dispatches).toHaveLength(0);
+      expect(await fixture.journal.getByIdempotencyKey(input.idempotencyKey)).toMatchObject({ status: "rejected" });
+      expect(await fixture.gateway.threadArchive(input)).toMatchObject({ status: "rejected", operationId: rejected.operationId });
+      expect(fake.dispatches).toHaveLength(0);
+      expect(await fixture.gateway.threadArchive({ ...input, idempotencyKey: "safe-retry" })).toMatchObject({ status: "accepted" });
+      expect(fake.dispatches).toHaveLength(1);
+    } finally {
+      await fixture.cleanup();
+      await fake.close();
+    }
   });
 
   it("preserves the original read error when protocol refresh fails", async () => {

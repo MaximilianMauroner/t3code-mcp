@@ -187,7 +187,26 @@ export class T3HttpClient {
 
   async dispatch(command: T3Command, signal?: AbortSignal): Promise<DispatchResult> {
     // Detect updates before a mutation rather than replaying a failed command.
-    if (await this.protocolVersion(signal, true) === 2) return this.dispatchV2(command, signal);
+    let version: 1 | 2;
+    try {
+      version = await this.protocolVersion(signal, true);
+    } catch (error) {
+      signal?.throwIfAborted();
+      const detail = error instanceof Error ? error.message : String(error);
+      // Local validation rejection, before any mutation transport is called.
+      // The gateway must not journal a definitely unsent command as uncertain.
+      const rejection = new T3HttpError(
+        400,
+        "GET",
+        "/.well-known/t3/environment",
+        "protocol_discovery_failed",
+        `T3 command not sent: ${detail} Retry after discovery recovers with a new idempotency key.`,
+        "command_not_sent",
+      );
+      this.lastError = rejection.message;
+      throw rejection;
+    }
+    if (version === 2) return this.dispatchV2(command, signal);
     return this.request(
       "POST",
       "/api/orchestration/dispatch",
