@@ -601,6 +601,42 @@ describe("merged orchestrator V2 boundary", () => {
   });
 
   it.each([
+    { model: selection.model, provider: "codex" },
+    { model: selection.model, instanceId: "other-model-instance" },
+    { model: selection.model },
+  ])("uses the matching V2 shell provider instance with model selection %j", async (modelSelection) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "shell-provider-instance" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    run.providerInstanceId = "runtime-provider";
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      providerInstanceId: "runtime-provider", modelSelection, lastError: "Runtime provider failed", lastErrorClass: "provider_error" });
+    const expected = { source: "t3_session", turnId: run.id, provider: "runtime-provider", model: selection.model };
+    expect((await gateway.threadsList({ includeArchived: false, detail: "summary", limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
+    expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toMatchObject(expected);
+  });
+
+  it.each([
+    ["list", "completed"], ["list", "interrupted"],
+    ["overview", "completed"], ["overview", "interrupted"],
+  ] as const)("returns a new full failure after %s accepts the shell's %s recovery", async (reader, state) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "first-enriched-failure" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.snapshotSequence = 3;
+    snapshot.projection.turnItems.push({ id: "new-root", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: state, lastError: null, lastErrorClass: null });
+    const observed = reader === "list" ? (await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0];
+    expect(observed).toMatchObject({ latestTurn: { turnId: run.id, state }, activity: "idle", latestResponseExcerpt: null,
+      failure: { source: "t3_v2_turn_item", turnId: run.id, code: "usageLimitExceeded" } });
+    expect((await makeGateway(config).gateway.runGet(sent.runId)).failure).toMatchObject({ turnId: run.id, code: "usageLimitExceeded" });
+  });
+
+  it.each([
     ["summary", "completed"], ["summary", "interrupted"],
     ["full", "completed"], ["full", "interrupted"],
     ["overview", "completed"], ["overview", "interrupted"],

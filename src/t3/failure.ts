@@ -86,7 +86,9 @@ export function failureInfo(thread: ThreadShell, expectedTurnId?: string | null)
       turn.completedAt != null &&
       sessionTime >= Date.parse(turn.requestedAt) &&
       sessionTime <= Date.parse(turn.completedAt));
-  const provider = sessionMatches ? session?.providerName : null;
+  const provider = sessionMatches
+    ? (thread.orchestrationProtocolVersion === 2 ? session?.providerInstanceId : undefined) ?? session?.providerName
+    : null;
   const identity = provider ?? thread.modelSelection.provider ?? thread.modelSelection.instanceId ?? null;
   // A provider type is more specific than V1's generic usage-limit sentence.
   if (assistant && categoryForFailure(null, assistantCode, assistant.text) !== "unknown") {

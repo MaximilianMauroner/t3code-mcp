@@ -2543,7 +2543,10 @@ export class T3Gateway {
         const fullIsNewer = retainedOrder === undefined || compareFailureOrder(
           await this.journal.orderFailureEvidence(summary.id, summary.observedTurnId, fullOrder), retainedOrder,
         ) >= 0;
-        let failure = sameTurn && sameState ? observed.failure : fullIsNewer ? null : summary.failure;
+        // Retained full failure evidence still belongs to this row when the
+        // shell selected an earlier recovered state of the same turn.
+        let failure = sameTurn && (sameState || observed.failure !== null)
+          ? observed.failure : fullIsNewer ? null : summary.failure;
         if (!sameTurn && summary.latestTurn?.state === "error") {
           const turnId = summary.latestTurn.turnId;
           const historicalOrder = failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full", turnId, readStartedAt);
