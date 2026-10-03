@@ -566,6 +566,45 @@ describe("structured provider failures", () => {
     expect((await makeGateway(fixture.config).gateway.runGet(run.runId)).failure).toMatchObject(failure);
   });
 
+  it.each(["completed", "interrupted"] as const)("uses a newer V1 shell error over stale full %s", async (state) => {
+    const { fixture, thread } = await setup(false);
+    thread.latestTurn = { ...thread.latestTurn!, state };
+    thread.session = { status: "ready", lastError: null };
+    const full = structuredClone(await fixture.client.getThread(thread.id));
+    const shell = structuredClone(await fixture.client.getShell());
+    shell.snapshotSequence = full.snapshotSequence + 1;
+    const row = shell.threads[0]!;
+    row.latestTurn = { ...thread.latestTurn, state: "error" };
+    row.session = { status: "error", activeTurnId: row.latestTurn.turnId, lastError: "Current V1 shell error" };
+    fixture.client.getThread = async () => full;
+    fixture.client.getShell = async () => shell;
+    expect((await fixture.gateway.threadGet(thread.id)).thread).toMatchObject({ latestTurn: { state: "error" }, activity: "failed",
+      failure: { turnId: row.latestTurn.turnId, source: "t3_session", message: "Current V1 shell error" } });
+  });
+
+  it.each(["vendor.example", "/namespace/error", "vendor:api_error", "vendor.token:0"])("preserves structured failure namespace %s and redacts message text", async (namespace) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities.push({ kind: "runtime.error", turnId, payload: { class: namespace, code: namespace,
+      message: "Failed at https://private.example/path access_token=private-secret" } });
+    const expected = { class: namespace, code: namespace, category: "unknown", turnId };
+    const observed = await fixture.gateway.runGet(run.runId);
+    expect(observed.failure).toMatchObject(expected);
+    expect(observed.failure?.message).not.toMatch(/private.example|private-secret/);
+    expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
+    expect(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId)).toMatchObject(expected);
+  });
+
+  it.each(["api_key=private-code", "api_key:private-code"])("redacts structured credential assignments %s", async (credential) => {
+    const { fixture, thread, run } = await setup(false);
+    const turnId = thread.latestTurn!.turnId;
+    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
+    thread.activities.push({ kind: "runtime.error", turnId, payload: { class: credential, code: credential, message: "Provider failed" } });
+    expect(JSON.stringify((await fixture.gateway.runGet(run.runId)).failure)).not.toContain("private-code");
+    expect(JSON.stringify(await makeGateway(fixture.config).journal.getFailureByTurnId(thread.id, turnId))).not.toContain("private-code");
+  });
+
   it("keeps overview recovery order when full enrichment fails for a V1 session-only error", async () => {
     const { fixture, thread, run } = await setup(false);
     await fixture.gateway.runGet(run.runId);

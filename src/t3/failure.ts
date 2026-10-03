@@ -130,8 +130,8 @@ function buildFailure(
   const code = codeForFailure(payload.code ?? payload.type, message);
   const result: FailureInfo = {
     category: categoryForFailure(payload.class, code, message),
-    class: payload.class ? sanitizeFailureText(payload.class, 200) : null,
-    code: code ? sanitizeFailureText(code, 200) : null,
+    class: payload.class ? sanitizeFailureMetadata(payload.class, 200) : null,
+    code: code ? sanitizeFailureMetadata(code, 200) : null,
     message: sanitizeFailureText(message, 2_000),
     provider: provider === null ? null : sanitizeFailureIdentifier(provider),
     model: sanitizeFailureIdentifier(model), turnId,
@@ -166,12 +166,21 @@ export function sanitizeFailureText(value: string, maxLength: number): string {
       (host) => isIP(host) === 6 ? "[REDACTED HOST]" : host)
     .replace(/\b(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z][a-z\d-]*(?::\d+)?\b/gi, "[REDACTED HOST]")
     .replace(/\b[a-z][a-z\d-]*:\d{1,5}\b/gi, "[REDACTED HOST]");
-  return redacted
+  const credentialsRedacted = redacted
+    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]");
+  return sanitizeFailureMetadata(credentialsRedacted, maxLength);
+}
+
+// Class/code namespaces keep dots, slashes and colon segments. Explicit
+// credential assignments and credential tokens still need redaction.
+function sanitizeFailureMetadata(value: string, maxLength: number): string {
+  return value
     .replace(/(["'])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3/gi,
       "$1$2$1:$3[REDACTED]$3")
+    .replace(/(^|[\s,{(])((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1$2=[REDACTED]")
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
-    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]")
+    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token))\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .slice(0, maxLength);
 }

@@ -998,6 +998,8 @@ export class T3Gateway {
       return input.includeArchived || !thread.archivedAt;
     });
     const sorted = sortThreads(filtered, input.sort ?? "recent", now);
+    const shellOrders = new Map(sorted.map((thread) => [thread.id,
+      failureEvidenceOrder(thread, shell.snapshotSequence, "shell", undefined, readStartedAt)]));
     await this.journal.clearTerminalFailures(shell.threads.flatMap((thread) => {
       const turn = thread.latestTurn;
       return turn?.state === "completed" || turn?.state === "interrupted" ? [{
@@ -1013,7 +1015,7 @@ export class T3Gateway {
     // Full transcripts still require t3_thread_messages.
     let items: ReadonlyArray<ThreadSummary> = summaries;
     if (input.detail === "full") {
-      items = await this.enrichWithLatestResponse(summaries, 200);
+      items = await this.enrichWithLatestResponse(summaries, 200, shellOrders);
     }
     const page = paginate(items, input.cursor, input.limit);
     return {
@@ -1071,7 +1073,9 @@ export class T3Gateway {
     const running = filtered
       .filter(isThreadRunning)
       .map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
-    const highlights = await Promise.all((await this.buildHighlights(filtered, projectTitles, environmentId, now))
+    const shellOrders = new Map(filtered.map((thread) => [thread.id,
+      failureEvidenceOrder(thread, shell.snapshotSequence, "shell", undefined, readStartedAt)]));
+    const highlights = await Promise.all((await this.buildHighlights(filtered, projectTitles, environmentId, now, shellOrders))
       .map((highlight) => {
         const thread = filtered.find((candidate) => candidate.id === highlight.id);
         return this.withRetainedFailure(highlight,
@@ -2498,6 +2502,7 @@ export class T3Gateway {
     projectTitles: Map<string, string>,
     environmentId: string,
     now: number,
+    shellOrders: ReadonlyMap<string, FailureEvidenceOrder>,
   ): Promise<ReadonlyArray<OverviewHighlight>> {
     const ranked = [...filtered]
       .map((thread) => ({
@@ -2510,12 +2515,13 @@ export class T3Gateway {
     const summaries = ranked.map(({ thread }) =>
       threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now),
     );
-    return this.enrichWithLatestResponse(summaries, 200);
+    return this.enrichWithLatestResponse(summaries, 200, shellOrders);
   }
 
   private async enrichWithLatestResponse<T extends ThreadSummary>(
     summaries: ReadonlyArray<T>,
     excerptChars: number,
+    shellOrders: ReadonlyMap<string, FailureEvidenceOrder>,
   ): Promise<Array<T & { latestResponseExcerpt: string | null }>> {
     const results: Array<T & { latestResponseExcerpt: string | null }> = [];
     const recoveries: TerminalRecovery[] = [];
@@ -2528,6 +2534,16 @@ export class T3Gateway {
         const fullSummary = threadSummary(withShellMetadata(snapshot.thread, summary), summary.projectTitle,
           summary.observedTarget.environmentId, Date.parse(summary.observedAt));
         const fullOrder = failureEvidenceOrder(snapshot.thread, snapshot.snapshotSequence, "full", undefined, readStartedAt);
+        const shellOrder = shellOrders.get(summary.id);
+        if (sameTurn && !sameState && summary.latestTurn?.state !== "error" && shellOrder && compareFailureOrder(
+          await this.journal.orderFailureEvidence(summary.id, summary.observedTurnId, fullOrder),
+          await this.journal.orderFailureEvidence(summary.id, summary.observedTurnId, shellOrder),
+        ) < 0) {
+          // A nonfailed shell row has no retained failure watermark. Reject
+          // its older conflicting full state before it can enter the journal.
+          results.push({ ...summary, latestResponseExcerpt: null });
+          continue;
+        }
         // Observe full evidence privately, but keep selection, sorting and counts
         // on the shell snapshot that selected this row.
         const turn = fullSummary.latestTurn;
@@ -3087,10 +3103,11 @@ function threadDetail(
       ? compareFailureOrder(fullOrder, shellOrder) > 0
       : Date.parse(thread.latestTurn.requestedAt) > Date.parse(summary.latestTurn.requestedAt));
   const fullHasNewerState = sameTurn && summary != null &&
-    (differentEras ? compareFailureOrder(fullOrder, shellOrder) > 0 :
-      ((fullOrder?.protocolVersion === 2 && shellOrder?.protocolVersion === 2 &&
-        fullOrder.snapshotSequence > shellOrder.snapshotSequence) ||
-      Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
+    (fullOrder != null && shellOrder != null && (differentEras ||
+      fullOrder.snapshotSequence !== shellOrder.snapshotSequence ||
+      (fullOrder.updatedAt != null && shellOrder.updatedAt != null && fullOrder.updatedAt !== shellOrder.updatedAt))
+      ? compareFailureOrder(fullOrder, shellOrder) > 0
+      : (Date.parse(thread.updatedAt ?? "") > Date.parse(summary.updatedAt ?? "") ||
       ((thread.latestTurn?.state === "completed" || thread.latestTurn?.state === "interrupted") &&
         summary.latestTurn?.state === "error")));
   const source: ThreadShell = fullHasNewerTurn || fullHasNewerState ? withShellMetadata(thread, summary ?? {}) : summary ?? thread;

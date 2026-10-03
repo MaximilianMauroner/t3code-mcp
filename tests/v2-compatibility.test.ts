@@ -600,6 +600,42 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await restarted.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toBeNull();
   });
 
+  it.each(["list", "overview"] as const)("does not persist an older failed full turn behind a running %s shell", async (reader) => {
+    const { gateway, client, snapshot, shell, config } = await setup();
+    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "running-shell-order" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = "failed";
+    snapshot.projection.turnItems.push({ id: "stale-root", type: "error", status: "failed", ordinal: 1,
+      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
+    const older = await client.getThread("thread-1");
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: run.id, status: "running", lastError: null, lastErrorClass: null });
+    const getThread = client.getThread.bind(client);
+    client.getThread = async () => older;
+    const observed = reader === "list" ? (await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0];
+    expect(observed).toMatchObject({ latestTurn: { turnId: run.id, state: "running" }, activity: "running", failure: null });
+    expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toBeNull();
+    run.status = "running";
+    snapshot.snapshotSequence = 3;
+    client.getThread = getThread;
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "running", failure: null });
+    expect(await makeGateway(config).gateway.runGet(sent.runId)).toMatchObject({ runStatus: "running", failure: null });
+  });
+
+  it.each(["completed", "interrupted"] as const)("uses a newer V2 shell error over stale full %s", async (state) => {
+    const { gateway, snapshot, shell, config } = await setup();
+    await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "shell-state-order" });
+    const run = snapshot.projection.runs[0]!;
+    run.status = state;
+    shell.snapshotSequence = 3;
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed",
+      lastError: "Current shell error", lastErrorClass: "provider_error" });
+    const expected = { turnId: run.id, source: "t3_session", message: "Current shell error", category: "provider_error" };
+    expect((await gateway.threadGet("thread-1")).thread).toMatchObject({ latestTurn: { state: "error" }, activity: "failed", failure: expected });
+    expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toMatchObject(expected);
+  });
+
   it.each([
     { model: selection.model, provider: "codex" },
     { model: selection.model, instanceId: "other-model-instance" },
