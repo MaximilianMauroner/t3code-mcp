@@ -1,0 +1,15 @@
+{
+  "codexUsageLimit": {
+    "class": "usage_limit",
+    "code": "usageLimitExceeded",
+    "message": "Provider stopped this request.",
+    "retryable": null,
+    "resetAt": "2033-05-19T07:20:00.000Z"
+  },
+  "claudeAuthentication": {
+    "class": "provider_error",
+    "code": "api_error_401",
+    "message": "Claude could not authenticate. For subscription login, run `claude auth login` on this environment's machine, then start a new thread. For API-key authentication, check this instance's configured credentials.",
+    "retryable": null
+  }
+}

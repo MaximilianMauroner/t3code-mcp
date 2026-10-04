@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { compareFailureOrder, failureOrderWithEra, samePersistedFailureOrder } from "../t3/failure-order.js";
+import { sanitizeFailureIdentifier } from "../t3/failure.js";
+import { FailureEvidenceOrderSchema, ProviderRetrySchema, type FailureEvidenceOrder } from "../t3/types.js";
 import { summarizeForAudit, type AuditLog } from "./audit-log.js";
 import { settingsReceiptSchema, type SettingsReceipt } from "./settings.js";
 import type { FailureInfo } from "../gateway.js";
@@ -54,7 +57,16 @@ export interface OperationRecord {
 interface ThreadFailureRecord {
   readonly threadId: string;
   readonly turnId: string;
-  readonly failure: FailureInfo;
+  readonly failure: FailureInfo | null;
+  readonly recoveredState?: "completed" | "interrupted";
+  readonly order?: FailureEvidenceOrder;
+}
+
+export interface TerminalRecovery {
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly state: "completed" | "interrupted";
+  readonly order?: FailureEvidenceOrder;
 }
 
 export interface TaskRecord {
@@ -412,12 +424,24 @@ export class OperationJournal {
     )?.terminalFailure ?? null;
   }
 
+  async getFailureEvidenceOrder(threadId: string, turnId: string): Promise<FailureEvidenceOrder | undefined> {
+    await this.init();
+    return this.threadFailures.get(`${threadId}\u0000${turnId}`)?.order;
+  }
+
+  async orderFailureEvidence(threadId: string, turnId: string | null | undefined, order: FailureEvidenceOrder): Promise<FailureEvidenceOrder> {
+    await this.init();
+    const retained = turnId ? this.threadFailures.get(`${threadId}\u0000${turnId}`) : undefined;
+    return failureOrderWithEra(order, retained?.order);
+  }
+
   async retainTerminalFailure(
     threadId: string,
     turnId: string,
     candidate: FailureInfo,
     operationId?: string,
-  ): Promise<FailureInfo> {
+    order?: FailureEvidenceOrder,
+  ): Promise<FailureInfo | null> {
     await this.init();
     if (candidate.turnId !== turnId) {
       throw new Error("A terminal failure must match its turn.");
@@ -434,16 +458,75 @@ export class OperationJournal {
       entry.kind === "thread.turn.start" && entry.threadId === threadId &&
       entry.turnId === turnId && entry.terminalFailure?.turnId === turnId
     )?.terminalFailure ?? null;
-    const existing = this.threadFailures.get(key)?.failure ?? operation?.terminalFailure ?? legacyFailure;
-    const failure = mergeTerminalFailure(existing, candidate);
+    const retained = this.threadFailures.get(key);
+    if (order) order = failureOrderWithEra(order, retained?.order);
+    const comparison = order && retained?.order ? compareFailureOrder(order, retained.order) : null;
+    if (retained?.recoveredState && (order === undefined ||
+      (comparison !== null && comparison <= 0))) return null;
+    const existing = retained?.failure ?? operation?.terminalFailure ?? legacyFailure;
+    const stale = retained?.order !== undefined &&
+      (order === undefined || (comparison !== null && comparison < 0));
+    const authoritativeV2 = order?.protocolVersion === 2;
+    const newerProtocol = comparison !== null && comparison > 0 && order?.protocolVersion !== retained?.order?.protocolVersion;
+    const sameReason = order?.failureIdentity != null && order.failureIdentity === retained?.order?.failureIdentity;
+    const laterV1Evidence = comparison !== null && comparison > 0 &&
+      candidate.source === existing?.source &&
+      (candidate.source === "t3_activity" || candidate.source === "t3_message" ||
+        (candidate.source === "t3_session" && (order?.scope === "full" || !sameReason || candidate.class !== existing.class)));
+    const matchingShell = order?.scope === "shell" && existing != null &&
+      (order.protocolVersion === 2 || (candidate.source === "t3_session" && existing.source === "t3_session")) &&
+      sameReason &&
+      existing.message === candidate.message && existing.class === candidate.class;
+    const unboundShell = order?.protocolVersion === 2 && order.scope === "shell" &&
+      candidate.source === "t3_turn" && existing != null;
+    let merged = (stale || unboundShell) && existing ? existing
+      : matchingShell ? { ...existing, resetAt: candidate.resetAt ?? existing.resetAt,
+        retryAfter: candidate.retryAfter ?? existing.retryAfter }
+      : authoritativeV2 || laterV1Evidence || newerProtocol
+        ? mergeOrderedFailure(existing, candidate, comparison === 0 && sameReason)
+        : mergeTerminalFailure(existing, candidate, sameReason);
+    // A newer observation can retain the stronger old reason. Keep that
+    // reason's raw identity before attribution copies obscure its selection.
+    const candidateOrder = merged === existing && order
+      ? { ...order, failureIdentity: retained?.order?.failureIdentity } : order;
+    if (!stale && order?.protocolVersion === 2 && order.scope === "shell" && existing) {
+      merged = { ...merged, provider: existing.provider, model: existing.model };
+    }
+    const reasonOrder = !stale && (unboundShell || matchingShell || (merged.source === candidate.source && merged.message === candidate.message &&
+      merged.category === candidate.category)) ? candidateOrder ?? retained?.order : retained?.order;
+    // Run attribution is immutable. An older full read can supply it without
+    // replacing the newer shell reason, and later shell reads cannot change it.
+    const runIdentity = order?.runIdentity ?? retained?.order?.runIdentity;
+    let nextOrder = reasonOrder && runIdentity ? { ...reasonOrder, runIdentity } : reasonOrder;
+    if (nextOrder && retained?.order?.protocolVersion === nextOrder.protocolVersion &&
+      (retained.order.protocolStartedAt ?? 0) === (nextOrder.protocolStartedAt ?? 0)) {
+      // A matching shell proves the protocol admission even when the full
+      // record still supplies stronger failure fields and item ordering.
+      const shellAdmission = matchingShell && order?.protocolVersion === nextOrder.protocolVersion &&
+        (order.protocolStartedAt ?? 0) === (nextOrder.protocolStartedAt ?? 0) ? order.readStartedAt ?? 0 : 0;
+      nextOrder = { ...nextOrder, readStartedAt: Math.max(nextOrder.readStartedAt ?? 0, retained.order.readStartedAt ?? 0, shellAdmission) };
+    }
+    if (runIdentity) merged = { ...merged, ...runIdentity };
+    const admittedModel = operation?.settings?.resolved.modelSelection;
+    // A V1 snapshot carries mutable thread settings. The run receipt records
+    // the settings admitted for this operation; V2 root items use run metadata.
+    const failure = admittedModel && nextOrder?.protocolVersion !== 2 && merged.source !== "t3_v2_turn_item" ? {
+      ...merged,
+      model: sanitizeFailureIdentifier(admittedModel.model),
+      provider: sanitizeFailureIdentifier(admittedModel.provider ?? admittedModel.instanceId ?? merged.provider ?? "") || null,
+    } : merged;
     const failureChanged = JSON.stringify(existing) !== JSON.stringify(failure);
+    const orderChanged = !samePersistedFailureOrder(retained?.order, nextOrder);
     const operationChanged = operation !== null && (operation.terminalRunStatus !== "failed" ||
       operation.turnId !== turnId || JSON.stringify(operation.terminalFailure) !== JSON.stringify(failure));
-    if (!failureChanged && !operationChanged) return failure;
+    if (!failureChanged && !orderChanged && !operationChanged) {
+      this.threadFailures.set(key, { threadId, turnId, failure, order: nextOrder });
+      return failure;
+    }
 
     // Update both maps before awaiting persistence so concurrent reads cannot
     // replace a precise session failure with a later generic turn fallback.
-    this.threadFailures.set(key, { threadId, turnId, failure });
+    this.threadFailures.set(key, { threadId, turnId, failure, order: nextOrder });
     if (operation !== null) {
       this.entries.set(operation.idempotencyKey, {
         ...operation,
@@ -455,6 +538,52 @@ export class OperationJournal {
     }
     await this.persist();
     return failure;
+  }
+
+  async getRecoveryByTurnId(threadId: string, turnId: string): Promise<"completed" | "interrupted" | null> {
+    await this.init();
+    return this.threadFailures.get(`${threadId}\u0000${turnId}`)?.recoveredState ?? null;
+  }
+
+  async clearTerminalFailure(
+    threadId: string, turnId: string, state: "completed" | "interrupted",
+    order?: FailureEvidenceOrder,
+  ): Promise<void> {
+    return this.clearTerminalFailures([{ threadId, turnId, state, order }]);
+  }
+
+  async clearTerminalFailures(recoveries: ReadonlyArray<TerminalRecovery>): Promise<void> {
+    await this.init();
+    let changed = false;
+    const cleared = new Set<string>();
+    for (const { threadId, turnId, state, order: observedOrder } of recoveries) {
+      const key = `${threadId}\u0000${turnId}`;
+      const retained = this.threadFailures.get(key);
+      let order = observedOrder ? failureOrderWithEra(observedOrder, retained?.order) : undefined;
+      if (retained?.order && (!order || compareFailureOrder(order, retained.order) < 0)) continue;
+      if (order && retained?.order?.protocolVersion === order.protocolVersion &&
+        (retained.order.protocolStartedAt ?? 0) === (order.protocolStartedAt ?? 0)) {
+        order = { ...order, readStartedAt: Math.max(order.readStartedAt ?? 0, retained.order.readStartedAt ?? 0) };
+      }
+      const tombstone = { threadId, turnId, failure: null, recoveredState: state, order };
+      if (retained?.failure === null && retained.recoveredState === state &&
+        samePersistedFailureOrder(retained.order, order)) {
+        this.threadFailures.set(key, tombstone);
+        continue;
+      }
+      changed = true;
+      this.threadFailures.set(key, tombstone);
+      cleared.add(key);
+    }
+    if (cleared.size === 0) return;
+    for (const entry of this.entries.values()) {
+      if (entry.kind !== "thread.turn.start" || !cleared.has(`${entry.threadId}\u0000${entry.turnId}`) ||
+        (entry.terminalRunStatus === undefined && entry.terminalFailure === undefined)) continue;
+      const { terminalRunStatus, terminalFailure, ...recovered } = entry;
+      this.entries.set(entry.idempotencyKey, { ...recovered, updatedAt: new Date().toISOString() });
+      changed = true;
+    }
+    if (changed) await this.persist();
   }
 
   private async persist(): Promise<void> {
@@ -526,32 +655,63 @@ function isThreadFailureRecord(value: unknown): value is ThreadFailureRecord {
   if (typeof value !== "object" || value === null) return false;
   const item = value as Record<string, unknown>;
   return typeof item.threadId === "string" && typeof item.turnId === "string" &&
-    isFailureInfo(item.failure) && item.failure.turnId === item.turnId;
+    (item.failure === null
+      ? (item.recoveredState === "completed" || item.recoveredState === "interrupted")
+      : isFailureInfo(item.failure) && item.failure.turnId === item.turnId && item.recoveredState === undefined) &&
+    (item.order === undefined || FailureEvidenceOrderSchema.safeParse(item.order).success);
 }
 
 function isFailureInfo(value: unknown): value is FailureInfo {
   if (typeof value !== "object" || value === null) return false;
   const failure = value as Record<string, unknown>;
   const nullableString = (field: unknown) => field === null || typeof field === "string";
-  return ["quota", "rate_limit", "auth_billing", "provider_internal", "unknown"].includes(String(failure.category)) &&
+  return ["quota", "rate_limit", "auth_billing", "provider_internal", "provider_error", "unknown"].includes(String(failure.category)) &&
+    (failure.class === undefined || nullableString(failure.class)) &&
+    (failure.retryable === undefined || failure.retryable === null || typeof failure.retryable === "boolean") &&
+    (failure.retry === undefined || failure.retry === null || ProviderRetrySchema.safeParse(failure.retry).success) &&
     nullableString(failure.code) && typeof failure.message === "string" &&
     nullableString(failure.provider) && typeof failure.model === "string" &&
     nullableString(failure.turnId) && nullableString(failure.resetAt) &&
     nullableString(failure.retryAfter) &&
-    ["t3_session", "t3_turn"].includes(String(failure.source));
+    ["t3_session", "t3_turn", "t3_activity", "t3_message", "t3_v2_turn_item"].includes(String(failure.source));
 }
 
-function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo): FailureInfo {
+const failureSourcePriority = {
+  t3_turn: 0, t3_session: 1, t3_activity: 2, t3_message: 3, t3_v2_turn_item: 4,
+};
+
+function mergeOrderedFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo, sameObservation: boolean): FailureInfo {
+  // A different error, or authoritative absence, replaces the entire reason.
+  // Metadata can be preserved only for the same explicitly identified error.
+  return sameObservation && existing?.message === candidate.message && existing.class === candidate.class ? {
+    ...candidate,
+    resetAt: candidate.resetAt ?? existing.resetAt,
+    retryAfter: candidate.retryAfter ?? existing.retryAfter,
+  } : candidate;
+}
+
+function mergeTerminalFailure(existing: FailureInfo | null | undefined, candidate: FailureInfo, sameReason: boolean): FailureInfo {
   if (!existing) return candidate;
-  if (existing.source === "t3_turn") return candidate.source === "t3_session" ? candidate : existing;
-  if (candidate.source === "t3_turn") return existing;
+  // Full V2 reads already select the authoritative root item. Replace older
+  // attempts, including their reset metadata, rather than mixing two errors.
+  if (candidate.source === "t3_v2_turn_item") return candidate;
+  const upgradesUnknown = existing.source !== "t3_v2_turn_item" &&
+    existing.category === "unknown" && candidate.category !== "unknown";
+  const losesKnownCategory = candidate.category === "unknown" && existing.category !== "unknown";
+  const preferred = upgradesUnknown || (!losesKnownCategory &&
+    failureSourcePriority[candidate.source] > failureSourcePriority[existing.source]) ? candidate : existing;
+  const other = preferred === candidate ? existing : candidate;
+  if (!sameReason || preferred.message !== other.message || preferred.class !== other.class) return preferred;
   return {
-    ...existing,
-    category: existing.category === "unknown" ? candidate.category : existing.category,
-    code: existing.code ?? candidate.code,
-    provider: existing.provider ?? candidate.provider,
-    resetAt: existing.resetAt ?? candidate.resetAt,
-    retryAfter: existing.retryAfter ?? candidate.retryAfter,
+    ...preferred,
+    category: preferred.category === "unknown" && preferred.source === other.source ? other.category : preferred.category,
+    class: preferred.class ?? other.class ?? null,
+    retryable: preferred.retryable ?? other.retryable ?? null,
+    retry: preferred.retry ?? other.retry ?? null,
+    code: preferred.code ?? other.code,
+    provider: preferred.provider ?? other.provider,
+    resetAt: preferred.resetAt ?? other.resetAt,
+    retryAfter: preferred.retryAfter ?? other.retryAfter,
   };
 }
 

@@ -12,6 +12,20 @@ export const ModelSelectionSchema = z
   .catchall(z.unknown());
 export type ModelSelection = z.infer<typeof ModelSelectionSchema>;
 
+export const ProviderRetrySchema = z.object({
+  attempt: z.number().int().positive(),
+  maxAttempts: z.number().int().positive().nullable(),
+  retryDelayMs: z.number().int().nonnegative().nullable(),
+});
+
+export const ProviderFailureSchema = z.object({
+  class: z.string(),
+  message: z.string(),
+  code: z.string().nullable(),
+  retryable: z.boolean().nullable().optional(),
+  resetAt: z.string().nullable().optional(),
+});
+
 export const LatestTurnSchema = z
   .object({
     turnId: NonEmptyString,
@@ -37,8 +51,29 @@ export const ProjectSchema = z
   .catchall(z.unknown());
 export type Project = z.infer<typeof ProjectSchema>;
 
+// Private observation provenance. Never included in MCP output schemas.
+export const FailureEvidenceOrderSchema = z.object({
+  protocolVersion: z.union([z.literal(1), z.literal(2)]),
+  scope: z.enum(["full", "shell"]),
+  snapshotSequence: z.number().int().nonnegative(),
+  readStartedAt: z.number().int().nonnegative().optional(),
+  protocolStartedAt: z.number().int().nonnegative().optional(),
+  // Private digest of the unsanitized provider reason. It prevents a
+  // redaction collision from making two V2 shell reasons look identical.
+  failureIdentity: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+  updatedAt: z.iso.datetime({ offset: true }).optional(),
+  runIdentity: z.object({ provider: z.string().nullable(), model: z.string() }).optional(),
+  item: z.object({
+    updatedAt: z.iso.datetime({ offset: true }),
+    ordinal: z.number().int().nonnegative(),
+    id: NonEmptyString,
+  }).optional(),
+});
+export type FailureEvidenceOrder = z.infer<typeof FailureEvidenceOrderSchema>;
+
 export const ThreadShellSchema = z
   .object({
+    evidenceOrder: FailureEvidenceOrderSchema.optional(),
     id: NonEmptyString,
     projectId: NonEmptyString,
     title: NonEmptyString,
@@ -57,6 +92,7 @@ export const ThreadShellSchema = z
       providerInstanceId: z.string().optional(),
       activeTurnId: z.string().nullable().optional(),
       lastError: z.string().nullable().optional(),
+      lastErrorClass: z.string().nullable().optional(),
       failureCode: z.string().nullable().optional(),
       failureCategory: z.string().nullable().optional(),
       resetAt: z.string().nullable().optional(),
@@ -96,6 +132,20 @@ export const ThreadSchema = ThreadShellSchema.extend({
   activities: z.array(z.unknown()).default([]),
   checkpoints: z.array(z.unknown()).default([]),
   proposedPlans: z.array(z.unknown()).default([]),
+  // Internal V2 normalization retains authoritative failures for historical runs.
+  turnFailures: z.array(z.object({
+    order: FailureEvidenceOrderSchema.optional(),
+    turnId: NonEmptyString,
+    provider: NonEmptyString,
+    modelSelection: ModelSelectionSchema,
+    failure: ProviderFailureSchema.nullable(),
+    retry: ProviderRetrySchema.optional(),
+  })).optional(),
+  turnRecoveries: z.array(z.object({
+    turnId: NonEmptyString,
+    state: z.enum(["completed", "interrupted"]),
+    order: FailureEvidenceOrderSchema,
+  })).optional(),
 }).catchall(z.unknown());
 export type Thread = z.infer<typeof ThreadSchema>;
 

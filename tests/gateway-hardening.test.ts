@@ -262,13 +262,15 @@ describe("gateway mutation and recovery hardening", () => {
       latestResponse: { id: "assistant-run", role: "assistant" },
     });
 
+    const next = await fixture.gateway.threadSend({
+      threadId: thread.id, message: "Continue with approval", idempotencyKey: "approval-run-key",
+    });
     thread.hasPendingApprovals = true;
-    thread.latestTurn = { ...thread.latestTurn!, state: "running" };
-    const approval = await fixture.gateway.runGet(accepted.runId);
+    const approval = await fixture.gateway.runGet(next.runId);
     expect(approval.runStatus).toBe("awaiting_approval");
     thread.hasPendingApprovals = false;
     thread.hasPendingUserInput = true;
-    expect((await fixture.gateway.runGet(accepted.runId)).runStatus).toBe("awaiting_input");
+    expect((await fixture.gateway.runGet(next.runId)).runStatus).toBe("awaiting_input");
   });
 
   it("waits for a state change and distinguishes timeout from failure", async () => {

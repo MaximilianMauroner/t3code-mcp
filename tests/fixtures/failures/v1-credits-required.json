@@ -1,0 +1,38 @@
+{
+  "latestTurn": {
+    "turnId": "failed-turn",
+    "state": "error",
+    "requestedAt": "2026-09-12T08:02:13.745Z",
+    "startedAt": "2026-09-12T08:02:13.745Z",
+    "completedAt": "2026-09-12T08:02:15.287Z",
+    "assistantMessageId": null
+  },
+  "session": {
+    "status": "stopped",
+    "activeTurnId": null,
+    "lastError": "Claude usage limit reached. Send the message again once the limit resets.",
+    "updatedAt": "2026-09-12T08:02:18.449Z"
+  },
+  "activities": [
+    {
+      "id": "error-0",
+      "tone": "error",
+      "kind": "runtime.error",
+      "summary": "Runtime error",
+      "payload": {
+        "message": "Claude usage limit reached. Send the message again once the limit resets."
+      },
+      "turnId": "failed-turn",
+      "createdAt": "2026-09-12T08:02:15.286Z"
+    }
+  ],
+  "messages": [
+    {
+      "id": "provider-error",
+      "role": "assistant",
+      "turnId": "failed-turn",
+      "text": "API Error: Request rejected (429) · Usage credits are required for this model.",
+      "createdAt": "2026-09-12T08:02:15.285Z"
+    }
+  ]
+}

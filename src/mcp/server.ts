@@ -1,3 +1,4 @@
+import { ProviderRetrySchema } from "../t3/types.js";
 import { settingsReceiptSchema } from "../operations/settings.js";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -95,7 +96,10 @@ const observedTargetOutput = z
   .passthrough();
 
 const failureOutput = z.object({
-  category: z.enum(["quota", "rate_limit", "auth_billing", "provider_internal", "unknown"]),
+  category: z.enum(["quota", "rate_limit", "auth_billing", "provider_internal", "provider_error", "unknown"]),
+  class: z.string().nullable().optional(),
+  retryable: z.boolean().nullable().optional(),
+  retry: ProviderRetrySchema.nullable().optional(),
   code: z.string().nullable(),
   message: z.string(),
   provider: z.string().nullable(),
@@ -103,7 +107,7 @@ const failureOutput = z.object({
   turnId: z.string().nullable(),
   resetAt: z.string().nullable(),
   retryAfter: z.string().nullable(),
-  source: z.enum(["t3_session", "t3_turn"]),
+  source: z.enum(["t3_session", "t3_turn", "t3_activity", "t3_message", "t3_v2_turn_item"]),
 }).passthrough();
 
 const threadSummaryOutput = z
