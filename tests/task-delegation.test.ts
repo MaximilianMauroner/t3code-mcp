@@ -3,8 +3,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
-import { makeGateway } from "../src/gateway.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { makeGateway, T3Gateway } from "../src/gateway.js";
+import { T3HttpError } from "../src/t3/http-client.js";
 import { IdempotencyConflictError } from "../src/operations/journal.js";
 import { FakeT3 } from "./support/fake-t3.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
@@ -15,6 +16,7 @@ const directories: string[] = [];
 const execute = promisify(execFile);
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
   await Promise.all(fakes.splice(0).map((fake) => fake.close()));
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -201,6 +203,121 @@ describe("recoverable task delegation", () => {
     const readOnly = makeGateway({ ...fixture.config, readOnly: true, dataDir: join(fixture.directory, "read-only") }).gateway;
     await expect(readOnly.taskStart(taskInput)).rejects.toMatchObject({ code: "gateway_read_only" });
     expect(fake.dispatches).toHaveLength(0);
+  });
+
+  it.each(["legacy", "native"] as const)("keeps missing %s task targets connected without claiming delivery", async (protocol) => {
+    const { fake, fixture, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId || !started.runOperationId || !started.threadId) throw new Error("expected durable task handles");
+    await fixture.journal.update(started.runOperationId, { status: "uncertain" });
+    await fixture.journal.updateTask(started.taskRef, { stage: "dispatch_uncertain" });
+    fake.threads.splice(0);
+    if (protocol === "native") {
+      vi.spyOn(fixture.client, "getThread").mockRejectedValue(new T3HttpError(
+        404, "GET", `/api/orchestration/threads/${encodeURIComponent(started.threadId)}`,
+        "NotFoundError", "native thread missing", "thread_not_found",
+      ));
+    }
+    const priorSnapshotAt = fixture.client.telemetry().lastSnapshotAt;
+    const descriptorReads = fake.countRequests("/.well-known/t3/environment");
+    const shellReads = fake.countRequests("/api/orchestration/shell");
+    expect(await gateway.runGet(started.runId)).toMatchObject({
+      runStatus: "unknown", connectionStatus: "connected", stateFreshness: "unknown", lastObservedAt: priorSnapshotAt,
+    });
+    expect(fake.countRequests("/.well-known/t3/environment") - descriptorReads).toBe(1);
+    expect(fake.countRequests("/api/orchestration/shell") - shellReads).toBe(protocol === "legacy" ? 1 : 0);
+    const result = await gateway.taskGet(started.taskRef);
+    expect(result.task).toMatchObject({
+      taskRef: started.taskRef, threadId: started.threadId, runId: started.runId,
+      runOperationId: started.runOperationId, threadOperationId: started.threadOperationId,
+      stage: "dispatch_uncertain", thread: null,
+      run: {
+        operationId: started.runOperationId, threadId: started.threadId, runId: started.runId,
+        environmentId: fake.environmentId, runStatus: "unknown", connectionStatus: "connected",
+        stateFreshness: "unknown", latestResponse: null,
+      },
+    });
+    expect(result.task.nextAction).toContain("do not start a replacement task");
+    expect(fake.dispatches.map(({ command }) => command.type)).toEqual(["thread.create", "thread.turn.start"]);
+    expect((await fixture.journal.getByOperationId(started.runOperationId))?.status).toBe("uncertain");
+  });
+
+  it.each([
+    { status: 404, code: "not_found", reason: null },
+    { status: 404, code: "not_found", reason: "route_not_found" },
+    { status: 401, code: "unauthorized", reason: "thread_not_found" },
+    { status: 503, code: "unavailable", reason: "thread_not_found" },
+  ])("does not classify route/auth/outage errors as missing targets: $status $reason", async ({ status, code, reason }) => {
+    const { fixture, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId || !started.threadId) throw new Error("expected durable task handles");
+    vi.spyOn(fixture.client, "getThread").mockRejectedValue(new T3HttpError(
+      status, "GET", `/api/orchestration/threads/${encodeURIComponent(started.threadId)}`, code, "read failed", reason,
+    ));
+    expect(await gateway.runGet(started.runId)).toMatchObject({ runStatus: "unknown", connectionStatus: "disconnected" });
+  });
+
+  it("keeps legacy target verification disconnected when its shell read fails", async () => {
+    const { fake, fixture, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId) throw new Error("expected run");
+    fake.threads.splice(0);
+    vi.spyOn(fixture.client, "getShell").mockRejectedValue(new T3HttpError(503, "GET", "/api/orchestration/shell", null, "shell outage"));
+    expect(await gateway.runGet(started.runId)).toMatchObject({ runStatus: "unknown", connectionStatus: "disconnected" });
+  });
+
+  it("requires a fresh matching descriptor and preserves environment mismatch", async () => {
+    const { fake, fixture, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId || !started.threadId) throw new Error("expected run");
+    vi.spyOn(fixture.client, "getThread").mockRejectedValue(new T3HttpError(
+      404, "GET", `/api/orchestration/threads/${encodeURIComponent(started.threadId)}`, null, "target missing", "thread_not_found",
+    ));
+    const descriptor = await fixture.client.getDescriptor();
+    const probe = vi.spyOn(fixture.client, "getDescriptor").mockRejectedValue(new Error("descriptor unavailable"));
+    expect(await gateway.runGet(started.runId)).toMatchObject({ runStatus: "unknown", connectionStatus: "disconnected" });
+    probe.mockResolvedValue({ ...descriptor, environmentId: "other-environment" });
+    const pinnedGateway = new T3Gateway(
+      fixture.client, fixture.journal, { ...fixture.config, environmentId: fake.environmentId },
+    );
+    await expect(pinnedGateway.runGet(started.runId)).rejects.toMatchObject({ code: "environment_mismatch" });
+  });
+
+  it("keeps actual transport loss disconnected rather than inferring a missing target", async () => {
+    const { fake, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId) throw new Error("expected run");
+    await fake.close();
+    expect(await gateway.runGet(started.runId)).toMatchObject({ runStatus: "unknown", connectionStatus: "disconnected" });
+  });
+
+  it("stops run waits after one missing-target observation", async () => {
+    const { fixture, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId || !started.threadId) throw new Error("expected run");
+    const reads = vi.spyOn(fixture.client, "getThread").mockRejectedValue(new T3HttpError(
+      404, "GET", `/api/orchestration/threads/${encodeURIComponent(started.threadId)}`, null, "missing target", "thread_not_found",
+    ));
+    expect(await gateway.runWait(started.runId, 30)).toMatchObject({
+      runStatus: "unknown", connectionStatus: "connected", stateFreshness: "unknown",
+    });
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains confirmed terminal failure when a target is later removed", async () => {
+    const { fake, gateway } = await setup();
+    const started = await gateway.taskStart(taskInput);
+    if (!started.runId || !started.threadId) throw new Error("expected run");
+    const target = fake.thread(started.threadId);
+    if (!target.latestTurn) throw new Error("expected native turn");
+    target.latestTurn = { ...target.latestTurn, state: "error" };
+    target.session = { status: "error", activeTurnId: target.latestTurn.turnId, lastError: "Provider stopped" };
+    const prior = await gateway.runGet(started.runId);
+    expect(prior.runStatus).toBe("failed");
+    fake.threads.splice(0);
+    expect(await gateway.runGet(started.runId)).toMatchObject({
+      runStatus: "failed", connectionStatus: "connected", stateFreshness: "unknown", failure: prior.failure,
+    });
   });
 
   it("fails closed when the upstream credential lacks operate scope", async () => {

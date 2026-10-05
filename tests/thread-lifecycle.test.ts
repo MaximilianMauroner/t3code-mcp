@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMcpServer } from "../src/mcp/server.js";
 import { defaultSnoozePreset, resolveSnoozePresets } from "../src/t3/snooze.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
@@ -12,6 +12,7 @@ const clients: Client[] = [];
 const servers: Array<{ close: () => Promise<void> }> = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(clients.splice(0).map((client) => client.close().catch(() => undefined)));
   await Promise.all(servers.splice(0).map((server) => server.close().catch(() => undefined)));
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -28,9 +29,7 @@ async function setup(options: ConstructorParameters<typeof FakeT3>[0] = {}) {
 }
 
 function localAt(hour: number, minute = 0): Date {
-  const date = new Date();
-  date.setHours(hour, minute, 0, 0);
-  return date;
+  return new Date(2026, 9, 5, hour, minute);
 }
 
 describe("snooze presets", () => {
@@ -66,8 +65,10 @@ describe("thread snooze", () => {
   });
 
   it("supports every preset and explicit wake times", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(localAt(10));
     const { fake, gateway } = await setup();
-    for (const preset of ["hour", "three-hours", "tomorrow", "next-week"] as const) {
+    for (const preset of ["hour", "three-hours", "evening", "tomorrow", "next-week"] as const) {
       const thread = fake.addThread({ id: `snooze-${preset}` });
       const result = await gateway.threadSnooze({ threadId: thread.id, preset, idempotencyKey: `snooze-${preset}` });
       expect(result).toMatchObject({ status: "accepted", preset });
@@ -80,6 +81,24 @@ describe("thread snooze", () => {
       idempotencyKey: "snooze-custom",
     });
     expect(customResult).toMatchObject({ status: "accepted", preset: "custom", snoozedUntil: until });
+  });
+
+  it("deduplicates next-week on Sunday and snoozes tomorrow to Monday morning", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 9, 4, 10));
+    const { fake, gateway } = await setup();
+    const thread = fake.addThread({ id: "sunday-snooze" });
+    expect(resolveSnoozePresets().map((preset) => preset.id)).not.toContain("next-week");
+    await expect(gateway.threadSnooze({
+      threadId: thread.id, preset: "next-week", idempotencyKey: "sunday-next-week",
+    })).rejects.toMatchObject({ code: "invalid_snooze_preset" });
+    expect(fake.dispatches).toHaveLength(0);
+    const result = await gateway.threadSnooze({
+      threadId: thread.id, preset: "tomorrow", idempotencyKey: "sunday-tomorrow",
+    });
+    expect(result).toMatchObject({
+      status: "accepted", preset: "tomorrow", snoozedUntil: new Date(2026, 9, 5, 9).toISOString(),
+    });
   });
 
   it("rejects past times, ambiguous input, and blocked threads without dispatch", async () => {

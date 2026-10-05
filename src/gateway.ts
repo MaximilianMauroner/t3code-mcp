@@ -2411,6 +2411,26 @@ export class T3Gateway {
     } catch (error) {
       if (error instanceof GatewayError && error.code === "environment_mismatch") throw error;
       const telemetry = this.client.telemetry();
+      let environmentId = boundedEnvironmentId ?? this.client.getCachedDescriptor()?.environmentId ?? this.config.environmentId ?? "unknown";
+      let connectionStatus: ConnectionStatus = "disconnected";
+      const targetReadError = error instanceof T3HttpError && error.status === 404 && error.method === "GET" &&
+        error.path === `/api/orchestration/threads/${encodeURIComponent(record.threadId)}`;
+      const missingTarget = targetReadError && (error.reason === "thread_not_found" || error.code === "thread_not_found");
+      const legacyNotFound = targetReadError && error.code === "not_found" && error.reason === null;
+      try {
+        const freshEnvironmentId = await this.environmentId();
+        if (boundedEnvironmentId !== undefined && freshEnvironmentId !== boundedEnvironmentId) {
+          throw new GatewayError("environment_mismatch", "T3 environment changed during the wait; discard this observation and reconnect before continuing.");
+        }
+        environmentId = freshEnvironmentId;
+        // V1's generic not_found also covers unknown routes. Check target absence
+        // until supported V1 servers provide explicit thread_not_found errors.
+        if (missingTarget || (legacyNotFound && !(await this.client.getShell()).threads.some((thread) => thread.id === record.threadId))) {
+          connectionStatus = "connected";
+        }
+      } catch (probeError) {
+        if (probeError instanceof GatewayError && probeError.code === "environment_mismatch") throw probeError;
+      }
       const observedAt = new Date().toISOString();
       const latestRecord = await this.journal.getByOperationId(record.operationId).catch(() => null) ?? record;
       const retainedFailure = latestRecord.threadId && latestRecord.turnId
@@ -2418,7 +2438,7 @@ export class T3Gateway {
         : null;
       const failure = retainedFailure ?? latestRecord.terminalFailure ?? null;
       const run: RunResult = {
-        environmentId: boundedEnvironmentId ?? await this.environmentId().catch(() => this.config.environmentId ?? "unknown"),
+        environmentId,
         ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings) }),
         operationId: record.operationId,
         projectId: record.projectId ?? null,
@@ -2427,8 +2447,8 @@ export class T3Gateway {
         t3TurnId: latestRecord.turnId ?? null,
         runStatus: latestRecord.terminalRunStatus === "failed" || failure !== null ? "failed" : "unknown",
         providerTurnId: null,
-        connectionStatus: "disconnected",
-        stateFreshness: freshness(telemetry.lastSnapshotAt, this.config.staleAfterMs),
+        connectionStatus,
+        stateFreshness: connectionStatus === "connected" ? "unknown" : freshness(telemetry.lastSnapshotAt, this.config.staleAfterMs),
         lastObservedAt: telemetry.lastSnapshotAt,
         observedAt,
         threadQuality: null,
@@ -3305,7 +3325,7 @@ function isTerminal(status: RunStatus): boolean {
 }
 
 function waitCanContinue(result: RunResult): boolean {
-  return result.connectionStatus === "connected" && !isTerminal(result.runStatus) &&
+  return result.connectionStatus === "connected" && result.error === undefined && !isTerminal(result.runStatus) &&
     result.runStatus !== "awaiting_approval" && result.runStatus !== "awaiting_input" &&
     !result.pendingActions.approvals && !result.pendingActions.userInput;
 }
