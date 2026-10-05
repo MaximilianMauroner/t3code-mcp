@@ -116,10 +116,10 @@ live acceptance from local checks, CI, code review, or an accepted mutation.
 
 The agent owns current-head CI and code-review tracking. Max owns the decision
 to authorize live acceptance; the selected operator owns execution and cleanup.
-The 2026-10-04 base-interaction check found one inherited Sunday snooze failure:
-`tests/thread-lifecycle.test.ts` requests `next-week` even when it collapses into
-`tomorrow`. The same test fails on current `main` without this PR. Max or the
-snooze owner must resolve that separate issue before all project checks can pass.
+The 2026-10-04 base-interaction check found an inherited Sunday snooze-test
+failure. The maintenance prerequisite repairs [issue #5](https://github.com/MaximilianMauroner/t3code-mcp/issues/5)
+with fixed local clocks and explicit Sunday deduplication coverage, preserving
+the preset contract. Assess current-head CI separately from this acceptance plan.
 The PR remains unmerged under the explicit task restriction. No temporary
 compatibility layer was added. Existing V1 support in `src/t3/http-client.ts`
 and its tests remains until V1 deployment and test support explicitly end.
