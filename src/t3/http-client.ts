@@ -72,11 +72,14 @@ function joinUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
 }
 
+class T3ResponseInvalidError extends Error {}
+
 export class T3HttpClient {
   private lastSuccessfulAt: number | null = null;
   private lastSnapshotAt: number | null = null;
   private lastError: string | null = null;
   private cachedDescriptor: Descriptor | null = null;
+  private descriptorRequest: Promise<Descriptor> | null = null;
 
   constructor(
     private readonly baseUrl: string,
@@ -98,16 +101,34 @@ export class T3HttpClient {
   }
 
   async getDescriptor(signal?: AbortSignal): Promise<Descriptor> {
-    const descriptor = await this.request(
+    // Share discovery so concurrent protocol failures do not start a refresh
+    // for each caller. Each waiter's cancellation is independent.
+    const request = this.descriptorRequest ??= this.request(
       "GET",
       "/.well-known/t3/environment",
       undefined,
       DescriptorSchema,
-      signal,
+      undefined,
       false,
-    );
-    this.cachedDescriptor = descriptor;
-    return descriptor;
+    ).then((descriptor) => {
+      this.cachedDescriptor = descriptor;
+      return descriptor;
+    }).finally(() => {
+      this.descriptorRequest = null;
+    });
+    if (!signal) return request;
+
+    // One caller's cancellation must not cancel discovery for other callers.
+    return new Promise<Descriptor>((resolve, reject) => {
+      const onAbort = () => {
+        signal.removeEventListener("abort", onAbort);
+        this.lastError = signal.reason instanceof Error ? signal.reason.message : String(signal.reason);
+        reject(signal.reason);
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+      void request.finally(() => signal.removeEventListener("abort", onAbort)).then(resolve, reject);
+    });
   }
 
   async getSession(signal?: AbortSignal): Promise<AuthSession> {
@@ -115,51 +136,77 @@ export class T3HttpClient {
   }
 
   async getShell(signal?: AbortSignal): Promise<ShellSnapshot> {
-    if (await this.protocolVersion(signal) === 2) {
-      const snapshot = await this.request("GET", "/api/orchestration/shell", undefined, V2ShellSchema, signal, true);
-      const archived = await this.rpc("orchestration.getArchivedShellSnapshot", {}, V2ArchivedShellSchema, signal);
-      const threads = [
-        ...[...snapshot.threads, ...snapshot.archivedThreads].map((thread) => normalizeV2ShellThread(thread, snapshot.snapshotSequence)),
-        ...archived.threads.map((thread) => normalizeV2ShellThread(thread, archived.snapshotSequence)),
-      ];
-      const unique = new Map(threads.map((thread) => [thread.id, thread]));
+    return this.readWithProtocol(async (version) => {
+      if (version === 2) {
+        const snapshot = await this.request("GET", "/api/orchestration/shell", undefined, V2ShellSchema, signal, true, 2);
+        const archived = await this.rpc("orchestration.getArchivedShellSnapshot", {}, V2ArchivedShellSchema, signal);
+        const threads = [
+          ...[...snapshot.threads, ...snapshot.archivedThreads].map((thread) => normalizeV2ShellThread(thread, snapshot.snapshotSequence)),
+          ...archived.threads.map((thread) => normalizeV2ShellThread(thread, archived.snapshotSequence)),
+        ];
+        const unique = new Map(threads.map((thread) => [thread.id, thread]));
+        this.lastSnapshotAt = Date.now();
+        return {
+          snapshotSequence: Math.max(snapshot.snapshotSequence, archived.snapshotSequence),
+          projects: snapshot.projects,
+          threads: [...unique.values()],
+          updatedAt: new Date(this.lastSnapshotAt).toISOString(),
+        };
+      }
+      const snapshot = await this.request(
+        "GET",
+        "/api/orchestration/shell",
+        undefined,
+        ShellSnapshotSchema,
+        signal,
+        true,
+        1,
+      );
       this.lastSnapshotAt = Date.now();
-      return {
-        snapshotSequence: Math.max(snapshot.snapshotSequence, archived.snapshotSequence),
-        projects: snapshot.projects,
-        threads: [...unique.values()],
-        updatedAt: new Date(this.lastSnapshotAt).toISOString(),
-      };
-    }
-    const snapshot = await this.request(
-      "GET",
-      "/api/orchestration/shell",
-      undefined,
-      ShellSnapshotSchema,
-      signal,
-      true,
-    );
-    this.lastSnapshotAt = Date.now();
-    return snapshot;
+      return snapshot;
+    }, signal);
   }
 
   async getThread(threadId: string, signal?: AbortSignal): Promise<ThreadSnapshot> {
-    if (await this.protocolVersion(signal) === 2) {
-      const snapshot = await this.request("GET", `/api/orchestration/threads/${encodeURIComponent(threadId)}`, undefined, V2ThreadSchema, signal, true);
-      return normalizeV2Thread(snapshot);
-    }
-    return this.request(
-      "GET",
-      `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
-      undefined,
-      ThreadSnapshotSchema,
-      signal,
-      true,
-    );
+    return this.readWithProtocol(async (version) => {
+      if (version === 2) {
+        const snapshot = await this.request("GET", `/api/orchestration/threads/${encodeURIComponent(threadId)}`, undefined, V2ThreadSchema, signal, true, 2);
+        return normalizeV2Thread(snapshot);
+      }
+      return this.request(
+        "GET",
+        `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
+        undefined,
+        ThreadSnapshotSchema,
+        signal,
+        true,
+        1,
+      );
+    }, signal);
   }
 
   async dispatch(command: T3Command, signal?: AbortSignal): Promise<DispatchResult> {
-    if (await this.protocolVersion(signal) === 2) return this.dispatchV2(command, signal);
+    // Detect updates before a mutation rather than replaying a failed command.
+    let version: 1 | 2;
+    try {
+      version = await this.protocolVersion(signal, true);
+    } catch (error) {
+      signal?.throwIfAborted();
+      const detail = error instanceof Error ? error.message : String(error);
+      // Local validation rejection, before any mutation transport is called.
+      // The gateway must not journal a definitely unsent command as uncertain.
+      const rejection = new T3HttpError(
+        400,
+        "GET",
+        "/.well-known/t3/environment",
+        "protocol_discovery_failed",
+        `T3 command not sent: ${detail} Retry after discovery recovers with a new idempotency key.`,
+        "command_not_sent",
+      );
+      this.lastError = rejection.message;
+      throw rejection;
+    }
+    if (version === 2) return this.dispatchV2(command, signal);
     return this.request(
       "POST",
       "/api/orchestration/dispatch",
@@ -167,14 +214,40 @@ export class T3HttpClient {
       DispatchResultSchema,
       signal,
       true,
+      1,
     );
   }
 
-  private async protocolVersion(signal?: AbortSignal): Promise<1 | 2> {
-    const descriptor = this.cachedDescriptor ?? await this.getDescriptor(signal);
+  private async protocolVersion(signal?: AbortSignal, refresh = false): Promise<1 | 2> {
+    const descriptor = !refresh && this.cachedDescriptor ? this.cachedDescriptor : await this.getDescriptor(signal);
     const version = descriptor.orchestrationProtocolVersion ?? 1;
     if (version !== 1 && version !== 2) throw new Error(`Unsupported T3 orchestration protocol ${String(version)}.`);
     return version;
+  }
+
+  private async readWithProtocol<T>(read: (version: 1 | 2) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const version = await this.protocolVersion(signal);
+    try {
+      return await read(version);
+    } catch (error) {
+      if (!(error instanceof T3ResponseInvalidError || (error instanceof T3HttpError && error.status === 400))) throw error;
+      let refreshedVersion: 1 | 2;
+      try {
+        // Another caller may already have refreshed since this read started.
+        refreshedVersion = await this.protocolVersion(signal);
+        if (refreshedVersion === version) refreshedVersion = await this.protocolVersion(signal, true);
+      } catch {
+        signal?.throwIfAborted();
+        this.lastError = error.message;
+        throw error;
+      }
+      if (refreshedVersion === version) {
+        this.lastError = error.message;
+        throw error;
+      }
+      // Retry only a read, once, using the new schema and transport together.
+      return read(refreshedVersion);
+    }
   }
 
   private async rpc<T>(method: string, payload: unknown, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T> {
@@ -238,6 +311,7 @@ export class T3HttpClient {
     schema: z.ZodType<T>,
     signal: AbortSignal | undefined,
     authenticated: boolean,
+    protocolVersion?: 1 | 2,
   ): Promise<T> {
     const requestUrl = joinUrl(this.baseUrl, path);
     const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
@@ -263,7 +337,7 @@ export class T3HttpClient {
         signal: requestSignal,
         headers: {
           accept: "application/json",
-          ...(authenticated && path.startsWith("/api/orchestration/") && this.cachedDescriptor?.orchestrationProtocolVersion === 2 ? { "x-t3-orchestration-protocol": "2" } : {}),
+          ...(protocolVersion === 2 ? { "x-t3-orchestration-protocol": "2" } : {}),
           ...(authenticated ? { authorization: `Bearer ${this.accessToken}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
@@ -286,7 +360,7 @@ export class T3HttpClient {
 
       const parsed = schema.safeParse(responseBody);
       if (!parsed.success) {
-        throw new Error(`T3 ${method} ${path} returned an invalid response.`);
+        throw new T3ResponseInvalidError(`T3 ${method} ${path} returned an invalid response.`);
       }
       this.lastSuccessfulAt = Date.now();
       this.lastError = null;
