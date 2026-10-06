@@ -44,7 +44,7 @@ const Run = z.object({
   requestedAt: Time, startedAt: Time.nullable(), completedAt: Time.nullable(),
 });
 const Message = z.object({
-  id: Id, runId: Id.nullable(), nodeId: Id.nullable(), role: z.enum(["user", "assistant", "system"]),
+  id: Id, threadId: Id, runId: Id.nullable(), nodeId: Id.nullable(), role: z.enum(["user", "assistant", "system"]),
   text: z.string(), streaming: z.boolean(), createdAt: Time, updatedAt: Time,
   attachments: z.array(z.unknown()),
 }).passthrough();
@@ -126,8 +126,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
   // Queue entries can have larger ordinals than the run that is executing.
   const runs = [...projection.runs].sort((a, b) => a.ordinal - b.ordinal);
   const active = runs.find((run) => ActiveStatuses.has(run.status));
-  const rootNodes = new Set(runs.map((run) => run.rootNodeId));
-  const messages = projection.messages.filter((message) => message.nodeId === null || rootNodes.has(message.nodeId));
+  const messages = projection.messages.filter((message) => message.threadId === projection.thread.id);
   const pending = projection.runtimeRequests.filter((request) => request.status === "pending" && request.responseCapability.type !== "not_resumable");
   const turnFailures = runs.filter((run) => run.status === "failed").map((run) => {
     const item = projection.turnItems

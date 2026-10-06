@@ -107,7 +107,7 @@ async function setup() {
     if (command.type === "message.dispatch") {
       const message = z.object({ messageId: z.string(), threadId: z.string(), text: z.string(), createdBy: z.literal("user"), creationSource: z.literal("mcp"), dispatchMode: z.object({ type: z.literal("start_immediately") }), attachments: z.array(z.unknown()) }).parse(command);
       snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "running", userMessageId: message.messageId, rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null });
-      snapshot.projection.messages.push({ id: message.messageId, runId: "run-v2", nodeId: null, role: "user", text: message.text, attachments: [], streaming: false, createdAt: now, updatedAt: now });
+      snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: message.messageId, runId: "run-v2", nodeId: null, role: "user", text: message.text, attachments: [], streaming: false, createdAt: now, updatedAt: now });
     }
     if (command.type === "run.interrupt") snapshot.projection.runs[0]!.status = "interrupted";
     if (command.type === "runtime-request.respond") snapshot.projection.runtimeRequests.find((request) => request.id === command.requestId)!.status = "resolved";
@@ -168,7 +168,7 @@ describe("merged orchestrator V2 boundary", () => {
     const { client, requests, snapshot } = await setup();
     expect((await client.getShell()).threads.map((thread) => thread.id)).toEqual(["thread-1", "archived-1"]);
     snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "completed", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: now });
-    snapshot.projection.messages.push({ id: "answer-1", runId: "run-v2", nodeId: "node-root", role: "assistant", text: "Done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: "answer-1", runId: "run-v2", nodeId: "node-root", role: "assistant", text: "Done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     expect((await client.getThread("thread-1")).thread).toMatchObject({ latestTurn: { turnId: "run-v2", state: "completed", assistantMessageId: "answer-1" }, messages: [{ turnId: "run-v2", text: "Done" }] });
     expect(requests.filter((request) => request.path.startsWith("/api/orchestration/")).every((request) => request.protocol === "2")).toBe(true);
   });
@@ -186,6 +186,67 @@ describe("merged orchestrator V2 boundary", () => {
     expect((await gateway.runGet(sent.runId)).runStatus).toBe("interrupted");
   });
 
+  it("keeps native item-node responses across run reads, summaries, history pages and text chunks", async () => {
+    const { client, gateway, snapshot, shell } = await setup();
+    const sent = await gateway.threadSend({ threadId: thread.id, message: "Check the result", idempotencyKey: "native-result" });
+    const current = snapshot.projection.runs[0]!;
+    current.ordinal = 2;
+    current.status = "completed";
+    current.completedAt = now;
+    snapshot.projection.runs.unshift({ ...current, id: "previous-run", ordinal: 1, rootNodeId: "previous-root" });
+    const text = "Native item result 🙂. ".repeat(50) + "Final result.";
+    snapshot.projection.messages.push(
+      { id: "previous-answer", threadId: thread.id, runId: "previous-run", nodeId: "previous-native-item", role: "assistant", text: "Previous result", streaming: false, attachments: [], createdAt: now, updatedAt: now },
+      { id: "native-answer", threadId: thread.id, runId: current.id, nodeId: "provider-item-node", role: "assistant", text, streaming: false, attachments: [], createdAt: now, updatedAt: now },
+      // Delegated subagents own another thread and have no parent projection run.
+      { id: "child-answer", threadId: "delegated-child-thread", runId: null, nodeId: null, role: "assistant", text: "Child result must not replace the parent result", streaming: false, attachments: [], createdAt: now, updatedAt: now },
+    );
+    Object.assign(shell.threads[0]!, {
+      latestRunId: current.id, activeRunId: null, status: "completed",
+      latestRunRequestedAt: now, latestRunStartedAt: now, latestRunCompletedAt: now,
+    });
+    const observed = (await client.getThread(thread.id)).thread;
+    expect(observed.messages.map((message) => message.id)).toEqual([sent.messageId, "previous-answer", "native-answer"]);
+    expect(observed.latestTurn?.assistantMessageId).toBe("native-answer");
+    expect(await gateway.runGet(sent.runId)).toMatchObject({
+      runStatus: "completed", latestResponse: { id: "native-answer", turnId: current.id, text },
+    });
+    expect((await gateway.threadGet(thread.id)).thread.latestResponse).toMatchObject({ id: "native-answer", text });
+    const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+    expect(overview.highlights.find((row) => row.id === thread.id)?.latestResponseExcerpt).toContain(text.slice(0, 40));
+    const summaries = await gateway.threadsList({ includeArchived: false, detail: "full", limit: 10 });
+    expect(summaries.page.items.find((row) => row.id === thread.id)).toMatchObject({
+      latestResponseExcerpt: expect.stringContaining(text.slice(0, 40)),
+    });
+    const first = await gateway.threadMessages(thread.id, { limit: 1, maxChars: 100 });
+    const second = await gateway.threadMessages(thread.id, { cursor: first.page.nextCursor!, limit: 1, maxChars: 100 });
+    const third = await gateway.threadMessages(thread.id, { cursor: second.page.nextCursor!, limit: 1, maxChars: 100 });
+    expect([first, second, third].flatMap((result) => result.page.messages.map((message) => message.id)))
+      .toEqual([sent.messageId, "previous-answer", "native-answer"]);
+    expect(third.page.nextCursor).toBeNull();
+    let offset = 0;
+    let reconstructed = "";
+    do {
+      const chunk = await gateway.threadMessages(thread.id, { messageId: "native-answer", textOffset: offset, limit: 1, maxChars: 256 });
+      const message = chunk.page.messages[0]!;
+      expect(message.id).toBe("native-answer");
+      expect(message.textRange).toMatchObject({ offset, totalChars: text.length });
+      const end = message.textRange.nextOffset ?? text.length;
+      expect(end).toBeGreaterThan(offset);
+      reconstructed += message.text.slice(0, end - offset);
+      offset = end;
+    } while (offset < text.length);
+    expect(reconstructed).toBe(text);
+  });
+
+  it("requires authoritative message thread ownership", async () => {
+    const { snapshot } = await setup();
+    const unownedMessage = { id: "unowned", runId: null, nodeId: null, role: "assistant", text: "Unknown owner", streaming: false, attachments: [], createdAt: now, updatedAt: now };
+    expect(V2ThreadSchema.safeParse({
+      ...snapshot, projection: { ...snapshot.projection, messages: [unownedMessage] },
+    }).success).toBe(false);
+  });
+
   it("ignores queued successors, child responses, and non-actionable runtime requests", async () => {
     const { client, snapshot, shell } = await setup();
     Object.assign(shell.threads[0]!, {
@@ -197,7 +258,7 @@ describe("merged orchestrator V2 boundary", () => {
       { id: "active", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "waiting", userMessageId: "user-1", rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null },
       { id: "queued", ordinal: 2, providerInstanceId: "codex_openai", modelSelection: selection, status: "queued", userMessageId: "user-2", rootNodeId: null, requestedAt: now, startedAt: null, completedAt: null },
     );
-    snapshot.projection.messages.push({ id: "child-answer", runId: "active", nodeId: "child-node", role: "assistant", text: "Child done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    snapshot.projection.messages.push({ threadId: "delegated-child-thread", id: "child-answer", runId: null, nodeId: "child-node", role: "assistant", text: "Child done", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     snapshot.projection.runtimeRequests.push(
       { id: "dead", nodeId: "node-root", kind: "user_input", status: "pending", responseCapability: { type: "not_resumable", reason: "restart" }, createdAt: now },
       { id: "live", nodeId: "node-root", kind: "user_input", status: "pending", responseCapability: { type: "message" }, createdAt: now },
@@ -246,7 +307,7 @@ describe("merged orchestrator V2 boundary", () => {
     failed.providerInstanceId = "claude-instance";
     snapshot.projection.turnItems.push({ id: "auth-error", type: "error", ordinal: 1, status: "failed", runId: failed.id, nodeId: failed.rootNodeId, title: "Provider error", updatedAt: now, failure: providerFailures.claudeAuthentication });
     snapshot.projection.runs.push({ ...failed, id: "later-run", ordinal: 2, status: "running", userMessageId: "later-user", modelSelection: selection, providerInstanceId: "codex_openai" });
-    snapshot.projection.messages.push({ id: "later-answer", role: "assistant", runId: "later-run", nodeId: failed.rootNodeId, text: "Later response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
+    snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: "later-answer", role: "assistant", runId: "later-run", nodeId: failed.rootNodeId, text: "Later response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", latestResponse: null, failure: { category: "provider_error", class: "provider_error", code: "api_error_401", model: "claude-opus-5-5", provider: "claude-instance", resetAt: null, source: "t3_v2_turn_item" } });
     expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject({ model: "claude-opus-5-5", provider: "claude-instance" });
     expect((await gateway.threadGet("thread-1")).thread.failure).toBeNull();
@@ -268,7 +329,7 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.snapshotSequence = 3;
     snapshot.projection.runs.push({ ...run, id: "successor", ordinal: 2, rootNodeId: "successor-root",
       status: successorState, modelSelection: { instanceId: "other-provider", model: "other-model" }, providerInstanceId: "other-provider" });
-    snapshot.projection.messages.push({ id: "successor-answer", role: "assistant", runId: "successor", nodeId: "successor-root",
+    snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: "successor-answer", role: "assistant", runId: "successor", nodeId: "successor-root",
       text: "Successor response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     const expected = { turnId: run.id, source: "t3_v2_turn_item", category: "quota", code: "usageLimitExceeded",
       provider: "codex_openai", model: selection.model, retry };
@@ -683,7 +744,7 @@ describe("merged orchestrator V2 boundary", () => {
     const run = snapshot.projection.runs[0]!;
     run.status = state;
     snapshot.snapshotSequence = 3;
-    snapshot.projection.messages.push({ id: "stale-success", role: "assistant", runId: run.id, nodeId: run.rootNodeId,
+    snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: "stale-success", role: "assistant", runId: run.id, nodeId: run.rootNodeId,
       text: "Stale successful response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     const recovery = await client.getThread("thread-1");
     run.status = "failed";
@@ -717,7 +778,7 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.projection.thread.createdAt = "2026-01-01T00:00:00.000Z";
     snapshot.projection.turnItems.push({ id: "old-error", type: "error", status: "failed", ordinal: 1,
       runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
-    snapshot.projection.messages.push({ id: "old-answer", role: "assistant", runId: run.id, nodeId: run.rootNodeId,
+    snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: "old-answer", role: "assistant", runId: run.id, nodeId: run.rootNodeId,
       text: "Old turn output", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     snapshot.snapshotSequence = newer === "full" ? 4 : 3;
     shell.snapshotSequence = newer === "shell" ? 4 : 3;
