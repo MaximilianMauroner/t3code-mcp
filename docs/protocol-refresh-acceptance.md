@@ -1,14 +1,44 @@
 # Protocol refresh acceptance handoff
 
+## Status on 2026-10-11
+
+[PR #4](https://github.com/MaximilianMauroner/t3code-mcp/pull/4) merged on
+2026-10-06 at 11:36:49 UTC. Before the merge, its candidate acceptance run
+passed. See the [executed acceptance receipt](https://github.com/MaximilianMauroner/t3code-mcp/pull/4#issuecomment-6015344754).
+
+- Tested head: `529520709629ad916a8d47c443b39876cb381a6a`. The PR was then
+  rebased with unchanged patches to `c8ce95bd95acc15c3d379182ca1f821492e98ca2`
+  and squash-merged as `f38199648380ab29b4498ed7dd5f6f496874852c`. No source,
+  test, or configuration file differs between the tested head and the merge.
+- Covered: a real upgrade of an isolated, disposable T3 environment from V1
+  `0.0.45` to V2 `0.0.46-nightly.20261005.2702`, then rollback to V1. Both
+  candidate gateway processes stayed alive across the upgrade. The read gateway
+  also recovered after rollback without a restart. Simultaneous first reads
+  recovered with bounded retries. One snooze used V2 RPC, an identical-key retry
+  sent no second command, and unsnooze restored the thread. Read-only result
+  checks in a live coding environment also passed.
+- Not covered: full history or inventory reads, provider execution, and live
+  injected transport or discovery faults. The synthetic tests remain the
+  evidence for those cases.
+- Scope: this accepted the candidate gateway in an isolated environment. It is
+  not acceptance of the installed gateway service or of a deployment. No shared
+  service was upgraded, restarted, rolled back, or deployed.
+
+## Plan as written on 2026-10-05
+
+The rest of this document is the plan from before the run. Use its procedure
+for future, separately authorized acceptance tests.
+
 This plan checks that a gateway stays usable when T3 changes orchestration
-protocol. It is a plan for later execution. No live acceptance run, deployment,
-service restart, provider write, or live setting change was performed here.
+protocol. It was a plan for later execution. No live acceptance run, deployment,
+service restart, provider write, or live setting change was performed when it
+was written.
 
 Scope: [PR #4](https://github.com/MaximilianMauroner/t3code-mcp/pull/4).
 The [review record](https://github.com/MaximilianMauroner/t3code-mcp/pull/4#issuecomment-5973976840)
 holds the current head, base, checks, findings, and review limits.
 
-## Evidence already available
+### Evidence already available
 
 | Requirement | Local or synthetic evidence | Remaining live evidence |
 | --- | --- | --- |
@@ -25,7 +55,7 @@ refreshes before sending. A preflight failure rejects an unsent command and give
 safe new-key retry guidance. A failure after sending remains subject to the
 existing uncertainty and reconciliation rules. No mutation replay was added.
 
-## Owner and prerequisites
+### Owner and prerequisites
 
 Max selects the acceptance operator and explicitly authorizes the named test
 environment, candidate gateway setup, controlled T3 upgrade or rollback, and
@@ -42,7 +72,7 @@ WebSocket upgrades at `/ws`. Use a disposable, idle, unsnoozed thread with no
 pending approval, user input, or queued turn. Record its initial state and ID.
 Do not silently select a different environment or create provider work.
 
-## Controlled live protocol transition
+### Controlled live protocol transition
 
 1. The operator prepares the approved candidate gateways before the transition.
    Use two isolated gateway processes if testing both first-operation paths:
@@ -91,7 +121,7 @@ Do not resubmit an uncertain operation with a fresh key. Confirmed preflight
 rejections may use a new key after discovery recovers; same-key rejected receipts
 remain rejected.
 
-## Broader live integration test
+### Broader live integration test
 
 `pnpm test:live` runs `tests/live.integration.test.ts`. It creates a thread,
 starts a provider task, reads it through a second gateway, and attempts to archive
@@ -107,7 +137,7 @@ or first-project defaults. A missing provider/model is a blocker, not a reason
 to silently substitute one. The test's archive attempt catches errors, so inspect
 the recorded thread afterward and confirm cleanup explicitly.
 
-## Acceptance receipt and remaining gates
+### Acceptance receipt and remaining gates
 
 The operator records each check as passed, failed, or not run, with the head,
 target environment/build, process continuity, safe request counts, receipt IDs,
@@ -120,6 +150,7 @@ The 2026-10-04 base-interaction check found an inherited Sunday snooze-test
 failure. The maintenance prerequisite repairs [issue #5](https://github.com/MaximilianMauroner/t3code-mcp/issues/5)
 with fixed local clocks and explicit Sunday deduplication coverage, preserving
 the preset contract. Assess current-head CI separately from this acceptance plan.
-The PR remains unmerged under the explicit task restriction. No temporary
+The PR was still unmerged under the explicit task restriction when this plan was
+written. It merged later; see [the status](#status-on-2026-10-11). No temporary
 compatibility layer was added. Existing V1 support in `src/t3/http-client.ts`
 and its tests remains until V1 deployment and test support explicitly end.
