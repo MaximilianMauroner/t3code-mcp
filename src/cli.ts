@@ -58,7 +58,10 @@ async function main(): Promise<void> {
       nativeTools: snapshot.tools.length,
       missingNativeTools: snapshot.missing,
     }, null, 2));
-    console.error("A running gateway uses the new credential on its next native call; no restart is needed.");
+    console.error(
+      "An HTTP gateway uses this login on its next request. A stdio session lists the native tools that it found at start: " +
+        "after a first login, restart the stdio server (the MCP server process that your client starts). A renewal needs no restart.",
+    );
     return;
   }
   const config = loadConfig();

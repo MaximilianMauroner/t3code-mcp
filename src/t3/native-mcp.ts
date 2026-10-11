@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema, ErrorCode, McpError, type CallToolResult, type Tool } from "@modelcontextprotocol/sdk/types.js";
-import { GATEWAY_VERSION, NATIVE_TOOL_NAMES, isNativeToolName, type NativeToolName } from "../contract.js";
+import { GATEWAY_VERSION, NATIVE_CALLED_TOOL_NAMES, isNativeToolName, type NativeCalledToolName, type NativeToolName } from "../contract.js";
 import { GatewayError } from "../errors.js";
 import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
 import { tokenIdentity, type NativeCredential, type NativeCredentialState, type NativeCredentialStore } from "./native-credential.js";
@@ -18,8 +18,8 @@ export interface NativeTool {
 export interface NativeSnapshot {
   /** Allowlisted tools the upstream currently offers. */
   readonly tools: ReadonlyArray<NativeTool>;
-  /** Allowlisted tools the upstream did not offer at the last successful read. */
-  readonly missing: ReadonlyArray<NativeToolName>;
+  /** Allowlisted and internal tools the upstream did not offer at the last successful read. */
+  readonly missing: ReadonlyArray<NativeCalledToolName>;
   readonly fetchedAt: string | null;
   readonly error: { readonly code: string; readonly message: string } | null;
 }
@@ -246,10 +246,10 @@ export class NativeMcpClient {
             ...(tool.annotations === undefined ? {} : { annotations: tool.annotations }),
           }]
         : []);
-      const offered = new Set<string>(tools.map((tool) => tool.name));
+      const offered = new Set<string>(listed.map((tool) => tool.name));
       return {
         tools,
-        missing: NATIVE_TOOL_NAMES.filter((name) => !offered.has(name)),
+        missing: NATIVE_CALLED_TOOL_NAMES.filter((name) => !offered.has(name)),
         fetchedAt: new Date().toISOString(),
         error: null,
       };
@@ -351,7 +351,7 @@ function isConnectionRefused(error: unknown): boolean {
 function failedSnapshot(previous: NativeSnapshot | undefined, error: GatewayError): NativeSnapshot {
   return {
     tools: previous?.tools ?? [],
-    missing: previous?.missing ?? [...NATIVE_TOOL_NAMES],
+    missing: previous?.missing ?? [...NATIVE_CALLED_TOOL_NAMES],
     fetchedAt: previous?.fetchedAt ?? null,
     error: { code: error.code, message: error.message },
   };

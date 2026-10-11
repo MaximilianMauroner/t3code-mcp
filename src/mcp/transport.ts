@@ -17,7 +17,9 @@ export async function runStdio(gateway: T3Gateway): Promise<void> {
     outcome: "started",
     details: { transport: "stdio" },
   });
-  // A stdio client starts its own process, so the native catalog is read once.
+  // A stdio session lists the native tools it finds at start. After a first login, a start while
+  // T3 was unavailable, or a T3 upgrade that changes the tools, restart this process. A renewal
+  // needs no restart.
   const server = createMcpServer(gateway, await gateway.nativeSnapshot());
   const transport = new StdioServerTransport();
   try {

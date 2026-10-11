@@ -10,10 +10,12 @@ import {
   GATEWAY_COMMIT,
   GATEWAY_TOOL_NAMES,
   GATEWAY_VERSION,
+  NATIVE_CALLED_TOOL_NAMES,
   NATIVE_TOOL_NAMES,
   isNativeMutatingTool,
   isNativeToolName,
   toolSchemaFingerprint,
+  type NativeCalledToolName,
   type NativeToolName,
 } from "./contract.js";
 import {
@@ -494,8 +496,15 @@ const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
   "t3_task_cancel",
 ]);
 
-/** Gateway tools that work through native T3 MCP and need its credential. */
-const NATIVE_BACKED_GATEWAY_OPERATIONS = new Set<string>(["t3_attachment_upload", "t3_task_cancel"]);
+/**
+ * Gateway tools that work through native T3 MCP and need its credential, with
+ * the native tools each one needs. `t3_attachment_upload` calls
+ * `t3_attachment_discard` only to clean up after a failure, so it does not need it.
+ */
+const NATIVE_BACKED_GATEWAY_OPERATIONS = new Map<string, ReadonlyArray<NativeCalledToolName>>([
+  ["t3_attachment_upload", ["t3_attachment_prepare_upload"]],
+  ["t3_task_cancel", ["t3_thread_interrupt"]],
+]);
 
 const IMAGE_MIME_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
 const MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -1788,7 +1797,7 @@ export class T3Gateway {
           expiresAt: null,
           catalogFetchedAt: null,
           availableTools: 0,
-          missingTools: [...NATIVE_TOOL_NAMES],
+          missingTools: [...NATIVE_CALLED_TOOL_NAMES],
           error: "This gateway has no native T3 MCP endpoint.",
         },
       };
@@ -2055,12 +2064,21 @@ function partitionOperations(access: {
   // Without a usable credential the snapshot still lists the last known tools, but none of them can be called.
   const offered = new Set<string>(credentialUsable ? access.native.snapshot?.tools.map((tool) => tool.name) ?? [] : []);
   const nativeUsable = credentialUsable && access.native.snapshot?.error === null;
+  const missing = new Set<string>(access.native.snapshot?.missing ?? []);
   const nativeReason = access.native.status.error ?? "Native T3 does not offer this tool.";
+  // Why a native tool or a native-backed gateway tool cannot be called, or null when it can.
+  const nativeBlocker = (operation: string): string | null => {
+    if (isNativeToolName(operation)) return offered.has(operation) ? null : nativeReason;
+    const required = NATIVE_BACKED_GATEWAY_OPERATIONS.get(operation);
+    if (required === undefined) return null;
+    if (!nativeUsable) return nativeReason;
+    const absent = required.find((tool) => missing.has(tool));
+    return absent === undefined ? null : `Native T3 does not offer ${absent}, which ${operation} needs.`;
+  };
   for (const operation of [...GATEWAY_TOOL_NAMES, ...NATIVE_TOOL_NAMES]) {
-    const nativeTool = isNativeToolName(operation);
-    const usesNative = nativeTool || NATIVE_BACKED_GATEWAY_OPERATIONS.has(operation);
-    if (nativeTool ? !offered.has(operation) : usesNative && !nativeUsable) {
-      disabledOperations.push({ operation, reasonCode: "native_unavailable", reason: nativeReason });
+    const blocker = nativeBlocker(operation);
+    if (blocker !== null) {
+      disabledOperations.push({ operation, reasonCode: "native_unavailable", reason: blocker });
       continue;
     }
     if (!MUTATING_GATEWAY_OPERATIONS.has(operation) && !isNativeMutatingTool(operation)) {
@@ -2075,6 +2093,7 @@ function partitionOperations(access: {
       });
       continue;
     }
+    const usesNative = isNativeToolName(operation) || NATIVE_BACKED_GATEWAY_OPERATIONS.has(operation);
     if (usesNative ? !access.native.operate : !access.hasOperate) {
       disabledOperations.push({
         operation,

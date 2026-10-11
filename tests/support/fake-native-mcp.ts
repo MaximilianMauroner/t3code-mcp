@@ -32,6 +32,8 @@ export class FakeNativeMcp {
   runEndsAfterMs: number | null = null;
   /** Hold each authorized tools/list request until `releaseToolLists` is called. */
   holdToolLists = false;
+  /** Tools that new sessions do not offer, as in an older T3 build. */
+  omitTools: ReadonlyArray<string> = [];
   /** /mcp requests refused because they did not carry `token`. */
   unauthorizedRequests = 0;
   /** Fail the next upload with this HTTP status. */
@@ -212,7 +214,12 @@ export class FakeNativeMcp {
       this.calls.push({ name, arguments: args });
     };
     const loose = (shape: z.ZodRawShape) => z.looseObject(shape);
-    server.registerTool(
+    const register: McpServer["registerTool"] = (name, config, callback) => {
+      const tool = server.registerTool(name, config, callback);
+      if (this.omitTools.includes(name)) tool.remove();
+      return tool;
+    };
+    register(
       "t3_thread_list",
       { description: "List threads in a project.", inputSchema: loose({ projectId: z.string(), limit: z.number().int().min(1).max(100).optional() }), annotations: { readOnlyHint: true } },
       async (args) => {
@@ -221,7 +228,7 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );
-    server.registerTool(
+    register(
       "t3_thread_wait",
       { description: "Wait for a run to end.", inputSchema: loose({ threadId: z.string(), timeoutMs: z.number().optional() }), annotations: { readOnlyHint: true } },
       async (args) => {
@@ -232,7 +239,7 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );
-    server.registerTool(
+    register(
       "t3_thread_send",
       {
         description: "Send, queue, or steer a message.",
@@ -246,7 +253,7 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );
-    server.registerTool(
+    register(
       "t3_thread_interrupt",
       { description: "Interrupt a run.", inputSchema: loose({ threadId: z.string(), runId: z.string().nullable().optional() }) },
       async (args) => {
@@ -255,7 +262,7 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );
-    server.registerTool(
+    register(
       "t3_attachment_prepare_upload",
       { description: "Prepare an upload.", inputSchema: loose({ upload: z.looseObject({ type: z.string(), name: z.string(), mimeType: z.string(), sizeBytes: z.number() }) }) },
       async (args) => {
@@ -264,7 +271,7 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );
-    server.registerTool(
+    register(
       "t3_attachment_discard",
       { description: "Discard an upload.", inputSchema: loose({ attachmentId: z.string() }) },
       async (args) => {
@@ -272,7 +279,7 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: "{}" }], structuredContent: {} };
       },
     );
-    server.registerTool(
+    register(
       "delegate_task",
       { description: "Needs a calling thread.", inputSchema: loose({ task: z.string() }) },
       async (args) => {

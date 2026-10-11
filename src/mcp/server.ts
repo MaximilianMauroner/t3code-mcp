@@ -542,7 +542,7 @@ export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | nul
     "t3_connection_status",
     {
       title: "T3 connection status",
-      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. toolSchemaFingerprint changes when the tool set or output shapes change, which makes cached tool definitions stale.",
+      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. toolSchemaFingerprint identifies this build's declared tool contract (gateway tools and the native allowlist), not the native tools that T3 offers now; tools/list and native.availableTools and native.missingTools show those.",
       inputSchema: {},
       outputSchema: connectionStatusOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -209,6 +209,30 @@ describe("native T3 tool proxy", () => {
     await expect(gateway.callNative("t3_thread_list", { projectId: "p" })).rejects.toMatchObject({
       code: "native_credential_expired",
       message: expect.stringContaining("native-login"),
+    });
+    expect(native.calls).toEqual([]);
+  });
+
+  it("reports an unreadable credential file and keeps the gateway's own tools working", async () => {
+    const native = await startNative();
+    const { gateway, store, config } = await nativeGateway(native, { mcpBearerToken: "gateway-bearer" });
+    await login(native, store);
+    await gateway.nativeSnapshot();
+    const baseUrl = await listen(gateway, config);
+
+    // A directory at the credential path fails the read with EISDIR, also for root.
+    await rm(store.filePath);
+    await mkdir(store.filePath);
+    const unreadable = expect.stringContaining("credential file cannot be read (EISDIR)");
+
+    await expect(store.read()).resolves.toEqual({ state: "missing", reason: unreadable });
+    await expect(gateway.nativeSnapshot()).resolves.toMatchObject({ error: { code: "native_credential_missing", message: unreadable } });
+    const audit = await postMcp(baseUrl, "gateway-bearer", "tools/call", { name: "t3_audit_log", arguments: { limit: 1 } });
+    const list = await postMcp(baseUrl, "gateway-bearer", "tools/call", { name: "t3_thread_list", arguments: { projectId: "project-1" } });
+    expect(audit).toMatchObject({ status: 200, body: { result: { structuredContent: { page: expect.any(Object) } } } });
+    expect(list).toMatchObject({
+      status: 200,
+      body: { result: { isError: true, structuredContent: { error: { code: "native_credential_missing", message: unreadable } } } },
     });
     expect(native.calls).toEqual([]);
   });
@@ -501,6 +525,22 @@ describe("native-backed gateway tools", () => {
     await expect(gateway.attachmentUpload({ name: "notes.txt", mimeType: "text/plain", dataBase64: Buffer.from("hi").toString("base64") }))
       .rejects.toMatchObject({ code: "native_upload_failed" });
     expect(elsewhere.uploads).toEqual([]);
+  });
+
+  it.each([
+    ["t3_task_cancel", "t3_thread_interrupt"],
+    ["t3_attachment_upload", "t3_attachment_prepare_upload"],
+  ])("reports %s as unavailable when T3 does not offer %s", async (operation, needed) => {
+    const native = await startNative();
+    native.omitTools = [needed];
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+
+    const status = await gateway.connectionStatus();
+
+    expect(status.callableOperations).not.toContain(operation);
+    expect(status.disabledOperations).toContainEqual({ operation, reasonCode: "native_unavailable", reason: expect.stringContaining(needed) });
+    expect(status.native.missingTools).toContain(needed);
   });
 
   async function taskGateway(native: FakeNativeMcp, options: ConstructorParameters<typeof FakeT3>[0] = {}) {

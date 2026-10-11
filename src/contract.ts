@@ -85,6 +85,14 @@ export const NATIVE_TOOL_NAMES = [...NATIVE_READ_TOOL_NAMES, ...NATIVE_MUTATING_
 
 export type NativeToolName = (typeof NATIVE_TOOL_NAMES)[number];
 
+/** Native tools that gateway tools call internally. The gateway never advertises them. */
+export const NATIVE_INTERNAL_TOOL_NAMES = ["t3_attachment_prepare_upload"] as const;
+
+/** Every native tool the gateway calls: the forwarded allowlist and the internal tools. */
+export const NATIVE_CALLED_TOOL_NAMES = [...NATIVE_TOOL_NAMES, ...NATIVE_INTERNAL_TOOL_NAMES] as const;
+
+export type NativeCalledToolName = (typeof NATIVE_CALLED_TOOL_NAMES)[number];
+
 /** Every tool a fully connected gateway advertises. */
 export const TOOL_NAMES = [...GATEWAY_TOOL_NAMES, ...NATIVE_TOOL_NAMES] as const;
 
@@ -101,6 +109,11 @@ export function isNativeMutatingTool(name: string): boolean {
   return NATIVE_MUTATING_TOOLS.has(name);
 }
 
+/**
+ * Identifies the declared tool contract of this build: the gateway tools, the
+ * native allowlist, and the schema version. It does not show which native
+ * tools T3 offers now.
+ */
 export function toolSchemaFingerprint(): string {
   const canonical = JSON.stringify({
     version: GATEWAY_VERSION,
