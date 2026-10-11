@@ -86,7 +86,7 @@ export const NATIVE_TOOL_NAMES = [...NATIVE_READ_TOOL_NAMES, ...NATIVE_MUTATING_
 export type NativeToolName = (typeof NATIVE_TOOL_NAMES)[number];
 
 /** Native tools that gateway tools call internally. The gateway never advertises them. */
-export const NATIVE_INTERNAL_TOOL_NAMES = ["t3_attachment_prepare_upload"] as const;
+const NATIVE_INTERNAL_TOOL_NAMES = ["t3_attachment_prepare_upload"] as const;
 
 /** Every native tool the gateway calls: the forwarded allowlist and the internal tools. */
 export const NATIVE_CALLED_TOOL_NAMES = [...NATIVE_TOOL_NAMES, ...NATIVE_INTERNAL_TOOL_NAMES] as const;

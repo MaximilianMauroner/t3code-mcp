@@ -67,7 +67,7 @@ The command refuses a pairing code given as an argument, because process lists s
 
 T3 issues the session for 30 days without a refresh token. Run `native-login` again with a new pairing code before it expires. `t3_connection_status` and `doctor` report the expiry. The `doctor` check `native_mcp` says "expires soon" when fewer than 7 days remain, and fails when the credential is missing or expired.
 
-An HTTP gateway uses a new login or a renewal on its next request, with no restart. A stdio session lists the native tools that it found when it started. Restart the stdio server (the MCP server process that your client starts) after the first login, after it started while T3 was unavailable, or after a T3 upgrade that changes the native tools. A renewal does not need a restart in either mode, because the tools are already listed.
+An HTTP gateway uses a new login or a renewal on its next request, with no restart. A stdio session lists the native tools that it found when it started. If it lists none, restart the stdio server (the MCP server process that your client starts) after you fix the cause: a missing, expired, unreadable, or refused credential, or a T3 that was unavailable. Also restart it after a T3 upgrade that changes the native tools. A renewal needs no restart while the session lists native tools.
 
 ## Connect an MCP client
 

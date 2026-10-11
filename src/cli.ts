@@ -59,8 +59,9 @@ async function main(): Promise<void> {
       missingNativeTools: snapshot.missing,
     }, null, 2));
     console.error(
-      "An HTTP gateway uses this login on its next request. A stdio session lists the native tools that it found at start: " +
-        "after a first login, restart the stdio server (the MCP server process that your client starts). A renewal needs no restart.",
+      "An HTTP gateway uses this login on its next request. A stdio session lists the native tools that it found at start. " +
+        "If it lists none, restart the stdio server (the MCP server process that your client starts). " +
+        "A renewal needs no restart while the session lists native tools.",
     );
     return;
   }
