@@ -30,6 +30,8 @@ export class FakeNativeMcp {
   stallRequests = false;
   /** End each t3_thread_wait after this many ms, as a run that ends does. When null, a wait uses its whole budget. */
   runEndsAfterMs: number | null = null;
+  /** Hold each authorized tools/list request until `releaseToolLists` is called. */
+  holdToolLists = false;
   /** /mcp requests refused because they did not carry `token`. */
   unauthorizedRequests = 0;
   /** Fail the next upload with this HTTP status. */
@@ -38,6 +40,7 @@ export class FakeNativeMcp {
   redirectNextUpload: string | null = null;
   private server: Server | null = null;
   private readonly sessions = new Map<string, StreamableHTTPServerTransport>();
+  private readonly heldToolLists: Array<() => void> = [];
   private readonly authorizations = new Map<string, { readonly challenge: string; readonly clientId: string; readonly scope: string }>();
 
   get baseUrl(): string {
@@ -62,6 +65,16 @@ export class FakeNativeMcp {
   /** Forget every MCP session, as a T3 restart does. */
   dropSessions(): void {
     this.sessions.clear();
+  }
+
+  /** tools/list requests that `holdToolLists` holds. */
+  get heldToolListCount(): number {
+    return this.heldToolLists.length;
+  }
+
+  /** Answer every held tools/list request. */
+  releaseToolLists(): void {
+    for (const release of this.heldToolLists.splice(0)) release();
   }
 
   async close(): Promise<void> {
@@ -175,7 +188,10 @@ export class FakeNativeMcp {
       await this.mcpServer().connect(created);
       transport = created;
     }
-    if (this.dropNextToolResponse && isToolCall(parsed)) {
+    if (this.holdToolLists && isRequest(parsed, "tools/list")) {
+      await new Promise<void>((resolve) => this.heldToolLists.push(resolve));
+    }
+    if (this.dropNextToolResponse && isRequest(parsed, "tools/call")) {
       const restart = this.restartOnDrop;
       this.dropNextToolResponse = false;
       this.restartOnDrop = false;
@@ -268,8 +284,8 @@ export class FakeNativeMcp {
   }
 }
 
-function isToolCall(message: unknown): boolean {
-  return typeof message === "object" && message !== null && "method" in message && message.method === "tools/call";
+function isRequest(message: unknown, method: string): boolean {
+  return typeof message === "object" && message !== null && "method" in message && message.method === method;
 }
 
 async function readBody(request: IncomingMessage): Promise<Buffer> {

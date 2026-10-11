@@ -282,6 +282,36 @@ describe("native T3 tool proxy", () => {
     expect(listed).toMatchObject({ status: 200, body: { result: { tools: expect.arrayContaining([expect.objectContaining({ name: "t3_thread_send" })]) } } });
   }, 20_000);
 
+  // A stdio session reads the tool list once, so this first answer lasts for the whole session.
+  it("gives the first caller the native tools when a renewal lands during the first catalog read", async () => {
+    const native = await startNative();
+    const { store, directory } = await nativeGateway(native);
+    let current = await login(native, store);
+    // The credential source has no file I/O, so the second call below reaches the catalog read in microtasks.
+    const client = new NativeMcpClient(native.mcpUrl, { read: async () => ({ state: "valid", credential: current }) }, new AuditLog(join(directory, "audit.jsonl")));
+    cleanups.push(() => client.close());
+
+    native.holdToolLists = true;
+    const first = client.snapshot();
+    await vi.waitFor(() => expect(native.heldToolListCount).toBe(1));
+    native.token = "native-token-2";
+    current = await login(native, store);
+    const second = client.snapshot();
+    // setImmediate runs after every pending microtask, so the second call has now reached the catalog read.
+    await new Promise((resolve) => setImmediate(resolve));
+    native.releaseToolLists();
+
+    for (const pending of [first, second]) {
+      const snapshot = await pending;
+      expect(snapshot.error).toBeNull();
+      expect(snapshot.tools.map((tool) => tool.name)).toContain("t3_thread_send");
+    }
+    // The catalog was read with the earlier token, so the next call reads it again with the new one.
+    await client.snapshot();
+    await vi.waitFor(() => expect(native.heldToolListCount).toBe(1));
+    native.releaseToolLists();
+  });
+
   it("keeps the last known tools when the catalog refresh for a renewed credential fails", async () => {
     const native = await startNative();
     const { gateway, store } = await nativeGateway(native);
