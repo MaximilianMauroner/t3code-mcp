@@ -251,6 +251,11 @@ function isSensitiveKey(key: string | undefined): boolean {
     "apikey",
     "privatekey",
     "idempotencykey",
+    // Attachment bytes, and signed upload or webhook URLs that act as bearer secrets.
+    "base64",
+    "relativeurl",
+    "uploadurl",
+    "webhookurl",
   ];
   if (secretTerms.some((term) => normalized.includes(term))) return true;
   return ["message", "instruction", "prompt", "text", "patch", "content", "answers", "answer", "body", "payload", "options"]

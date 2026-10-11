@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { T3HttpError, T3HttpClient } from "../src/t3/http-client.js";
+import type { T3Command } from "../src/t3/commands.js";
 import { FakeT3 } from "./support/fake-t3.js";
+
+const approval: T3Command = {
+  type: "thread.approval.respond",
+  commandId: "command-1",
+  threadId: "thread-1",
+  requestId: "request-1",
+  decision: "accept",
+  createdAt: "2026-01-01T00:00:00.000Z",
+};
 
 describe("T3HttpClient", () => {
   it.each([
@@ -57,14 +67,17 @@ describe("T3HttpClient", () => {
       const client = new T3HttpClient(fake.baseUrl, fake.accessToken);
       await client.getThread("thread/with/slash");
       await client.dispatch({
-        type: "thread.archive",
+        type: "thread.approval.respond",
         commandId: "command-1",
         threadId: "thread/with/slash",
+        requestId: "request-1",
+        decision: "accept",
+        createdAt: "2026-01-01T00:00:00.000Z",
       });
 
       expect(fake.requests.some((request) => request.path === "/api/orchestration/threads/thread%2Fwith%2Fslash")).toBe(true);
       const dispatch = fake.dispatches[0];
-      expect(dispatch?.command).toMatchObject({ type: "thread.archive", commandId: "command-1" });
+      expect(dispatch?.command).toMatchObject({ type: "thread.approval.respond", commandId: "command-1" });
       expect(dispatch?.request.authorization).toBe(`Bearer ${fake.accessToken}`);
     } finally {
       await fake.close();
@@ -78,7 +91,7 @@ describe("T3HttpClient", () => {
       const client = new T3HttpClient(fake.baseUrl, fake.accessToken);
       await client.getDescriptor();
       await expect(
-        client.dispatch({ type: "thread.archive", commandId: "command-1", threadId: "thread-1" }),
+        client.dispatch(approval),
       ).rejects.toMatchObject<Partial<T3HttpError>>({
         status: 409,
         method: "POST",
@@ -113,7 +126,7 @@ describe("T3HttpClient", () => {
       const client = new T3HttpClient(fake.baseUrl, fake.accessToken, 2_000);
       const controller = new AbortController();
       const pending = client.dispatch(
-        { type: "thread.archive", commandId: "command-1", threadId: "thread-1" },
+        approval,
         controller.signal,
       );
       controller.abort();

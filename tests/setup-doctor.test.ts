@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runDoctor } from "../src/doctor.js";
-import { TOOL_NAMES } from "../src/contract.js";
+import { GATEWAY_TOOL_NAMES, TOOL_NAMES } from "../src/contract.js";
 import { parseSetupArgs, renderSetup } from "../src/setup.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
 import { FakeT3 } from "./support/fake-t3.js";
@@ -67,12 +67,15 @@ describe("read-only doctor", () => {
     fixtures.push(fixture);
     const result = await runDoctor(fixture.gateway, fixture.config, { tunnelHealthUrl: "http://127.0.0.1:1/readyz" });
     const names = result.checks.map((c) => c.name);
-    expect(names).toEqual(expect.arrayContaining(["config", "journal", "t3_identity", "effective_access", "freshness", "build", "mcp_discovery", "overview_read", "tunnel"]));
+    expect(names).toEqual(expect.arrayContaining(["config", "journal", "t3_identity", "native_mcp", "effective_access", "freshness", "build", "mcp_discovery", "overview_read", "tunnel"]));
     expect(result.checks.find((c) => c.name === "t3_identity")?.ok).toBe(true);
     expect(result.checks.find((c) => c.name === "overview_read")?.ok).toBe(true);
+    // The fixture has no native credential, so only gateway tools are discovered.
+    expect(result.checks.find((c) => c.name === "native_mcp")).toMatchObject({ ok: false, detail: expect.stringContaining("credential=missing") });
+    expect(result.checks.find((c) => c.name === "mcp_discovery")?.ok).toBe(false);
     expect(result.manifest).toMatchObject({
       declaredOperations: [...TOOL_NAMES],
-      locallyDiscoveredOperations: expect.arrayContaining([...TOOL_NAMES]),
+      locallyDiscoveredOperations: [...GATEWAY_TOOL_NAMES].sort(),
     });
     expect(fake.dispatches).toHaveLength(0);
   });

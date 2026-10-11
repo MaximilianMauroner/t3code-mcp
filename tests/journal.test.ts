@@ -41,7 +41,7 @@ describe("OperationJournal", () => {
     const path = join(directory, "operations.json");
     const first = new OperationJournal(path);
     await first.begin({
-      kind: "project.create",
+      kind: "thread.create",
       idempotencyKey: "crash-key",
       payloadHash: hashPayload({ title: "demo" }),
       projectId: "project-1",
@@ -85,7 +85,7 @@ describe("OperationJournal", () => {
     const path = join(directory, "nested", "operations.json");
     const journal = new OperationJournal(path);
     const begun = await journal.begin({
-      kind: "thread.archive",
+      kind: "thread.create",
       idempotencyKey: "persist-key",
       payloadHash: hashPayload({ threadId: "thread-1" }),
       threadId: "thread-1",
@@ -168,12 +168,42 @@ describe("OperationJournal", () => {
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 2, tasks: [{ title: "Legacy upgrade" }] });
   });
 
+  it("loads legacy-kind records and keeps their idempotency keys reserved", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "t3-code-mcp-journal-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "operations.json");
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const snooze = {
+      operationId: "op-snooze", kind: "thread.snooze", idempotencyKey: "legacy-snooze",
+      payloadHash: hashPayload({ threadId: "thread-1" }), commandId: "command-snooze", status: "accepted",
+      createdAt, updatedAt: createdAt, threadId: "thread-1", snoozedUntil: "2026-01-02T08:00:00.000Z",
+    };
+    const projectCreate = {
+      operationId: "op-project", kind: "project.create", idempotencyKey: "legacy-project",
+      payloadHash: hashPayload({ title: "demo" }), commandId: "command-project", status: "accepted",
+      createdAt, updatedAt: createdAt, projectId: "project-1",
+    };
+    await writeFile(path, JSON.stringify({ version: 2, operations: [snooze, projectCreate], tasks: [] }));
+    const journal = new OperationJournal(path);
+
+    expect(await journal.getByIdempotencyKey("legacy-snooze")).toMatchObject(snooze);
+    expect(await journal.getByIdempotencyKey("legacy-project")).toMatchObject(projectCreate);
+    await expect(
+      journal.begin({
+        kind: "thread.create",
+        idempotencyKey: "legacy-project",
+        payloadHash: hashPayload({ title: "different" }),
+        projectId: "project-1",
+      }),
+    ).rejects.toBeInstanceOf(IdempotencyConflictError);
+  });
+
   it("rejects an idempotency key reused across operation kinds", async () => {
     const directory = await mkdtemp(join(tmpdir(), "t3-code-mcp-journal-"));
     temporaryDirectories.push(directory);
     const journal = new OperationJournal(join(directory, "operations.json"));
     await journal.begin({
-      kind: "thread.archive",
+      kind: "thread.create",
       idempotencyKey: "cross-kind-key",
       payloadHash: hashPayload({ threadId: "thread-1" }),
       threadId: "thread-1",

@@ -8,6 +8,7 @@ import { WebSocketServer } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { makeGateway } from "../src/gateway.js";
+import type { ThreadCreateCommand } from "../src/t3/commands.js";
 import { T3HttpClient } from "../src/t3/http-client.js";
 import { requestT3Rpc } from "../src/t3/rpc-client.js";
 import { V2ShellSchema, V2ThreadSchema } from "../src/t3/v2.js";
@@ -24,6 +25,11 @@ const thread = {
   branch: null, worktreePath: null, createdBy: "user", creationSource: "web",
   createdAt: now, updatedAt: now, archivedAt: null, settledOverride: null, settledAt: null,
   latestUserMessageAt: null, hasActionableProposedPlan: false,
+};
+// Recreating the fixture thread leaves its projection unchanged on either protocol.
+const threadCreate: ThreadCreateCommand = {
+  type: "thread.create", commandId: "create-1", threadId: thread.id, projectId: project.id, title: thread.title,
+  modelSelection: selection, runtimeMode: "full-access", interactionMode: "default", branch: null, worktreePath: null, createdAt: now,
 };
 
 // Wire fields from the merged V2 contracts, without the V1 session/latestTurn.
@@ -61,13 +67,6 @@ async function setup() {
     if (path.startsWith("/api/orchestration/") && request.headers["x-t3-orchestration-protocol"] !== "2") return send({ code: "invalid_request", reason: "protocol" }, 400);
     if (path === "/api/orchestration/shell") return send(shell);
     if (path === `/api/orchestration/threads/${snapshot.projection.thread.id}`) return send(snapshot);
-    if (path === "/api/projects/mutate") {
-      const chunks: Buffer[] = [];
-      for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      const command = z.object({ type: z.literal("project.create"), commandId: z.string(), projectId: z.string(), title: z.string(), workspaceRoot: z.string() }).parse(JSON.parse(Buffer.concat(chunks).toString()));
-      commands.push(command);
-      return send({ id: command.projectId });
-    }
     send({ code: "not_found", reason: "thread_not_found", traceId: "trace-2" }, 404);
   });
   const sockets = new WebSocketServer({ noServer: true });
@@ -87,7 +86,7 @@ async function setup() {
     if (disconnect) { ws.close(); return; }
     if (hold) return;
     if (rejectRpc) {
-      ws.send(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "OrchestrationV2DispatchCommandError", message: "Cannot archive a running thread" } }] } }));
+      ws.send(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "OrchestrationV2DispatchCommandError", message: "Thread already exists" } }] } }));
       return;
     }
     if (command.type === "thread.create") {
@@ -109,7 +108,6 @@ async function setup() {
       snapshot.projection.runs.push({ id: "run-v2", ordinal: 1, providerInstanceId: "codex_openai", modelSelection: selection, status: "running", userMessageId: message.messageId, rootNodeId: "node-root", requestedAt: now, startedAt: now, completedAt: null });
       snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: message.messageId, runId: "run-v2", nodeId: null, role: "user", text: message.text, attachments: [], streaming: false, createdAt: now, updatedAt: now });
     }
-    if (command.type === "run.interrupt") snapshot.projection.runs[0]!.status = "interrupted";
     if (command.type === "runtime-request.respond") snapshot.projection.runtimeRequests.find((request) => request.id === command.requestId)!.status = "resolved";
     ws.send(JSON.stringify([{ _tag: "Exit", requestId: "unrelated", exit: { _tag: "Success", value: {} } }, { _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: { sequence: 3 } } }]));
   }));
@@ -121,7 +119,7 @@ async function setup() {
   cleanups.push(async () => { for (const ws of sockets.clients) ws.terminate(); sockets.close(); await new Promise<void>((resolve) => server.close(() => resolve())); });
   const directory = await mkdtemp(join(tmpdir(), "t3-v2-test-"));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
-  const config = { t3HttpBaseUrl: baseUrl, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 };
+  const config = { t3HttpBaseUrl: baseUrl, t3NativeMcpUrl: `${baseUrl}/mcp`, t3AccessToken: "test-token", mcpBearerToken: "mcp-test", readOnly: false, host: "127.0.0.1", port: 0, maxBodyBytes: 2 * 1024 * 1024, environmentId: null, environmentLabel: null, dataDir: directory, worktreeRoot: null, staleAfterMs: 30_000 };
   const made = makeGateway(config);
   return { ...made, config, snapshot, shell, commands, requests, baseUrl, setArchivedSequence: (sequence: number) => { archivedSequence = sequence; }, setProtocol: (version: number) => { protocolVersion = version; }, disconnect: () => { disconnect = true; }, hold: () => { hold = true; }, rejectRpc: () => { rejectRpc = true; } };
 }
@@ -136,23 +134,23 @@ describe("merged orchestrator V2 boundary", () => {
     expect(shell.threads.find((thread) => thread.id === "archived-1")?.evidenceOrder).toMatchObject({ scope: "shell", snapshotSequence: 10 });
   });
 
-  it.each(["shell", "thread", "snooze"] as const)("recovers the first %s after an upgrade", async (operation) => {
+  it.each(["shell", "thread", "dispatch"] as const)("recovers the first %s after an upgrade", async (operation) => {
     const { client, setProtocol, requests, commands } = await setup();
     setProtocol(1);
     await client.getDescriptor();
     setProtocol(2);
     if (operation === "shell") expect((await client.getShell()).threads).toHaveLength(2);
     if (operation === "thread") expect((await client.getThread("thread-1")).thread.id).toBe("thread-1");
-    if (operation === "snooze") {
-      await client.dispatch({ type: "thread.snooze", commandId: "snooze-1", threadId: "thread-1", snoozedUntil: "2026-10-04T08:47:00.000Z" });
+    if (operation === "dispatch") {
+      await client.dispatch(threadCreate);
       expect(commands).toHaveLength(1);
-      expect(commands[0]?.type).toBe("thread.snooze");
+      expect(commands[0]?.type).toBe("thread.create");
       expect(requests.some((request) => request.path === "/api/orchestration/dispatch")).toBe(false);
       expect(requests.some((request) => request.path.startsWith("/ws?"))).toBe(true);
     }
     expect(requests.filter((request) => request.path === "/.well-known/t3/environment")).toHaveLength(2);
     const reads = requests.filter((request) => request.path.startsWith("/api/orchestration/"));
-    if (operation !== "snooze") expect(reads.map((request) => request.protocol)).toEqual([undefined, "2"]);
+    if (operation !== "dispatch") expect(reads.map((request) => request.protocol)).toEqual([undefined, "2"]);
   });
 
   it("detects upgrades and rollbacks on the same client without an explicit refresh", async () => {
@@ -164,7 +162,7 @@ describe("merged orchestrator V2 boundary", () => {
       const start = requests.length;
       expect((await client.getShell()).projects[0]?.id).toBe("project-1");
       expect((await client.getThread("thread-1")).thread.id).toBe("thread-1");
-      await client.dispatch({ type: "thread.archive", commandId: `archive-${commands.length}`, threadId: "thread-1" });
+      await client.dispatch({ ...threadCreate, commandId: `create-${commands.length}` });
       const observed = requests.slice(start);
       expect(observed.some((request) => request.path === "/api/orchestration/dispatch")).toBe(version === 1);
       expect(observed.some((request) => request.path.startsWith("/ws?"))).toBe(version === 2);
@@ -195,20 +193,17 @@ describe("merged orchestrator V2 boundary", () => {
     expect(requests.filter((request) => request.path.startsWith("/api/orchestration/")).every((request) => request.protocol === "2")).toBe(true);
   });
 
-  it("sends once, binds the run, and interrupts the V2 run ID", async () => {
+  it("sends once and binds the V2 run", async () => {
     const { gateway, commands } = await setup();
     const input = { threadId: "thread-1", message: "Do the work", runtimeMode: "approval-required" as const, interactionMode: "plan" as const, idempotencyKey: "send-v2" };
     const sent = await gateway.threadSend(input);
     expect(sent.status).toBe("accepted");
     await gateway.threadSend(input);
     expect(commands.filter((command) => command.type === "message.dispatch")).toHaveLength(1);
-    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "running", settings: { matchesResolved: true, effective: { runtimeMode: "approval-required" } } });
-    await gateway.runInterrupt({ runId: sent.runId, idempotencyKey: "stop-v2" });
-    expect(commands.find((command) => command.type === "run.interrupt")).toMatchObject({ runId: "run-v2" });
-    expect((await gateway.runGet(sent.runId)).runStatus).toBe("interrupted");
+    expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "running", t3TurnId: "run-v2", settings: { matchesResolved: true, effective: { runtimeMode: "approval-required" } } });
   });
 
-  it("keeps native item-node responses across run reads, summaries, history pages and text chunks", async () => {
+  it("keeps native item-node responses across run reads and summaries", async () => {
     const { client, gateway, snapshot, shell } = await setup();
     const sent = await gateway.threadSend({ threadId: thread.id, message: "Check the result", idempotencyKey: "native-result" });
     const current = snapshot.projection.runs[0]!;
@@ -240,25 +235,6 @@ describe("merged orchestrator V2 boundary", () => {
     expect(summaries.page.items.find((row) => row.id === thread.id)).toMatchObject({
       latestResponseExcerpt: expect.stringContaining(text.slice(0, 40)),
     });
-    const first = await gateway.threadMessages(thread.id, { limit: 1, maxChars: 100 });
-    const second = await gateway.threadMessages(thread.id, { cursor: first.page.nextCursor!, limit: 1, maxChars: 100 });
-    const third = await gateway.threadMessages(thread.id, { cursor: second.page.nextCursor!, limit: 1, maxChars: 100 });
-    expect([first, second, third].flatMap((result) => result.page.messages.map((message) => message.id)))
-      .toEqual([sent.messageId, "previous-answer", "native-answer"]);
-    expect(third.page.nextCursor).toBeNull();
-    let offset = 0;
-    let reconstructed = "";
-    do {
-      const chunk = await gateway.threadMessages(thread.id, { messageId: "native-answer", textOffset: offset, limit: 1, maxChars: 256 });
-      const message = chunk.page.messages[0]!;
-      expect(message.id).toBe("native-answer");
-      expect(message.textRange).toMatchObject({ offset, totalChars: text.length });
-      const end = message.textRange.nextOffset ?? text.length;
-      expect(end).toBeGreaterThan(offset);
-      reconstructed += message.text.slice(0, end - offset);
-      offset = end;
-    } while (offset < text.length);
-    expect(reconstructed).toBe(text);
   });
 
   it("requires authoritative message thread ownership", async () => {
@@ -314,7 +290,7 @@ describe("merged orchestrator V2 boundary", () => {
     Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: null, status: "failed", lastError: failure.message, lastErrorClass: failure.class, usageLimitResetAt: null });
     // Observe a summary-only shell row first; a full read upgrades its provenance.
     expect((await gateway.threadsList({ includeArchived: false, limit: 5, detail: "summary" })).page.items[0]?.failure).toMatchObject({ category: "unknown", class: "usage_limit", source: "t3_session", resetAt: null });
-    expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject({ category: "quota", class: "usage_limit", retryable: false, retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 250 }, source: "t3_v2_turn_item", resetAt: null });
+    expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ category: "quota", class: "usage_limit", retryable: false, retry: { attempt: 2, maxAttempts: 3, retryDelayMs: 250 }, source: "t3_v2_turn_item", resetAt: null });
     snapshot.projection.turnItems[0]!.failure!.resetAt = providerFailures.codexUsageLimit.resetAt;
     expect((await gateway.runGet(sent.runId)).failure).toMatchObject({ resetAt: providerFailures.codexUsageLimit.resetAt, retryAfter: null });
     expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject({ source: "t3_v2_turn_item", code: "usageLimitExceeded" });
@@ -331,7 +307,6 @@ describe("merged orchestrator V2 boundary", () => {
     snapshot.projection.runs.push({ ...failed, id: "later-run", ordinal: 2, status: "running", userMessageId: "later-user", modelSelection: selection, providerInstanceId: "codex_openai" });
     snapshot.projection.messages.push({ threadId: snapshot.projection.thread.id, id: "later-answer", role: "assistant", runId: "later-run", nodeId: failed.rootNodeId, text: "Later response", streaming: false, attachments: [], createdAt: now, updatedAt: now });
     expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", latestResponse: null, failure: { category: "provider_error", class: "provider_error", code: "api_error_401", model: "claude-opus-5-5", provider: "claude-instance", resetAt: null, source: "t3_v2_turn_item" } });
-    expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject({ model: "claude-opus-5-5", provider: "claude-instance" });
     expect((await gateway.threadGet("thread-1")).thread.failure).toBeNull();
   });
 
@@ -841,39 +816,6 @@ describe("merged orchestrator V2 boundary", () => {
     expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toMatchObject(expected);
   });
 
-  it.each(["completed", "interrupted"] as const)("keeps a newer failure when a bounded wait poll sees stale %s", async (state) => {
-    const { gateway, client, snapshot, config } = await setup();
-    const sent = await gateway.threadSend({ threadId: "thread-1", message: "Work", idempotencyKey: "wait-stale-recovery" });
-    const run = snapshot.projection.runs[0]!;
-    const running = await client.getThread("thread-1");
-    run.status = state;
-    const recovery = await client.getThread("thread-1");
-    let release!: () => void;
-    let entered!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const started = new Promise<void>((resolve) => { entered = resolve; });
-    const getThread = client.getThread.bind(client);
-    let calls = 0;
-    client.getThread = async (id) => {
-      if (++calls === 1) return running;
-      if (calls === 2) { entered(); await gate; return recovery; }
-      return getThread(id);
-    };
-    const waiting = gateway.runWait(sent.runId, 2);
-    await started;
-    run.status = "failed";
-    snapshot.snapshotSequence = 3;
-    snapshot.projection.turnItems.push({ id: "new-failure", type: "error", status: "failed", ordinal: 1,
-      runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
-    expect((await gateway.runGet(sent.runId)).runStatus).toBe("failed");
-    release();
-    const expected = { runStatus: "failed", failure: { source: "t3_v2_turn_item", code: "usageLimitExceeded" } };
-    expect(await waiting).toMatchObject(expected);
-    const restarted = makeGateway(config);
-    restarted.client.getThread = async () => recovery;
-    expect(await restarted.gateway.runGet(sent.runId)).toMatchObject(expected);
-  });
-
   it.each([
     ["list", "completed"], ["list", "interrupted"],
     ["overview", "completed"], ["overview", "interrupted"],
@@ -934,7 +876,6 @@ describe("merged orchestrator V2 boundary", () => {
       requestedAt: "2026-10-02T20:00:02.000Z", startedAt: "2026-10-02T20:00:02.000Z", completedAt: null });
     Object.assign(shell.threads[0]!, { latestRunId: "successor", activeRunId: "successor", status: "running", lastError: null, lastErrorClass: null });
     expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: expectedState, failure: null, t3TurnId: run.id });
-    expect(await gateway.runWait(sent.runId, 0.1)).toMatchObject({ runStatus: expectedState, failure: null });
     const restarted = makeGateway(config);
     restarted.client.getThread = async () => older;
     expect(await restarted.gateway.runGet(sent.runId)).toMatchObject({ runStatus: expectedState, failure: null });
@@ -958,7 +899,6 @@ describe("merged orchestrator V2 boundary", () => {
     const expected = { category: "unknown", class: null, code: null, resetAt: null, retry: null,
       source: "t3_turn", provider: run.providerInstanceId, model: run.modelSelection.model };
     expect(await gateway.runGet(sent.runId)).toMatchObject({ runStatus: "failed", failure: expected });
-    expect((await gateway.runWait(sent.runId, 0.1)).failure).toMatchObject(expected);
     expect((await gateway.threadGet("thread-1")).thread.failure).toMatchObject(expected);
     expect((await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]?.failure).toMatchObject(expected);
     const restarted = makeGateway(config);
@@ -1110,7 +1050,7 @@ describe("merged orchestrator V2 boundary", () => {
     const client = new T3HttpClient(baseUrl, "test-token");
     await client.getDescriptor();
     setProtocol(3);
-    await expect(client.dispatch({ type: "thread.archive", commandId: "archive", threadId: "thread-1" })).rejects.toThrow("Unsupported T3 orchestration protocol 3");
+    await expect(client.dispatch(threadCreate)).rejects.toThrow("Unsupported T3 orchestration protocol 3");
     expect(commands).toEqual([]);
   });
 
@@ -1123,8 +1063,8 @@ describe("merged orchestrator V2 boundary", () => {
   it("times out a connected socket and surfaces tagged RPC failures", async () => {
     const fixture = await setup();
     fixture.rejectRpc();
-    await expect(fixture.client.dispatch({ type: "thread.archive", threadId: "thread-1", commandId: "archive" })).rejects.toThrow("Cannot archive a running thread");
+    await expect(fixture.client.dispatch(threadCreate)).rejects.toThrow("Thread already exists");
     fixture.hold();
-    await expect(requestT3Rpc(fixture.baseUrl, "test-token", 50, "orchestration.dispatchCommand", { type: "thread.archive" }, z.unknown())).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(requestT3Rpc(fixture.baseUrl, "test-token", 50, "orchestration.dispatchCommand", { type: "thread.create" }, z.unknown())).rejects.toMatchObject({ name: "TimeoutError" });
   });
 });

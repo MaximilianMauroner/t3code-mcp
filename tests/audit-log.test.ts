@@ -68,7 +68,7 @@ describe("AuditLog", () => {
     const audit = new AuditLog(join(directory, "audit.jsonl"));
     const journal = new OperationJournal(join(directory, "operations.json"), audit);
     const begun = await journal.begin({
-      kind: "thread.archive",
+      kind: "thread.create",
       idempotencyKey: "journal-key",
       payloadHash: hashPayload({ threadId: "thread-1" }),
       threadId: "thread-1",
@@ -77,7 +77,7 @@ describe("AuditLog", () => {
 
     const raw = await readFile(audit.filePath, "utf8");
     expect(raw).not.toContain("journal-key");
-    const page = await audit.query({ source: "journal", operation: "thread.archive", limit: 50 });
+    const page = await audit.query({ source: "journal", operation: "thread.create", limit: 50 });
     expect(page.items.map((event) => event.event)).toEqual(["operation.begin", "operation.update"]);
   });
 

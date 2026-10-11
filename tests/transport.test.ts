@@ -88,7 +88,7 @@ describe("Streamable HTTP gateway boundary", () => {
 
   it("supports independent stateless MCP clients and never returns T3 credentials", async () => {
     const { fake, baseUrl } = await httpFixture();
-    fake.addProject({ id: "project-http", title: "HTTP project" });
+    fake.addThread({ id: "thread-http", title: "HTTP thread" });
     const initializeParams = {
       protocolVersion: "2025-06-18",
       capabilities: {},
@@ -103,7 +103,7 @@ describe("Streamable HTTP gateway boundary", () => {
     const secondInitBody = await secondInit.json() as Record<string, any>;
     const tools = await request(baseUrl, "/mcp", mcpRequest(3, "tools/list", {}));
     const call = await request(baseUrl, "/mcp", mcpRequest(4, "tools/call", {
-      name: "t3_projects_list",
+      name: "t3_threads_list",
       arguments: { limit: 10 },
     }));
     const callText = JSON.stringify(await call.json());
@@ -114,7 +114,7 @@ describe("Streamable HTTP gateway boundary", () => {
     expect(secondInitBody.result?.serverInfo?.name).toBe("t3-code-mcp");
     expect(tools.status).toBe(200);
     expect(call.status).toBe(200);
-    expect(callText).toContain("project-http");
+    expect(callText).toContain("thread-http");
     expect(callText).not.toContain(fake.accessToken);
     expect(firstInit.headers.get("mcp-session-id")).toBeNull();
     expect(secondInit.headers.get("mcp-session-id")).toBeNull();

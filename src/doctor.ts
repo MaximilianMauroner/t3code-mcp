@@ -31,6 +31,13 @@ export interface CapabilityManifest {
   readonly hostDiscoveredOperations: ReadonlyArray<string> | null;
 }
 
+function expiryNote(expiresAt: string | null): string {
+  const expiry = expiresAt ? Date.parse(expiresAt) : Number.NaN;
+  if (!Number.isFinite(expiry)) return "";
+  if (Date.now() > expiry) return ` credential EXPIRED at ${expiresAt}`;
+  return expiry - Date.now() < 7 * 24 * 3600_000 ? ` credential expires soon at ${expiresAt}` : ` credential expires at ${expiresAt}`;
+}
+
 async function canWrite(dir: string): Promise<boolean> {
   try {
     await access(dir, constants.W_OK);
@@ -71,18 +78,18 @@ export async function runDoctor(
   let fingerprintOk = false;
   try {
     const status = await gateway.connectionStatus();
-    const expiry = status.sessionExpiresAt ? Date.parse(status.sessionExpiresAt) : Number.NaN;
-    const expiryNote = Number.isFinite(expiry)
-      ? Date.now() > expiry
-        ? ` credential EXPIRED at ${status.sessionExpiresAt}`
-        : expiry - Date.now() < 7 * 24 * 3600_000
-          ? ` credential expires soon at ${status.sessionExpiresAt}`
-          : ` credential expires at ${status.sessionExpiresAt}`
-      : "";
     checks.push({
       name: "t3_identity",
       ok: status.connectionStatus === "connected",
-      detail: `env=${status.environment?.environmentId ?? "unknown"} version=${status.environment?.serverVersion ?? "unknown"} scopes=[${status.upstreamScopes.join(",")}]${expiryNote}${status.error ? ` error=${status.error}` : ""}`,
+      detail: `env=${status.environment?.environmentId ?? "unknown"} version=${status.environment?.serverVersion ?? "unknown"} scopes=[${status.upstreamScopes.join(",")}]${expiryNote(status.sessionExpiresAt)}${status.error ? ` error=${status.error}` : ""}`,
+    });
+    const native = status.native;
+    checks.push({
+      name: "native_mcp",
+      ok: native.credential === "valid" && native.error === null && native.missingTools.length === 0,
+      detail: `url=${native.url ?? "none"} credential=${native.credential} access=${native.access ?? "none"} tools=${native.availableTools}` +
+        `${native.missingTools.length > 0 ? ` missing=[${native.missingTools.join(",")}]` : ""}${expiryNote(native.expiresAt)}` +
+        `${native.error ? ` error=${native.error}` : ""}${native.credential === "valid" ? "" : " Run native-login with a T3 pairing code."}`,
     });
     checks.push({
       name: "effective_access",
@@ -123,7 +130,7 @@ export async function runDoctor(
 
   try {
     // MCP discovery without mutation: exercise a real tools/list exchange against this build.
-    const server = createMcpServer(gateway);
+    const server = createMcpServer(gateway, await gateway.nativeSnapshot());
     const client = new Client({ name: "t3-code-mcp-doctor", version: "1.0.0" }, { capabilities: {} });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);

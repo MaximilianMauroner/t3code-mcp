@@ -7,7 +7,7 @@ import { makeGateway } from "../src/gateway.js";
 const fixtures: GatewayFixture[] = [];
 const fakes: FakeT3[] = [];
 afterEach(async () => {
-  vi.useRealTimers(); vi.restoreAllMocks();
+  vi.restoreAllMocks();
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
   await Promise.all(fakes.splice(0).map((fake) => fake.close()));
 });
@@ -21,7 +21,7 @@ async function setup(options: ConstructorParameters<typeof FakeT3>[0] = {}) {
 async function running() {
   const state = await setup();
   const run = await state.fixture.gateway.threadSend({ threadId: "thread", message: "work", idempotencyKey: "run" });
-  await state.fixture.gateway.runGet(run.runId); // settle durable turn attribution before fake time
+  await state.fixture.gateway.runGet(run.runId); // settle durable turn attribution before stubbing reads
   const snapshot = await state.fixture.client.getThread("thread");
   const descriptor = await state.fixture.client.getDescriptor();
   const observations = vi.spyOn(state.fixture.client, "getThread").mockImplementation(async () => snapshot);
@@ -29,84 +29,21 @@ async function running() {
   return { ...state, thread: snapshot.thread, run, snapshot, descriptor, observations, descriptors };
 }
 
-describe("bounded run monitoring", () => {
-  it("halves unchanged-run observations, bounds descriptors and never redispatches", async () => {
-    const { fixture, run, fake, observations, descriptors } = await running();
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const pending = fixture.gateway.runWait(run.runId, 30);
-    await vi.advanceTimersByTimeAsync(30_000);
-    const result = await pending;
-    // Old 500 ms loop: initial read + 60 polls, each also fetching identity.
-    expect(observations.mock.calls.length).toBeLessThanOrEqual(30);
-    expect(descriptors).toHaveBeenCalledTimes(2);
-    expect(result).toMatchObject({ runStatus: "running", timedOut: true, monitoring: { observations: 18, requestedTimeoutSeconds: 30 } });
-    expect(fake.dispatches).toHaveLength(1);
-  });
-
-  it.each(["completed", "approval", "input"])("detects %s within the healthy latency guardrail", async (change) => {
-    const { fixture, run, thread, observations } = await running();
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const pending = fixture.gateway.runWait(run.runId, 30);
-    await vi.advanceTimersByTimeAsync(4_000);
-    if (change === "completed") thread.latestTurn = { ...thread.latestTurn!, state: "completed" };
-    if (change === "approval") thread.hasPendingApprovals = true;
-    if (change === "input") thread.hasPendingUserInput = true;
-    await vi.advanceTimersByTimeAsync(2_000);
-    const result = await pending;
-    expect(result.monitoring!.elapsedMs).toBeLessThanOrEqual(6_000);
-    expect(result.timedOut).toBeUndefined();
-    if (change === "completed") expect(result.runStatus).toBe("completed");
-    else expect(result.pendingActions[change === "approval" ? "approvals" : "userInput"]).toBe(true);
-    expect(observations.mock.calls.length).toBeLessThan(10);
-  });
-
-  it("returns immediately for already pending approval", async () => {
-    const { fixture, run, thread, observations } = await running();
-    thread.hasPendingApprovals = true;
-    const result = await fixture.gateway.runWait(run.runId, 30);
-    expect(result.pendingActions.approvals).toBe(true);
-    expect(observations).toHaveBeenCalledTimes(1);
-    expect(result.timedOut).toBeUndefined();
-  });
-
-  it("stops at disconnection instead of consuming the wait interval", async () => {
-    const { fixture, run, observations, descriptors } = await running();
+describe("run observation honesty", () => {
+  it("reports disconnection when the thread read fails", async () => {
+    const { fixture, run, observations } = await running();
     observations.mockRejectedValue(new Error("offline"));
-    const result = await fixture.gateway.runWait(run.runId, 30);
-    expect(result.connectionStatus).toBe("disconnected");
-    expect(result.runStatus).toBe("unknown");
+    const result = await fixture.gateway.runGet(run.runId);
+    expect(result).toMatchObject({ connectionStatus: "disconnected", runStatus: "unknown" });
     expect(observations).toHaveBeenCalledTimes(1);
-    expect(descriptors).toHaveBeenCalledTimes(1);
-    expect(result.monitoring!.elapsedMs).toBeLessThan(2_500);
   });
 
   it("reports unknown when descriptor revalidation is unavailable", async () => {
-    const { fixture, run, descriptor, descriptors, thread } = await running();
-    descriptors.mockResolvedValueOnce(descriptor).mockRejectedValue(new Error("descriptor offline"));
+    const { fixture, run, descriptors, thread } = await running();
+    descriptors.mockRejectedValue(new Error("descriptor offline"));
     thread.latestTurn = { ...thread.latestTurn!, state: "completed" };
-    const result = await fixture.gateway.runWait(run.runId, 30);
+    const result = await fixture.gateway.runGet(run.runId);
     expect(result).toMatchObject({ connectionStatus: "disconnected", runStatus: "unknown", stateFreshness: "unknown", settings: { state: "unresolved" } });
-  });
-
-  it("does not retain a failure from an environment that changes during the wait", async () => {
-    const { fixture, run, descriptor, descriptors, thread } = await running();
-    descriptors.mockResolvedValueOnce(descriptor).mockResolvedValue({ ...descriptor, environmentId: "different" });
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const pending = fixture.gateway.runWait(run.runId, 30);
-    const rejected = expect(pending).rejects.toMatchObject({ code: "environment_mismatch" });
-    await vi.advanceTimersByTimeAsync(100);
-    thread.latestTurn = { ...thread.latestTurn!, state: "error" };
-    thread.session = { status: "error", lastError: "foreign failure" };
-    await vi.advanceTimersByTimeAsync(1_000);
-    await rejected;
-    expect(await fixture.journal.getFailureByTurnId("thread", thread.latestTurn.turnId)).toBeNull();
-  });
-
-  it("rejects an environment change during a wait even without a configured pin", async () => {
-    const { fixture, run, descriptor, descriptors, thread } = await running();
-    descriptors.mockResolvedValueOnce(descriptor).mockResolvedValue({ ...descriptor, environmentId: "different" });
-    thread.latestTurn = { ...thread.latestTurn!, state: "completed" };
-    await expect(fixture.gateway.runWait(run.runId, 30)).rejects.toMatchObject({ code: "environment_mismatch" });
   });
 });
 

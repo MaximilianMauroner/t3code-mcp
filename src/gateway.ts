@@ -4,14 +4,19 @@ import { stat } from "node:fs/promises";
 import { failureIdentityFor, failureInfo, sanitizeFailureIdentifier, sanitizeFailureText } from "./t3/failure.js";
 import { observeSettings, safeModelSelection, type SettingsReceipt, type SettingsObservation } from "./operations/settings.js";
 import { isAbsolute, join } from "node:path";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 import {
   GATEWAY_COMMIT,
+  GATEWAY_TOOL_NAMES,
   GATEWAY_VERSION,
-  TOOL_NAMES,
+  NATIVE_TOOL_NAMES,
+  isNativeMutatingTool,
+  isNativeToolName,
   toolSchemaFingerprint,
+  type NativeToolName,
 } from "./contract.js";
 import {
-  hasQueuedTurnStart,
   isThreadRunning,
   needsAttentionFor,
   observeThread,
@@ -22,17 +27,10 @@ import {
   type ThreadActivity,
   type ThreadStatus,
 } from "./t3/thread-state.js";
-import {
-  defaultSnoozePreset,
-  resolveSnoozePresets,
-  snoozeWakeDescription,
-  type SnoozePresetId,
-} from "./t3/snooze.js";
 import type { GatewayConfig } from "./config.js";
 import {
   OperationJournal,
   hashPayload,
-  type OperationKind,
   type OperationRecord,
   type TaskRecord,
   type TaskStage,
@@ -41,21 +39,19 @@ import {
 import { AuditLog, type AuditLogPage, type AuditQueryInput } from "./operations/audit-log.js";
 import {
   type InteractionMode,
-  type ProjectCreateCommand,
   type RuntimeMode,
   type T3Command,
   type ThreadApprovalResponseCommand,
-  type ThreadArchiveCommand,
   type ThreadCreateCommand,
-  type ThreadSettleCommand,
-  type ThreadSnoozeCommand,
-  type ThreadTurnInterruptCommand,
   type ThreadTurnStartCommand,
-  type ThreadUnsettleCommand,
-  type ThreadUnsnoozeCommand,
   type ThreadUserInputResponseCommand,
 } from "./t3/commands.js";
+import { GatewayError } from "./errors.js";
 import { T3HttpClient, T3HttpError } from "./t3/http-client.js";
+import { NativeCredentialStore, type NativeAccessLevel, type NativeCredentialState } from "./t3/native-credential.js";
+import { NativeMcpClient, type NativeSnapshot } from "./t3/native-mcp.js";
+
+export { GatewayError };
 import type {
   FailureEvidenceOrder,
   Descriptor,
@@ -105,13 +101,53 @@ export interface ConnectionStatusResult {
   readonly upstreamScopes: ReadonlyArray<string>;
   readonly gatewayOperations: ReadonlyArray<string>;
   readonly sessionExpiresAt: string | null;
+  readonly native: NativeStatus;
   readonly error?: string;
+}
+
+/** The proxied native T3 MCP endpoint, as seen by this gateway. */
+export interface NativeStatus {
+  readonly url: string | null;
+  readonly credential: NativeCredentialState["state"];
+  readonly access: NativeAccessLevel | null;
+  readonly scopes: ReadonlyArray<string>;
+  readonly expiresAt: string | null;
+  readonly catalogFetchedAt: string | null;
+  readonly availableTools: number;
+  readonly missingTools: ReadonlyArray<string>;
+  readonly error: string | null;
 }
 
 export interface DisabledOperation {
   readonly operation: string;
-  readonly reasonCode: "gateway_read_only" | "t3_scope_required";
+  readonly reasonCode: "gateway_read_only" | "t3_scope_required" | "native_unavailable";
   readonly reason: string;
+}
+
+export interface AttachmentUploadInput {
+  readonly name: string;
+  readonly mimeType: string;
+  readonly dataBase64: string;
+}
+
+export interface AttachmentUploadResult {
+  readonly attachment: {
+    readonly type: "image" | "file";
+    readonly id: string;
+    readonly name: string;
+    readonly mimeType: string;
+    readonly sizeBytes: number;
+  };
+  readonly nextAction: string;
+}
+
+export interface TaskCancelResult {
+  readonly taskRef: string;
+  readonly threadId: string;
+  /** The T3 run that was asked to stop. */
+  readonly t3RunId: string;
+  readonly status: string;
+  readonly nextAction: string;
 }
 
 export interface ObservedTarget {
@@ -126,15 +162,6 @@ export interface Page<T> {
   readonly nextCursor: string | null;
   readonly hasMore: boolean;
   readonly total: number;
-}
-
-export interface ProjectSummary {
-  readonly id: string;
-  readonly title: string;
-  readonly workspaceRoot: string;
-  readonly defaultModelSelection: ModelSelection | null;
-  readonly createdAt: string | null;
-  readonly updatedAt: string | null;
 }
 
 export interface ThreadSummary {
@@ -221,21 +248,6 @@ export interface ThreadDetail extends ThreadSummary {
   readonly proposedPlanCount: number;
 }
 
-export interface MessagePage {
-  readonly threadId: string;
-  readonly messages: ReadonlyArray<Message & {
-    readonly textRange: {
-      readonly offset: number;
-      readonly totalChars: number;
-      readonly nextOffset: number | null;
-    };
-  }>;
-  readonly nextCursor: string | null;
-  readonly hasMore: boolean;
-  readonly total: number;
-  readonly truncated: boolean;
-}
-
 export interface MutationAccepted {
   readonly environmentId: string;
   readonly operationId: string;
@@ -262,11 +274,6 @@ export interface MutationRejected {
 
 export type MutationResult = MutationAccepted | MutationUncertain | MutationRejected;
 
-export type ProjectCreateResult = MutationResult & {
-  readonly projectId: string;
-  readonly workspaceRoot: string;
-};
-
 export type ThreadCreateResult = MutationResult & {
   readonly projectId: string;
   readonly threadId: string;
@@ -285,7 +292,7 @@ export type ThreadSendResult = MutationResult & {
   /** T3's orchestration turn identifier, not a provider-owned turn identifier. */
   readonly t3TurnId: string | null;
   readonly providerTurnId: string | null;
-  readonly nextAction: "Use t3_run_get or t3_run_wait.";
+  readonly nextAction: "Use t3_task_get, or t3_thread_wait with the threadId.";
   readonly settings?: SettingsObservation;
 };
 
@@ -321,12 +328,6 @@ export interface RunResult {
     readonly approvals: boolean;
     readonly userInput: boolean;
   };
-  readonly monitoring?: {
-    readonly observations: number;
-    readonly requestedTimeoutSeconds: number;
-    readonly elapsedMs: number;
-  };
-  readonly timedOut?: boolean;
   readonly error?: string;
   readonly failure: FailureInfo | null;
 }
@@ -351,13 +352,6 @@ export interface MutationCommonInput {
   readonly idempotencyKey: string;
 }
 
-export interface ProjectCreateInput extends MutationCommonInput {
-  readonly title: string;
-  readonly workspaceRoot: string;
-  readonly createWorkspaceRootIfMissing?: boolean;
-  readonly defaultModelSelection?: ModelSelection | null;
-}
-
 export interface ThreadCreateInput extends MutationCommonInput {
   readonly projectId: string;
   readonly title: string;
@@ -376,19 +370,6 @@ interface ManagedThreadCreateInput extends ThreadCreateInput {
   };
 }
 
-export interface ThreadStartInput extends MutationCommonInput {
-  readonly projectId: string;
-  readonly title: string;
-  readonly message: string;
-  readonly modelSelection?: ModelSelection;
-  readonly runtimeMode: RuntimeMode;
-  readonly interactionMode?: InteractionMode;
-  readonly workspaceMode?: "local" | "worktree";
-  readonly branch?: string | null;
-  readonly worktreePath?: string | null;
-  readonly startFromOrigin?: boolean;
-}
-
 export interface ThreadSendInput extends MutationCommonInput {
   /** Internal provenance for a newly created thread; never exposed as a caller option. */
   readonly initialSettings?: SettingsReceipt;
@@ -398,20 +379,6 @@ export interface ThreadSendInput extends MutationCommonInput {
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: InteractionMode;
   readonly titleSeed?: string;
-  readonly bootstrap?: ThreadTurnStartCommand["bootstrap"];
-}
-
-export interface ThreadInterruptInput extends MutationCommonInput {
-  readonly threadId: string;
-  readonly expectedTurnId: string;
-}
-
-export interface RunInterruptInput extends MutationCommonInput {
-  readonly runId: string;
-}
-
-export interface ArchiveThreadInput extends MutationCommonInput {
-  readonly threadId: string;
 }
 
 export interface PendingActionRespondInput extends MutationCommonInput {
@@ -421,91 +388,6 @@ export interface PendingActionRespondInput extends MutationCommonInput {
   readonly decision?: "accept" | "acceptForSession" | "decline" | "cancel";
   readonly answers?: Record<string, unknown>;
 }
-
-export type SnoozePresetInput = SnoozePresetId | "default";
-
-export interface ThreadSnoozeInput extends MutationCommonInput {
-  readonly threadId: string;
-  /** Named wake time. Defaults to "default" (this evening, else tomorrow morning). */
-  readonly preset?: SnoozePresetInput;
-  /** Explicit ISO wake time. Specify either preset or snoozedUntil, not both. */
-  readonly snoozedUntil?: string;
-}
-
-export interface ThreadUnsnoozeInput extends MutationCommonInput {
-  readonly threadId: string;
-}
-
-export interface ThreadSettleInput extends MutationCommonInput {
-  readonly threadId: string;
-}
-
-export interface ThreadUnsettleInput extends MutationCommonInput {
-  readonly threadId: string;
-}
-
-export type ThreadSnoozeResult = MutationResult & {
-  readonly threadId: string;
-  /** Requested wake time (also the accepted time when status is accepted). */
-  readonly snoozedUntil: string;
-  readonly preset: SnoozePresetId | "custom";
-  readonly wakeDescription: string;
-  readonly note?: string;
-};
-
-export type ThreadUnsnoozeResult = MutationResult & {
-  readonly threadId: string;
-};
-
-export type ThreadSettleResult = MutationResult & {
-  readonly threadId: string;
-  readonly settledOverride: "settled" | "active" | null;
-  readonly lifecycle: ThreadStatus | null;
-  readonly note?: string;
-};
-
-export type ThreadUnsettleResult = MutationResult & {
-  readonly threadId: string;
-  readonly settledOverride: "settled" | "active" | null;
-  readonly lifecycle: ThreadStatus | null;
-};
-
-export interface ProviderOption {
-  readonly instanceId: string | null;
-  readonly provider: string | null;
-  readonly model: string;
-  readonly label: string;
-  readonly projectsWithDefault: ReadonlyArray<string>;
-  readonly threadsUsing: number;
-}
-
-export interface ProvidersResult {
-  readonly environmentId: string;
-  readonly observedAt: string;
-  readonly defaultsByProject: Record<string, ModelSelection | null>;
-  readonly options: ReadonlyArray<ProviderOption>;
-}
-
-export type InterruptVerification =
-  | "interrupted"
-  | "still_running"
-  | "target_changed"
-  | "not_running"
-  | "inconsistent"
-  | "unknown";
-
-export interface ThreadInterruptVerification {
-  readonly observed: InterruptVerification;
-  readonly observedTurnId: string | null;
-  readonly observedAt: string;
-  readonly detail: string;
-}
-
-export type ThreadInterruptResult = MutationResult & {
-  readonly threadId: string;
-  readonly expectedTurnId: string;
-  readonly verification: ThreadInterruptVerification | null;
-};
 
 export interface ThreadsListResult {
   readonly environmentId: string;
@@ -605,33 +487,22 @@ export interface ResultPackage {
   readonly limitations: ReadonlyArray<string>;
 }
 
-const GATEWAY_OPERATIONS: ReadonlyArray<string> = [...TOOL_NAMES];
-
 const MUTATING_GATEWAY_OPERATIONS = new Set<string>([
-  "t3_project_create",
-  "t3_thread_create",
-  "t3_thread_send",
-  "t3_run_interrupt",
   "t3_pending_action_respond",
-  "t3_thread_archive",
-  "t3_thread_interrupt",
-  "t3_thread_snooze",
-  "t3_thread_unsnooze",
-  "t3_thread_settle",
-  "t3_thread_unsettle",
+  "t3_attachment_upload",
   "t3_task_start",
+  "t3_task_cancel",
 ]);
 
-export class GatewayError extends Error {
-  override readonly name = "GatewayError";
+/** Gateway tools that work through native T3 MCP and need its credential. */
+const NATIVE_BACKED_GATEWAY_OPERATIONS = new Set<string>(["t3_attachment_upload", "t3_task_cancel"]);
 
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
-  }
-}
+const IMAGE_MIME_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+const MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+const PreparedUpload = z.object({ attachmentId: z.string().min(1), relativeUrl: z.string().min(1) });
+const InterruptOutcome = z.object({ status: z.string() });
 
 export class T3Gateway {
   private lastReadStartedAt = 0;
@@ -647,6 +518,7 @@ export class T3Gateway {
     private readonly gitInspector = new GitInspector(),
     private readonly auditLog = new AuditLog(join(config.dataDir, "audit.jsonl")),
     private readonly gitWorktrees = new GitWorktreeManager(config.worktreeRoot, auditLog),
+    private readonly nativeClient: NativeMcpClient | null = null,
   ) {}
 
   get audit(): AuditLog {
@@ -694,11 +566,13 @@ export class T3Gateway {
     // When disconnected we cannot confirm scopes; report read-only to fail closed.
     const effective: "read-only" | "read-write" = readOnly ? "read-only" : failure === null && hasOperate ? "read-write" : "read-only";
     const gatewayOps = readOnly
-      ? GATEWAY_OPERATIONS.filter((operation) => !MUTATING_GATEWAY_OPERATIONS.has(operation))
-      : [...GATEWAY_OPERATIONS];
-    const { callableOperations, disabledOperations } = partitionOperations([...TOOL_NAMES], {
+      ? GATEWAY_TOOL_NAMES.filter((operation) => !MUTATING_GATEWAY_OPERATIONS.has(operation))
+      : [...GATEWAY_TOOL_NAMES];
+    const native = await this.nativeView();
+    const { callableOperations, disabledOperations } = partitionOperations({
       readOnly,
       hasOperate: failure === null ? hasOperate : false,
+      native,
     });
 
     return {
@@ -719,6 +593,7 @@ export class T3Gateway {
       upstreamScopes: sessionScopes,
       gatewayOperations: gatewayOps,
       sessionExpiresAt,
+      native: native.status,
       ...(failure === null ? {} : { error: failure }),
     };
   }
@@ -736,18 +611,6 @@ export class T3Gateway {
       auditError: this.auditLog.diagnosticError,
       page,
     };
-  }
-
-  async projectsList(input: { readonly query?: string; readonly cursor?: string; readonly limit: number }): Promise<{
-    readonly environmentId: string;
-    readonly page: Page<ProjectSummary>;
-  }> {
-    const shell = await this.client.getShell();
-    const projects = shell.projects.filter((project) =>
-      matchesQuery(input.query, project.title, project.workspaceRoot, project.id),
-    );
-    const page = paginate(projects.map(projectSummary), input.cursor, input.limit);
-    return { environmentId: await this.environmentId(), page };
   }
 
   async gitStatus(input: GitStatusInput): Promise<GitStatusResult> {
@@ -970,6 +833,80 @@ export class T3Gateway {
     };
   }
 
+  /** The native tool catalog for registering proxied tools; null when native MCP is not configured. */
+  async nativeSnapshot(): Promise<NativeSnapshot | null> {
+    return this.nativeClient === null ? null : this.nativeClient.snapshot();
+  }
+
+  async callNative(name: NativeToolName, args: Record<string, unknown>): Promise<CallToolResult> {
+    const mutating = isNativeMutatingTool(name);
+    const native = await this.requireNative(mutating);
+    return native.callTool(name, args, mutating);
+  }
+
+  async attachmentUpload(input: AttachmentUploadInput): Promise<AttachmentUploadResult> {
+    const native = await this.requireNative(true);
+    const bytes = decodeBase64Strict(input.dataBase64);
+    const type: "image" | "file" = IMAGE_MIME_TYPES.has(input.mimeType) ? "image" : "file";
+    const limit = type === "image" ? MAX_IMAGE_ATTACHMENT_BYTES : MAX_FILE_ATTACHMENT_BYTES;
+    if (bytes.byteLength === 0 || bytes.byteLength > limit) {
+      throw new GatewayError("invalid_attachment", `A ${type} attachment must be 1 to ${limit} bytes; received ${bytes.byteLength}.`);
+    }
+    const upload = { type, name: input.name, mimeType: input.mimeType, sizeBytes: bytes.byteLength };
+    const prepared = nativeValue(
+      await native.callTool("t3_attachment_prepare_upload", { upload }, true),
+      PreparedUpload,
+      "t3_attachment_prepare_upload",
+    );
+    try {
+      await native.uploadAttachment(prepared.relativeUrl, bytes, input.mimeType);
+    } catch (error) {
+      await native.callTool("t3_attachment_discard", { attachmentId: prepared.attachmentId }, true).catch(() => undefined);
+      throw error;
+    }
+    return {
+      attachment: { ...upload, id: prepared.attachmentId },
+      nextAction: "Pass attachment in the attachments array of t3_thread_send_attachments with the target threadId.",
+    };
+  }
+
+  async taskCancel(input: { readonly taskRef: string; readonly reason?: string }): Promise<TaskCancelResult> {
+    const native = await this.requireNative(true);
+    const { task } = await this.taskGet(input.taskRef);
+    const t3RunId = task.run?.t3TurnId ?? null;
+    if (task.threadId === null || t3RunId === null) {
+      // Only an accepted or uncertain dispatch can have started a run.
+      if (task.threadId === null || (task.stage !== "run_accepted" && task.stage !== "dispatch_uncertain")) {
+        throw new GatewayError("task_not_started", `Task ${input.taskRef} is at stage ${task.stage} and started no run. ${task.nextAction}`);
+      }
+      throw new GatewayError(
+        "task_run_unknown",
+        `T3 has not reported the run for task ${input.taskRef}. Inspect thread ${task.threadId} with t3_thread_read, then use t3_thread_interrupt.`,
+      );
+    }
+    const outcome = nativeValue(
+      await native.callTool(
+        "t3_thread_interrupt",
+        {
+          threadId: task.threadId,
+          runId: t3RunId,
+          ...(input.reason === undefined ? {} : { reason: input.reason }),
+          clientRequestId: `task-cancel:${input.taskRef}:${t3RunId}`,
+        },
+        true,
+      ),
+      InterruptOutcome,
+      "t3_thread_interrupt",
+    );
+    return {
+      taskRef: input.taskRef,
+      threadId: task.threadId,
+      t3RunId,
+      status: outcome.status,
+      nextAction: "Confirm the stop with t3_thread_wait or t3_task_get. Interrupt acceptance alone does not prove the run stopped.",
+    };
+  }
+
   async threadsList(input: {
     readonly projectId?: string;
     readonly includeArchived: boolean;
@@ -1018,7 +955,7 @@ export class T3Gateway {
       failureEvidenceOrder(thread, shell.snapshotSequence, "shell", undefined, readStartedAt),
     )));
     // detail=full is served by the same shell rows plus latest-response enrichment on the page only.
-    // Full transcripts still require t3_thread_messages.
+    // Full transcripts come from native t3_thread_read.
     let items: ReadonlyArray<ThreadSummary> = summaries;
     if (input.detail === "full") {
       items = await this.enrichWithLatestResponse(summaries, 200, shellOrders);
@@ -1100,50 +1037,6 @@ export class T3Gateway {
     };
   }
 
-  async providersList(): Promise<ProvidersResult> {
-    const shell = await this.client.getShell();
-    const environmentId = await this.environmentId();
-    const observedAt = new Date().toISOString();
-    const defaultsByProject: Record<string, ModelSelection | null> = {};
-    for (const project of shell.projects) {
-      defaultsByProject[project.id] = project.defaultModelSelection ?? null;
-    }
-    const byKey = new Map<string, { selection: ModelSelection; projectsWithDefault: Set<string>; threadsUsing: number }>();
-    const keyOf = (selection: ModelSelection): string =>
-      `${selection.instanceId ?? ""}\u0000${selection.provider ?? ""}\u0000${selection.model}`;
-    for (const project of shell.projects) {
-      const def = project.defaultModelSelection;
-      if (!def) continue;
-      const key = keyOf(def);
-      const entry = byKey.get(key) ?? { selection: def, projectsWithDefault: new Set<string>(), threadsUsing: 0 };
-      entry.projectsWithDefault.add(project.id);
-      byKey.set(key, entry);
-    }
-    for (const thread of shell.threads) {
-      const key = keyOf(thread.modelSelection);
-      const entry = byKey.get(key) ?? {
-        selection: thread.modelSelection,
-        projectsWithDefault: new Set<string>(),
-        threadsUsing: 0,
-      };
-      entry.threadsUsing += 1;
-      byKey.set(key, entry);
-    }
-    const options: ProviderOption[] = [...byKey.values()]
-      .map((entry) => ({
-        instanceId: entry.selection.instanceId ?? null,
-        provider: entry.selection.provider ?? null,
-        model: entry.selection.model,
-        label: [entry.selection.instanceId ?? entry.selection.provider ?? "t3", entry.selection.model]
-          .filter(Boolean)
-          .join("/"),
-        projectsWithDefault: [...entry.projectsWithDefault].sort(),
-        threadsUsing: entry.threadsUsing,
-      }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-    return { environmentId, observedAt, defaultsByProject, options };
-  }
-
   async threadGet(threadId: string): Promise<{ readonly environmentId: string; readonly thread: ThreadDetail }> {
     const fullReadStartedAt = this.readStartedAt();
     const snapshot = await this.client.getThread(threadId);
@@ -1181,95 +1074,6 @@ export class T3Gateway {
       environmentId,
       thread: detail,
     };
-  }
-
-  async threadMessages(
-    threadId: string,
-    input: { readonly cursor?: string; readonly limit: number; readonly maxChars: number; readonly messageId?: string; readonly textOffset?: number },
-  ): Promise<{ readonly environmentId: string; readonly page: MessagePage }> {
-    const snapshot = await this.client.getThread(threadId);
-    const history = input.messageId === undefined
-      ? snapshot.thread.messages
-      : snapshot.thread.messages.filter((message) => message.id === input.messageId);
-    if (input.messageId !== undefined && history.length === 0) {
-      throw new GatewayError("message_not_found", "The requested message is not in this thread.");
-    }
-    const offset = input.textOffset ?? 0;
-    if (!Number.isSafeInteger(offset) || offset < 0 || (offset > 0 && input.messageId === undefined)) {
-      throw new GatewayError("invalid_text_offset", "textOffset must be a non-negative safe integer; a positive offset requires messageId.");
-    }
-    const { items, ...page } = paginate(history, input.cursor, input.limit);
-    let truncated = false;
-    const messages = items.map((message) => {
-      if (offset > message.text.length) {
-        throw new GatewayError("invalid_text_offset", "textOffset exceeds the message length. Read the message again from offset 0.");
-      }
-      const end = Math.min(message.text.length, offset + input.maxChars);
-      const nextOffset = end < message.text.length ? end : null;
-      truncated ||= offset > 0 || nextOffset !== null;
-      return {
-        ...message,
-        text: message.text.slice(offset, end) + (nextOffset === null ? "" : "\n[truncated]"),
-        textRange: { offset, totalChars: message.text.length, nextOffset },
-      };
-    });
-    return {
-      environmentId: await this.environmentId(),
-      page: { threadId, ...page, messages, truncated },
-    };
-  }
-
-  async projectCreate(input: ProjectCreateInput): Promise<ProjectCreateResult> {
-    const payload = {
-      title: input.title,
-      workspaceRoot: input.workspaceRoot,
-      createWorkspaceRootIfMissing: input.createWorkspaceRootIfMissing ?? false,
-      defaultModelSelection: input.defaultModelSelection ?? null,
-    };
-    const commandKind: OperationKind = "project.create";
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin({
-        kind: commandKind,
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        projectId: existing.projectId,
-      });
-      const reconciled = await this.reconcile(begun.record);
-      return this.projectCreateResult(reconciled, input.workspaceRoot);
-    }
-    await this.requireOperationScope();
-    const projectId = randomUUID();
-    const begun = await this.journal.begin({
-      kind: commandKind,
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      projectId,
-    });
-    if (begun.reused) {
-      const reconciled = await this.reconcile(begun.record);
-      return this.projectCreateResult(reconciled, input.workspaceRoot);
-    }
-
-    const command: ProjectCreateCommand = {
-      type: "project.create",
-      commandId: begun.record.commandId,
-      projectId,
-      title: input.title,
-      workspaceRoot: input.workspaceRoot,
-      ...(input.createWorkspaceRootIfMissing === undefined
-        ? {}
-        : { createWorkspaceRootIfMissing: input.createWorkspaceRootIfMissing }),
-      ...(input.defaultModelSelection === undefined
-        ? {}
-        : { defaultModelSelection: input.defaultModelSelection }),
-      createdAt: new Date().toISOString(),
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return this.projectCreateResult(result, input.workspaceRoot);
   }
 
   async threadCreate(input: ManagedThreadCreateInput): Promise<ThreadCreateResult> {
@@ -1335,7 +1139,7 @@ export class T3Gateway {
     if (modelSelection === null || modelSelection === undefined) {
       throw new GatewayError(
         "model_selection_required",
-        "The project has no default model. Call t3_providers_list to discover available instanceId/model values, then supply modelSelection.",
+        "The project has no default model. Call orchestrator_capabilities to discover available instanceId/model values, then supply modelSelection.",
       );
     }
     const threadId = randomUUID();
@@ -1394,84 +1198,6 @@ export class T3Gateway {
     return this.threadCreateResult(result, input.projectId, modelSelection, selectedBranch, selectedWorktreePath);
   }
 
-  async threadStart(input: ThreadStartInput): Promise<ThreadSendResult> {
-    const workspaceMode = input.workspaceMode ?? "local";
-    if (workspaceMode === "worktree" && !input.branch) {
-      throw new GatewayError(
-        "worktree_base_branch_required",
-        "workspaceMode=worktree requires a base branch, for example branch=main. The gateway generates the isolated task branch/path; omit worktreePath. Use workspaceMode=local to use the current checkout.",
-      );
-    }
-    if (workspaceMode === "worktree" && input.worktreePath != null) {
-      throw new GatewayError(
-        "worktree_path_not_allowed",
-        "workspaceMode=worktree creates a gateway-managed path; worktreePath must be omitted.",
-      );
-    }
-    if (workspaceMode === "local" && input.startFromOrigin !== undefined) {
-      throw new GatewayError(
-        "origin_selection_requires_worktree",
-        "startFromOrigin is only valid when workspaceMode=worktree.",
-      );
-    }
-    const legacyPayload = {
-      projectId: input.projectId,
-      title: input.title,
-      message: input.message,
-      modelSelection: input.modelSelection ?? null,
-      runtimeMode: input.runtimeMode,
-      interactionMode: input.interactionMode ?? "default",
-      workspaceMode,
-      branch: input.branch ?? null,
-      worktreePath: input.worktreePath ?? null,
-      startFromOrigin: input.startFromOrigin ?? false,
-    };
-    const legacyOperation = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (legacyOperation !== null) {
-      const begun = await this.journal.begin({
-        kind: "thread.turn.start",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(legacyPayload),
-        projectId: legacyOperation.projectId ?? input.projectId,
-        threadId: legacyOperation.threadId,
-        runId: legacyOperation.runId,
-        messageId: legacyOperation.messageId,
-      });
-      return this.threadSendResult(await this.reconcile(begun.record));
-    }
-    const created = await this.threadCreate({
-      projectId: input.projectId,
-      title: input.title,
-      modelSelection: input.modelSelection,
-      runtimeMode: input.runtimeMode,
-      interactionMode: input.interactionMode,
-      branch: workspaceMode === "worktree" ? null : input.branch,
-      worktreePath: workspaceMode === "worktree" ? null : input.worktreePath,
-      ...(workspaceMode === "worktree"
-        ? { managedWorktree: { baseBranch: input.branch!, startFromOrigin: input.startFromOrigin ?? false } }
-        : {}),
-      idempotencyKey: `${input.idempotencyKey}:thread`,
-    });
-    if (created.status !== "accepted") {
-      throw new GatewayError(
-        created.status === "uncertain" ? "thread_create_uncertain" : "thread_create_rejected",
-        `Initial message was not sent because thread creation was ${created.status}. ` +
-          `Thread ${created.threadId}; operation ${created.operationId}. ${created.reason}`,
-      );
-    }
-
-    return this.threadSend({
-      initialSettings: (await this.journal.getByOperationId(created.operationId))?.settings,
-      threadId: created.threadId,
-      message: input.message,
-      modelSelection: input.modelSelection,
-      runtimeMode: input.runtimeMode,
-      interactionMode: input.interactionMode,
-      titleSeed: input.title,
-      idempotencyKey: `${input.idempotencyKey}:turn`,
-    });
-  }
-
   async threadSend(input: ThreadSendInput): Promise<ThreadSendResult> {
     if (this.config.readOnly) {
       await this.requireOperationScope();
@@ -1483,7 +1209,6 @@ export class T3Gateway {
       runtimeMode: input.runtimeMode ?? null,
       interactionMode: input.interactionMode ?? null,
       titleSeed: input.titleSeed ?? null,
-      ...(input.bootstrap === undefined ? {} : { bootstrap: input.bootstrap }),
     };
     const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
     if (existing) {
@@ -1527,10 +1252,9 @@ export class T3Gateway {
         "thread_busy",
         `Thread ${input.threadId} is busy (execution=${observation.execution}, ` +
           `turn=${activeTurn ?? "unknown"}, session=${typeof sessionStatus === "string" ? sessionStatus : "unknown"}, ` +
-          `quality=${observation.quality}). Valid next actions: use t3_run_wait with the existing gateway runId, ` +
-          `or t3_thread_get when no gateway run handle is known; ` +
-          `wait for completion, or interrupt the observed turn ${activeTurn ?? "once known"} with t3_thread_interrupt. ` +
-          `Queueing and steering are not enabled.`,
+          `quality=${observation.quality}). Valid next actions: wait with t3_thread_wait, ` +
+          `steer or queue with t3_thread_send mode=steer or mode=queue, ` +
+          `or interrupt the observed run ${activeTurn ?? "once known"} with t3_thread_interrupt.`,
       );
     }
 
@@ -1562,19 +1286,6 @@ export class T3Gateway {
       return this.threadSendResult(reconciled);
     }
 
-    const bootstrap = input.bootstrap?.prepareWorktree !== undefined && input.bootstrap.prepareWorktree.branch === undefined
-      ? {
-          ...input.bootstrap,
-          prepareWorktree: {
-            ...input.bootstrap.prepareWorktree,
-            // Match T3's client convention. Deriving the temporary branch
-            // from the durable command id keeps retries stable without adding
-            // generated state to the caller's idempotency payload.
-            branch: `t3code/${begun.record.commandId.toLowerCase().replaceAll("-", "").slice(0, 8)}`,
-          },
-        }
-      : input.bootstrap;
-
     const command: ThreadTurnStartCommand = {
       type: "thread.turn.start",
       commandId: begun.record.commandId,
@@ -1584,7 +1295,6 @@ export class T3Gateway {
       ...(input.titleSeed === undefined ? {} : { titleSeed: input.titleSeed }),
       runtimeMode: input.runtimeMode ?? snapshot.thread.runtimeMode,
       interactionMode: input.interactionMode ?? snapshot.thread.interactionMode ?? "default",
-      ...(bootstrap === undefined ? {} : { bootstrap }),
       createdAt: new Date().toISOString(),
     };
     const result = await this.dispatchNew(begun.record, command);
@@ -1597,268 +1307,7 @@ export class T3Gateway {
     if (!operation || operation.kind !== "thread.turn.start") {
       throw new GatewayError("run_not_found", `Run ${runId} was not found in the gateway journal.`);
     }
-    return (await this.observeRun(operation)).run;
-  }
-
-  async runWait(runId: string, timeoutSeconds: number): Promise<RunResult> {
-    const startedAt = Date.now();
-    const initial = await this.runGet(runId);
-    const deadline = Date.now() + timeoutSeconds * 1000;
-    let current = initial;
-    let failureOrder: FailureEvidenceOrder | undefined;
-    let observations = 1;
-    let intervalMs = 500;
-    while (Date.now() < deadline && waitCanContinue(current)) {
-      await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
-      const record = await this.journal.getByRunId(runId) ?? await this.findRun(runId);
-      if (!record || record.kind !== "thread.turn.start") throw new GatewayError("run_not_found", `Run ${runId} was not found in the gateway journal.`);
-      const observation = await this.observeRun(record, initial.environmentId);
-      current = observation.run;
-      failureOrder = observation.failureOrder;
-      observations += 1;
-      if (hasRelevantChange(initial, current)) break;
-      intervalMs = Math.min(2_000, intervalMs * 2);
-    }
-    // Reuse identity only inside this bounded read. Mutation checks stay fresh.
-    // Revalidate even when the configuration does not pin an environment.
-    if (current.connectionStatus === "connected") {
-      try {
-        const finalEnvironmentId = await this.environmentId();
-        if (finalEnvironmentId !== initial.environmentId) {
-          throw new GatewayError("environment_mismatch", "T3 environment changed during the wait; discard this observation and reconnect before continuing.");
-        }
-      } catch (error) {
-        if (error instanceof GatewayError && error.code === "environment_mismatch") throw error;
-        const retainedFailure = current.threadId && current.t3TurnId
-          ? await this.journal.getFailureByTurnId(current.threadId, current.t3TurnId)
-          : null;
-        current = {
-          ...current, connectionStatus: "disconnected", runStatus: retainedFailure ? "failed" : "unknown",
-          failure: retainedFailure, stateFreshness: "unknown", threadQuality: null, threadWarning: null,
-          latestResponse: null, pendingActions: { approvals: false, userInput: false },
-          error: sanitizeFailureText(safeErrorMessage(error), 2_000),
-          ...(current.settings === undefined ? {} : { settings: observeSettings(current.settings) }),
-        };
-      }
-    }
-    if (current.connectionStatus === "connected" && current.t3TurnId) {
-      const record = await this.journal.getByOperationId(current.operationId);
-      if (record && record.turnId !== current.t3TurnId) {
-        await this.journal.update(record.operationId, { turnId: current.t3TurnId });
-      }
-      if (current.failure && current.threadId) {
-        const retained = await this.journal.retainTerminalFailure(
-          current.threadId, current.t3TurnId, current.failure, current.operationId, failureOrder,
-        );
-        current = { ...current, failure: retained,
-          runStatus: retained ? "failed" : await this.journal.getRecoveryByTurnId(current.threadId, current.t3TurnId) ?? current.runStatus };
-      }
-      if (current.threadId && current.t3TurnId &&
-        (current.runStatus === "completed" || current.runStatus === "interrupted")) {
-        await this.journal.clearTerminalFailure(current.threadId, current.t3TurnId, current.runStatus, failureOrder);
-        const retainedFailure = await this.journal.getFailureByTurnId(current.threadId, current.t3TurnId);
-        current = { ...current, failure: retainedFailure,
-          runStatus: retainedFailure ? "failed" : await this.journal.getRecoveryByTurnId(current.threadId, current.t3TurnId) ?? current.runStatus,
-          latestResponse: retainedFailure ? null : current.latestResponse };
-      }
-    }
-    const result: RunResult = {
-      ...current,
-      ...(waitCanContinue(current) && !hasRelevantChange(initial, current) && Date.now() >= deadline ? { timedOut: true } : {}),
-      monitoring: { observations, requestedTimeoutSeconds: timeoutSeconds, elapsedMs: Date.now() - startedAt },
-    };
-    await this.auditLog.record({
-      source: "system", event: "run.wait", operation: "t3_run_wait", outcome: result.connectionStatus === "disconnected" ? "disconnected" : result.timedOut ? "timed_out" : "changed",
-      durationMs: result.monitoring!.elapsedMs,
-      details: { runId, ...result.monitoring, runStatus: result.runStatus },
-    });
-    return result;
-  }
-
-  async runInterrupt(input: RunInterruptInput): Promise<MutationResult> {
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const payload = {
-        runId: input.runId,
-        threadId: existing.threadId ?? null,
-        turnId: existing.turnId ?? null,
-      };
-      const begun = await this.journal.begin({
-        kind: "thread.turn.interrupt",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        threadId: existing.threadId,
-        runId: input.runId,
-        ...(existing.turnId === undefined ? {} : { turnId: existing.turnId }),
-      });
-      return mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId());
-    }
-    await this.requireOperationScope();
-    const run = await this.runGet(input.runId);
-    if (!run.threadId) {
-      throw new GatewayError("run_thread_missing", "The run has no associated thread.");
-    }
-    if (isTerminal(run.runStatus)) {
-      throw new GatewayError("run_not_active", `Run ${input.runId} is already ${run.runStatus}.`);
-    }
-    const snapshot = await this.client.getThread(run.threadId);
-    const turnId = run.t3TurnId ?? associatedTurnId(snapshot.thread, input.runId);
-    const payload = { runId: input.runId, threadId: run.threadId, turnId: turnId ?? null };
-    const begun = await this.journal.begin({
-      kind: "thread.turn.interrupt",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: run.threadId,
-      runId: input.runId,
-      ...(turnId === null || turnId === undefined ? {} : { turnId }),
-    });
-    if (begun.reused) {
-      return mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId());
-    }
-    const command: ThreadTurnInterruptCommand = {
-      type: "thread.turn.interrupt",
-      commandId: begun.record.commandId,
-      threadId: run.threadId,
-      ...(turnId === null || turnId === undefined ? {} : { turnId }),
-      createdAt: new Date().toISOString(),
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return mutationResult(result, await this.knownEnvironmentId());
-  }
-
-  async threadInterrupt(input: ThreadInterruptInput): Promise<ThreadInterruptResult> {
-    if (this.config.readOnly) await this.requireOperationScope();
-    const payload = { threadId: input.threadId, expectedTurnId: input.expectedTurnId };
-    const beginInput = {
-      kind: "thread.turn.interrupt" as const,
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: input.threadId,
-      turnId: input.expectedTurnId,
-    };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin(beginInput);
-      const environmentId = await this.knownEnvironmentId();
-      return {
-        ...mutationResult(begun.record, environmentId),
-        threadId: input.threadId,
-        expectedTurnId: input.expectedTurnId,
-        verification: await this.verifyInterruption(environmentId, input.threadId, input.expectedTurnId),
-      };
-    }
-    await this.requireOperationScope();
-    // Check identity before dispatch; a misconfigured endpoint must never stop work.
-    // T3 interrupts by provider session, so this precheck is not atomic.
-    const environmentId = await this.environmentId();
-    const { thread } = await this.client.getThread(input.threadId);
-    const observedAt = new Date().toISOString();
-    if (thread.latestTurn?.turnId !== input.expectedTurnId) {
-      throw new GatewayError(
-        "turn_changed",
-        `Thread ${input.threadId} latest turn is ${thread.latestTurn?.turnId ?? "unknown"} at ${observedAt}, ` +
-          `not expected ${input.expectedTurnId}. Read t3_thread_get again and use the fresh observedTarget before interrupting.`,
-      );
-    }
-    if (thread.latestTurn.state !== "running") {
-      throw new GatewayError(
-        "thread_not_running",
-        `Thread ${input.threadId} turn ${input.expectedTurnId} is ${thread.latestTurn.state} at ${observedAt}, ` +
-          `not running. Read t3_thread_get to reconcile; do not retry the interrupt.`,
-      );
-    }
-    const begun = await this.journal.begin(beginInput);
-    if (begun.reused) {
-      return {
-        ...mutationResult(begun.record, environmentId),
-        threadId: input.threadId,
-        expectedTurnId: input.expectedTurnId,
-        verification: await this.verifyInterruption(environmentId, input.threadId, input.expectedTurnId),
-      };
-    }
-    const result = await this.dispatchNew(begun.record, {
-      type: "thread.turn.interrupt",
-      commandId: begun.record.commandId,
-      threadId: input.threadId,
-      turnId: input.expectedTurnId,
-      createdAt: new Date().toISOString(),
-    });
-    const verification = result.status === "accepted"
-      ? await this.verifyInterruption(environmentId, input.threadId, input.expectedTurnId)
-      : null;
-    return {
-      ...mutationResult(result, environmentId),
-      threadId: input.threadId,
-      expectedTurnId: input.expectedTurnId,
-      verification,
-    };
-  }
-
-  private async verifyInterruption(
-    environmentId: string,
-    threadId: string,
-    expectedTurnId: string,
-  ): Promise<ThreadInterruptVerification> {
-    void environmentId;
-    try {
-      const { thread } = await this.client.getThread(threadId);
-      const now = Date.now();
-      const observation = observeThread(thread, now);
-      const currentTurnId = thread.latestTurn?.turnId ?? null;
-      const currentState = thread.latestTurn?.state ?? null;
-      if (currentTurnId !== expectedTurnId) {
-        return {
-          observed: "target_changed",
-          observedTurnId: currentTurnId,
-          observedAt: observation.observedAt,
-          detail: `Latest turn changed from ${expectedTurnId} to ${currentTurnId ?? "unknown"}. ` +
-            `Acceptance did not confirm the observed run stopped; read t3_thread_get to reconcile. ` +
-            `T3 interrupts by provider session without an atomic turn condition.`,
-        };
-      }
-      if (currentState === "interrupted") {
-        return {
-          observed: "interrupted",
-          observedTurnId: currentTurnId,
-          observedAt: observation.observedAt,
-          detail: `Turn ${expectedTurnId} is interrupted as observed at ${observation.observedAt}.`,
-        };
-      }
-      if (currentState !== "running") {
-        return {
-          observed: "not_running",
-          observedTurnId: currentTurnId,
-          observedAt: observation.observedAt,
-          detail: `Turn ${expectedTurnId} is ${currentState ?? "unknown"}; it is no longer running.`,
-        };
-      }
-      if (observation.quality === "inconsistent") {
-        return {
-          observed: "inconsistent",
-          observedTurnId: currentTurnId,
-          observedAt: observation.observedAt,
-          detail: observation.warning ?? "T3 signals disagree after interrupt acceptance.",
-        };
-      }
-      return {
-        observed: "still_running",
-        observedTurnId: currentTurnId,
-        observedAt: observation.observedAt,
-        detail: `Interrupt accepted but turn ${expectedTurnId} still reports running at ${observation.observedAt}. ` +
-          `Poll t3_thread_get; acceptance alone does not confirm a stop.`,
-      };
-    } catch (error) {
-      return {
-        observed: "unknown",
-        observedTurnId: null,
-        observedAt: new Date().toISOString(),
-        detail: `Could not verify interruption: ${safeErrorMessage(error)}. ` +
-          `Reconcile with t3_thread_get using the durable operation handle; do not resubmit with a fresh key.`,
-      };
-    }
+    return this.observeRun(operation);
   }
 
   async pendingActionsList(threadId: string): Promise<PendingActionsResult> {
@@ -1933,321 +1382,6 @@ export class T3Gateway {
     return mutationResult(result, await this.knownEnvironmentId());
   }
 
-  async threadArchive(input: ArchiveThreadInput): Promise<MutationResult> {
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    const payload = { threadId: input.threadId };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin({
-        kind: "thread.archive",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        threadId: existing.threadId ?? input.threadId,
-      });
-      return mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId());
-    }
-    await this.requireOperationScope();
-    const begun = await this.journal.begin({
-      kind: "thread.archive",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: input.threadId,
-    });
-    if (begun.reused) {
-      return mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId());
-    }
-    const command: ThreadArchiveCommand = {
-      type: "thread.archive",
-      commandId: begun.record.commandId,
-      threadId: input.threadId,
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return mutationResult(result, await this.knownEnvironmentId());
-  }
-
-  async threadSnooze(input: ThreadSnoozeInput): Promise<ThreadSnoozeResult> {
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    if (input.snoozedUntil !== undefined && input.preset !== undefined && input.preset !== "default") {
-      throw new GatewayError("invalid_snooze_input", "Specify either preset or snoozedUntil, not both.");
-    }
-    if (input.snoozedUntil !== undefined) {
-      const parsed = Date.parse(input.snoozedUntil);
-      if (!Number.isFinite(parsed)) {
-        throw new GatewayError("invalid_snooze_time", `snoozedUntil ${JSON.stringify(input.snoozedUntil)} is not a valid date.`);
-      }
-      if (parsed <= Date.now()) {
-        throw new GatewayError("invalid_snooze_time", "The snooze wake time must be in the future.");
-      }
-    }
-    // The idempotency hash covers user intent (preset or explicit time), not
-    // the resolved clock time, so a retry with the same key stays identical
-    // while the resolved wake time is journaled with the operation.
-    const payload = { threadId: input.threadId, preset: input.preset ?? "default", snoozedUntil: input.snoozedUntil ?? null };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin({
-        kind: "thread.snooze",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        threadId: existing.threadId ?? input.threadId,
-      });
-      const snoozedUntil = begun.record.snoozedUntil ?? resolveSnoozeWakeTime(input);
-      const reconciled = await this.reconcile(begun.record);
-      return this.threadSnoozeResult(reconciled, input.threadId, snoozedUntil, presetOf(input, snoozedUntil), false);
-    }
-    await this.requireOperationScope();
-    const snoozedUntil = resolveSnoozeWakeTime(input);
-    const snapshot = await this.client.getThread(input.threadId);
-    assertNotArchived(snapshot.thread, input.threadId);
-    if (snapshot.thread.hasPendingApprovals === true || snapshot.thread.hasPendingUserInput === true) {
-      throw new GatewayError(
-        "snooze_not_allowed",
-        `Thread ${input.threadId} has a pending approval or user-input request. Respond to the request first; snoozing would hide the agent waiting on you.`,
-      );
-    }
-    if (hasQueuedTurnStart(snapshot.thread)) {
-      throw new GatewayError(
-        "snooze_not_allowed",
-        `Thread ${input.threadId} has a queued turn start that no turn has adopted yet. Wait for the turn to start before snoozing.`,
-      );
-    }
-    const running = isThreadRunning(snapshot.thread);
-    const begun = await this.journal.begin({
-      kind: "thread.snooze",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: input.threadId,
-      snoozedUntil,
-    });
-    if (begun.reused) {
-      const reconciled = await this.reconcile(begun.record);
-      const wakeTime = begun.record.snoozedUntil ?? snoozedUntil;
-      return this.threadSnoozeResult(reconciled, input.threadId, wakeTime, presetOf(input, wakeTime), running);
-    }
-    const command: ThreadSnoozeCommand = {
-      type: "thread.snooze",
-      commandId: begun.record.commandId,
-      threadId: input.threadId,
-      snoozedUntil,
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return this.threadSnoozeResult(result, input.threadId, snoozedUntil, presetOf(input, snoozedUntil), running);
-  }
-
-  async threadUnsnooze(input: ThreadUnsnoozeInput): Promise<ThreadUnsnoozeResult> {
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    const payload = { threadId: input.threadId };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin({
-        kind: "thread.unsnooze",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        threadId: existing.threadId ?? input.threadId,
-      });
-      return {
-        ...mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId()),
-        threadId: input.threadId,
-      };
-    }
-    await this.requireOperationScope();
-    const snapshot = await this.client.getThread(input.threadId);
-    assertNotArchived(snapshot.thread, input.threadId);
-    const begun = await this.journal.begin({
-      kind: "thread.unsnooze",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: input.threadId,
-    });
-    if (begun.reused) {
-      return {
-        ...mutationResult(await this.reconcile(begun.record), await this.knownEnvironmentId()),
-        threadId: input.threadId,
-      };
-    }
-    const command: ThreadUnsnoozeCommand = {
-      type: "thread.unsnooze",
-      commandId: begun.record.commandId,
-      threadId: input.threadId,
-      reason: "user",
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return {
-      ...mutationResult(result, await this.knownEnvironmentId()),
-      threadId: input.threadId,
-    };
-  }
-
-  async threadSettle(input: ThreadSettleInput): Promise<ThreadSettleResult> {
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    const payload = { threadId: input.threadId };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin({
-        kind: "thread.settle",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        threadId: existing.threadId ?? input.threadId,
-      });
-      const reconciled = await this.reconcile(begun.record);
-      return this.threadSettleResult(reconciled, input.threadId);
-    }
-    await this.requireOperationScope();
-    const snapshot = await this.client.getThread(input.threadId);
-    assertNotArchived(snapshot.thread, input.threadId);
-    const sessionStatus = snapshot.thread.session?.status ?? null;
-    if (sessionStatus === "starting" || sessionStatus === "running" || snapshot.thread.latestTurn?.state === "running") {
-      const turn = snapshot.thread.latestTurn?.turnId ?? null;
-      throw new GatewayError(
-        "settle_blocked",
-        `Thread ${input.threadId} is still running${turn ? ` (turn ${turn})` : ""}. ` +
-          `Interrupt the observed turn with t3_thread_interrupt or wait for completion before settling.`,
-      );
-    }
-    if (snapshot.thread.hasPendingApprovals === true) {
-      throw new GatewayError(
-        "settle_blocked",
-        `Thread ${input.threadId} has a pending approval. Respond with t3_pending_action_respond first; settling cannot answer approvals.`,
-      );
-    }
-    if (hasQueuedTurnStart(snapshot.thread)) {
-      throw new GatewayError(
-        "settle_blocked",
-        `Thread ${input.threadId} has a queued turn start that no turn has adopted yet. Wait for the turn to start before settling.`,
-      );
-    }
-    const begun = await this.journal.begin({
-      kind: "thread.settle",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: input.threadId,
-    });
-    if (begun.reused) {
-      const reconciled = await this.reconcile(begun.record);
-      return this.threadSettleResult(reconciled, input.threadId);
-    }
-    const command: ThreadSettleCommand = {
-      type: "thread.settle",
-      commandId: begun.record.commandId,
-      threadId: input.threadId,
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return this.threadSettleResult(result, input.threadId);
-  }
-
-  async threadUnsettle(input: ThreadUnsettleInput): Promise<ThreadUnsettleResult> {
-    if (this.config.readOnly) {
-      await this.requireOperationScope();
-    }
-    const payload = { threadId: input.threadId };
-    const existing = await this.journal.getByIdempotencyKey(input.idempotencyKey);
-    if (existing) {
-      const begun = await this.journal.begin({
-        kind: "thread.unsettle",
-        idempotencyKey: input.idempotencyKey,
-        payloadHash: hashPayload(payload),
-        threadId: existing.threadId ?? input.threadId,
-      });
-      const reconciled = await this.reconcile(begun.record);
-      return this.threadUnsettleResult(reconciled, input.threadId);
-    }
-    await this.requireOperationScope();
-    const snapshot = await this.client.getThread(input.threadId);
-    assertNotArchived(snapshot.thread, input.threadId);
-    const begun = await this.journal.begin({
-      kind: "thread.unsettle",
-      idempotencyKey: input.idempotencyKey,
-      payloadHash: hashPayload(payload),
-      threadId: input.threadId,
-    });
-    if (begun.reused) {
-      const reconciled = await this.reconcile(begun.record);
-      return this.threadUnsettleResult(reconciled, input.threadId);
-    }
-    const command: ThreadUnsettleCommand = {
-      type: "thread.unsettle",
-      commandId: begun.record.commandId,
-      threadId: input.threadId,
-      reason: "user",
-    };
-    const result = await this.dispatchNew(begun.record, command);
-    return this.threadUnsettleResult(result, input.threadId);
-  }
-
-  private async threadSnoozeResult(
-    record: OperationRecord,
-    threadId: string,
-    snoozedUntil: string,
-    preset: SnoozePresetId | "custom",
-    running: boolean,
-  ): Promise<ThreadSnoozeResult> {
-    const base = mutationResult(record, await this.knownEnvironmentId());
-    const wakeDescription = snoozeWakeDescription(snoozedUntil);
-    if (base.status === "accepted" && running) {
-      return {
-        ...base,
-        threadId,
-        snoozedUntil,
-        preset,
-        wakeDescription,
-        note: "Snooze hides the thread; the agent keeps running.",
-      };
-    }
-    return { ...base, threadId, snoozedUntil, preset, wakeDescription };
-  }
-
-  private async threadSettleResult(record: OperationRecord, threadId: string): Promise<ThreadSettleResult> {
-    const base = mutationResult(record, await this.knownEnvironmentId());
-    if (base.status !== "accepted") {
-      return { ...base, threadId, settledOverride: null, lifecycle: null };
-    }
-    try {
-      const snapshot = await this.client.getThread(threadId);
-      const now = Date.now();
-      const lifecycle = threadStatus(snapshot.thread, now);
-      const override = snapshot.thread.settledOverride ?? null;
-      if (lifecycle !== "settled") {
-        return {
-          ...base,
-          threadId,
-          settledOverride: override,
-          lifecycle,
-          note: `Settle accepted but the thread shows ${lifecycle} (${threadStatusReason(snapshot.thread, now)}).`,
-        };
-      }
-      return { ...base, threadId, settledOverride: override, lifecycle };
-    } catch {
-      return { ...base, threadId, settledOverride: null, lifecycle: null };
-    }
-  }
-
-  private async threadUnsettleResult(record: OperationRecord, threadId: string): Promise<ThreadUnsettleResult> {
-    const base = mutationResult(record, await this.knownEnvironmentId());
-    if (base.status !== "accepted") {
-      return { ...base, threadId, settledOverride: null, lifecycle: null };
-    }
-    try {
-      const snapshot = await this.client.getThread(threadId);
-      const now = Date.now();
-      return {
-        ...base,
-        threadId,
-        settledOverride: snapshot.thread.settledOverride ?? null,
-        lifecycle: threadStatus(snapshot.thread, now),
-      };
-    } catch {
-      return { ...base, threadId, settledOverride: null, lifecycle: null };
-    }
-  }
-
   private async dispatchNew(record: OperationRecord, command: T3Command): Promise<OperationRecord> {
     try {
       const dispatch = await this.client.dispatch(command);
@@ -2264,7 +1398,7 @@ export class T3Gateway {
       }
       return this.journal.update(record.operationId, {
         status: "uncertain",
-        lastError: `${safeErrorMessage(error)} Reconcile with operation ${record.operationId} via t3_run_get; do not resubmit with a fresh idempotency key.`,
+        lastError: `${safeErrorMessage(error)} Reconcile with operation ${record.operationId} via t3_task_get; do not resubmit with a fresh idempotency key.`,
       });
     }
   }
@@ -2274,10 +1408,6 @@ export class T3Gateway {
       return record;
     }
     try {
-      const snapshot = await this.client.getShell();
-      if (record.kind === "project.create" && record.projectId && snapshot.projects.some((project) => project.id === record.projectId)) {
-        return this.journal.update(record.operationId, { status: "accepted" });
-      }
       if (record.threadId) {
         const threadSnapshot = await this.client.getThread(record.threadId);
         if (record.kind === "thread.create") {
@@ -2291,22 +1421,6 @@ export class T3Gateway {
               ...(message.turnId ? { turnId: message.turnId } : {}),
             });
           }
-        }
-        if (record.kind === "thread.archive" && threadSnapshot.thread.archivedAt) {
-          return this.journal.update(record.operationId, { status: "accepted" });
-        }
-        if (record.kind === "thread.snooze" && threadSnapshot.thread.snoozedUntil != null &&
-          Date.parse(threadSnapshot.thread.snoozedUntil) > Date.now()) {
-          return this.journal.update(record.operationId, { status: "accepted" });
-        }
-        if (record.kind === "thread.unsnooze" && threadSnapshot.thread.snoozedUntil == null) {
-          return this.journal.update(record.operationId, { status: "accepted" });
-        }
-        if (record.kind === "thread.settle" && threadSnapshot.thread.settledOverride === "settled") {
-          return this.journal.update(record.operationId, { status: "accepted" });
-        }
-        if (record.kind === "thread.unsettle" && threadSnapshot.thread.settledOverride !== "settled") {
-          return this.journal.update(record.operationId, { status: "accepted" });
         }
       }
     } catch {
@@ -2328,9 +1442,7 @@ export class T3Gateway {
     return { ...summary, failure: retained };
   }
 
-  private async observeRun(record: OperationRecord, boundedEnvironmentId?: string): Promise<{
-    readonly run: RunResult; readonly failureOrder?: FailureEvidenceOrder;
-  }> {
+  private async observeRun(record: OperationRecord): Promise<RunResult> {
     if (!record.runId || !record.threadId) {
       throw new GatewayError("run_invalid", "The journal entry does not contain a run handle.");
     }
@@ -2345,7 +1457,7 @@ export class T3Gateway {
         ? thread.messages.find((candidate) => candidate.id === record.messageId) ?? null
         : null;
       const turnId = record.turnId ?? message?.turnId ?? null;
-      if (turnId && record.turnId !== turnId && boundedEnvironmentId === undefined) {
+      if (turnId && record.turnId !== turnId) {
         await this.journal.update(record.operationId, { turnId });
       }
       const latestTurn = thread.latestTurn ?? null;
@@ -2354,7 +1466,7 @@ export class T3Gateway {
       const historicalRecovery = thread.turnRecoveries?.find((entry) => entry.turnId === turnId)?.state;
       const recoveryState = historicalRecovery ?? (sameTurn &&
         (latestTurn.state === "completed" || latestTurn.state === "interrupted") ? latestTurn.state : null);
-      if (recoveryState && turnId && boundedEnvironmentId === undefined) {
+      if (recoveryState && turnId) {
         await this.journal.clearTerminalFailure(thread.id, turnId, recoveryState, failureOrder);
       }
       const matchingSessionFailure = latestTurn === null && turnId !== null
@@ -2375,17 +1487,15 @@ export class T3Gateway {
       const observedFailure = turnId === null ? null : failureInfo(thread, turnId);
       const priorFailure = turnId === null ? null : await this.journal.getFailureByTurnId(thread.id, turnId);
       const retainedRecovery = turnId ? await this.journal.getRecoveryByTurnId(thread.id, turnId) : null;
-      const failure = recoveryState ? (boundedEnvironmentId === undefined ? priorFailure : null)
+      const failure = recoveryState ? priorFailure
         : turnId !== null && (observedFailure !== null || priorFailure !== null)
-        ? boundedEnvironmentId === undefined
-          ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId, failureOrder)
-          : observedFailure ?? priorFailure
+        ? await this.journal.retainTerminalFailure(thread.id, turnId, observedFailure ?? priorFailure!, record.operationId, failureOrder)
         : retainedRecovery ? null : record.terminalFailure ?? null;
       const runStatus = failure !== null || (!recoveryState && !retainedRecovery && record.terminalRunStatus === "failed")
         ? "failed"
         : recoveryState ?? (turnId ? await this.journal.getRecoveryByTurnId(thread.id, turnId) : null) ?? observedRunStatus;
       const run: RunResult = {
-        environmentId: boundedEnvironmentId ?? await this.environmentId(),
+        environmentId: await this.environmentId(),
         ...(record.settings === undefined ? {} : { settings: observeSettings(record.settings, sameTurn ? thread : undefined) }),
         operationId: record.operationId,
         projectId: thread.projectId,
@@ -2407,22 +1517,18 @@ export class T3Gateway {
           userInput: thread.hasPendingUserInput ?? false,
         },
       };
-      return { run, failureOrder };
+      return run;
     } catch (error) {
       if (error instanceof GatewayError && error.code === "environment_mismatch") throw error;
       const telemetry = this.client.telemetry();
-      let environmentId = boundedEnvironmentId ?? this.client.getCachedDescriptor()?.environmentId ?? this.config.environmentId ?? "unknown";
+      let environmentId = this.client.getCachedDescriptor()?.environmentId ?? this.config.environmentId ?? "unknown";
       let connectionStatus: ConnectionStatus = "disconnected";
       const targetReadError = error instanceof T3HttpError && error.status === 404 && error.method === "GET" &&
         error.path === `/api/orchestration/threads/${encodeURIComponent(record.threadId)}`;
       const missingTarget = targetReadError && (error.reason === "thread_not_found" || error.code === "thread_not_found");
       const legacyNotFound = targetReadError && error.code === "not_found" && error.reason === null;
       try {
-        const freshEnvironmentId = await this.environmentId();
-        if (boundedEnvironmentId !== undefined && freshEnvironmentId !== boundedEnvironmentId) {
-          throw new GatewayError("environment_mismatch", "T3 environment changed during the wait; discard this observation and reconnect before continuing.");
-        }
-        environmentId = freshEnvironmentId;
+        environmentId = await this.environmentId();
         // V1's generic not_found also covers unknown routes. Check target absence
         // until supported V1 servers provide explicit thread_not_found errors.
         if (missingTarget || (legacyNotFound && !(await this.client.getShell()).threads.some((thread) => thread.id === record.threadId))) {
@@ -2458,7 +1564,7 @@ export class T3Gateway {
         pendingActions: { approvals: false, userInput: false },
         error: sanitizeFailureText(safeErrorMessage(error), 2_000),
       };
-      return { run };
+      return run;
     }
   }
 
@@ -2468,30 +1574,10 @@ export class T3Gateway {
     if (!project) {
       throw new GatewayError(
         "project_not_found",
-        `Project ${projectId} was not found. Call t3_projects_list to discover available project IDs.`,
+        `Project ${projectId} was not found. Call t3_project_list to discover available project IDs.`,
       );
     }
     return project;
-  }
-
-  private async requireExistingWorkspace(worktreePath: string): Promise<void> {
-    try {
-      const workspaceStat = await stat(worktreePath);
-      if (!workspaceStat.isDirectory()) {
-        throw new GatewayError("workspace_not_directory", `The requested thread workspace is not a directory: ${worktreePath}`);
-      }
-    } catch (error) {
-      if (error instanceof GatewayError) throw error;
-      const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : null;
-      if (code === "ENOENT") {
-        throw new GatewayError(
-          "workspace_missing",
-          `The requested thread workspace does not exist: ${worktreePath}. ` +
-            "Use workspaceMode=worktree to have the gateway create an isolated worktree.",
-        );
-      }
-      throw new GatewayError("workspace_unreadable", `The requested thread workspace cannot be inspected: ${worktreePath}`);
-    }
   }
 
   private async resolveGitWorkspace(input: GitTargetInput): Promise<GitWorkspaceSelection> {
@@ -2500,7 +1586,7 @@ export class T3Gateway {
     if (!project) {
       throw new GatewayError(
         "project_not_found",
-        `Project ${input.projectId} was not found. Call t3_projects_list to discover available project IDs.`,
+        `Project ${input.projectId} was not found. Call t3_project_list to discover available project IDs.`,
       );
     }
     const thread = input.threadId === undefined
@@ -2671,6 +1757,61 @@ export class T3Gateway {
     }
   }
 
+  private async requireNative(mutating: boolean): Promise<NativeMcpClient> {
+    if (this.nativeClient === null) {
+      throw new GatewayError("native_unavailable", "This gateway has no native T3 MCP endpoint.");
+    }
+    if (!mutating) return this.nativeClient;
+    if (this.config.readOnly) {
+      throw new GatewayError("gateway_read_only", "This gateway endpoint is configured as read-only.");
+    }
+    const state = await this.nativeClient.credentialState();
+    if (state.state === "valid" && !state.credential.scopes.includes("orchestration:operate")) {
+      throw new GatewayError(
+        "t3_scope_required",
+        "The native MCP credential was approved read-only. Run `t3-code-mcp native-login --access full-access` with a new pairing code.",
+      );
+    }
+    return this.nativeClient;
+  }
+
+  private async nativeView(): Promise<NativeView> {
+    if (this.nativeClient === null) {
+      return {
+        snapshot: null,
+        operate: false,
+        status: {
+          url: null,
+          credential: "missing",
+          access: null,
+          scopes: [],
+          expiresAt: null,
+          catalogFetchedAt: null,
+          availableTools: 0,
+          missingTools: [...NATIVE_TOOL_NAMES],
+          error: "This gateway has no native T3 MCP endpoint.",
+        },
+      };
+    }
+    const [state, snapshot] = await Promise.all([this.nativeClient.credentialState(), this.nativeClient.snapshot()]);
+    const credential = state.state === "missing" ? null : state.credential;
+    return {
+      snapshot,
+      operate: state.state === "valid" && state.credential.scopes.includes("orchestration:operate"),
+      status: {
+        url: this.nativeClient.url,
+        credential: state.state,
+        access: credential?.access ?? null,
+        scopes: credential?.scopes ?? [],
+        expiresAt: credential?.expiresAt ?? null,
+        catalogFetchedAt: snapshot.fetchedAt,
+        availableTools: snapshot.tools.length,
+        missingTools: snapshot.missing,
+        error: snapshot.error?.message ?? null,
+      },
+    };
+  }
+
   private async requireOperationScope(): Promise<void> {
     if (this.config.readOnly) {
       throw new GatewayError("gateway_read_only", "This gateway endpoint is configured as read-only.");
@@ -2691,14 +1832,6 @@ export class T3Gateway {
         `Configured environment ${this.config.environmentId} does not match the connected T3 environment.`,
       );
     }
-  }
-
-  private async projectCreateResult(record: OperationRecord, workspaceRoot: string): Promise<ProjectCreateResult> {
-    return {
-      ...mutationResult(record, await this.knownEnvironmentId()),
-      projectId: record.projectId ?? "unknown",
-      workspaceRoot,
-    };
   }
 
   private async threadCreateResult(
@@ -2753,7 +1886,7 @@ export class T3Gateway {
       messageId: record.messageId ?? "unknown",
       t3TurnId: record.turnId ?? null,
       providerTurnId: null,
-      nextAction: "Use t3_run_get or t3_run_wait.",
+      nextAction: "Use t3_task_get, or t3_thread_wait with the threadId.",
     };
   }
 
@@ -2861,7 +1994,7 @@ function taskNextAction(stage: TaskStage, taskRef: string): string {
     case "thread_created":
       return "Retry t3_task_start with the same idempotency key and identical original input to dispatch the initial instruction.";
     case "dispatch_rejected":
-      return "The initial dispatch was definitively rejected. Inspect the thread, correct the cause, then use t3_thread_send with a new idempotency key or start a replacement task.";
+      return "The initial dispatch was definitively rejected. Inspect the thread, correct the cause, then send a corrected message with t3_thread_send or start a replacement task.";
     case "thread_create_uncertain":
     case "dispatch_uncertain":
       return `Use t3_task_get with taskRef ${taskRef} to reconcile; do not start a replacement task.`;
@@ -2898,18 +2031,35 @@ function mutationResult(record: OperationRecord, environmentId: string): Mutatio
     status: "uncertain",
     reason:
       record.lastError ??
-      `The command outcome could not be reconciled. Reconcile with operation ${record.operationId} via t3_run_get; do not resubmit with a fresh idempotency key.`,
+      `The command outcome could not be reconciled. Reconcile with operation ${record.operationId} via t3_task_get; do not resubmit with a fresh idempotency key.`,
   };
 }
 
-function partitionOperations(
-  operations: ReadonlyArray<string>,
-  access: { readonly readOnly: boolean; readonly hasOperate: boolean },
-): { readonly callableOperations: string[]; readonly disabledOperations: DisabledOperation[] } {
+interface NativeView {
+  readonly status: NativeStatus;
+  readonly snapshot: NativeSnapshot | null;
+  /** The native credential is valid and grants orchestration:operate. */
+  readonly operate: boolean;
+}
+
+function partitionOperations(access: {
+  readonly readOnly: boolean;
+  readonly hasOperate: boolean;
+  readonly native: NativeView;
+}): { readonly callableOperations: string[]; readonly disabledOperations: DisabledOperation[] } {
   const callableOperations: string[] = [];
   const disabledOperations: DisabledOperation[] = [];
-  for (const operation of operations) {
-    if (!MUTATING_GATEWAY_OPERATIONS.has(operation)) {
+  const offered = new Set<string>(access.native.snapshot?.tools.map((tool) => tool.name) ?? []);
+  const nativeUsable = access.native.status.credential === "valid" && access.native.snapshot?.error === null;
+  const nativeReason = access.native.status.error ?? "Native T3 does not offer this tool.";
+  for (const operation of [...GATEWAY_TOOL_NAMES, ...NATIVE_TOOL_NAMES]) {
+    const nativeTool = isNativeToolName(operation);
+    const usesNative = nativeTool || NATIVE_BACKED_GATEWAY_OPERATIONS.has(operation);
+    if (nativeTool ? !offered.has(operation) : usesNative && !nativeUsable) {
+      disabledOperations.push({ operation, reasonCode: "native_unavailable", reason: nativeReason });
+      continue;
+    }
+    if (!MUTATING_GATEWAY_OPERATIONS.has(operation) && !isNativeMutatingTool(operation)) {
       callableOperations.push(operation);
       continue;
     }
@@ -2921,17 +2071,49 @@ function partitionOperations(
       });
       continue;
     }
-    if (!access.hasOperate) {
+    if (usesNative ? !access.native.operate : !access.hasOperate) {
       disabledOperations.push({
         operation,
         reasonCode: "t3_scope_required",
-        reason: "Upstream T3 credential lacks orchestration:operate. Mutations will be rejected until the scope is granted.",
+        reason: usesNative
+          ? "The native MCP credential lacks orchestration:operate. Run native-login with a control access level."
+          : "Upstream T3 credential lacks orchestration:operate. Mutations will be rejected until the scope is granted.",
       });
       continue;
     }
     callableOperations.push(operation);
   }
   return { callableOperations, disabledOperations };
+}
+
+function nativeValue<T>(result: CallToolResult, schema: z.ZodType<T>, tool: string): T {
+  const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
+  if (result.isError === true) {
+    throw new GatewayError("native_rejected", `${tool} failed: ${text.slice(0, 500)}`);
+  }
+  const parsed = schema.safeParse(result.structuredContent ?? parseJsonOrNull(text));
+  if (!parsed.success) {
+    throw new GatewayError("native_unexpected_result", `${tool} returned a result this gateway does not recognize.`);
+  }
+  return parsed.data;
+}
+
+function parseJsonOrNull(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/** Buffer.from silently skips invalid base64, so reject anything that does not round-trip. */
+function decodeBase64Strict(value: string): Buffer<ArrayBuffer> {
+  const compact = value.replace(/\s+/g, "");
+  const bytes = Buffer.from(compact, "base64");
+  if (bytes.toString("base64").replace(/=+$/, "") !== compact.replace(/=+$/, "")) {
+    throw new GatewayError("invalid_attachment", "dataBase64 is not valid standard base64.");
+  }
+  return bytes;
 }
 
 function sortThreads(
@@ -3009,44 +2191,6 @@ function resolutionHint(
   const where = scope.length > 0 ? ` for ${scope.join(", ")}` : "";
   return `No threads${where}. Retry with a broader query, another project, or includeArchived=true. ` +
     `Zero results must not select a thread for control.`;
-}
-
-function projectSummary(project: Project): ProjectSummary {
-  return {
-    id: project.id,
-    title: project.title,
-    workspaceRoot: project.workspaceRoot,
-    defaultModelSelection: project.defaultModelSelection ?? null,
-    createdAt: project.createdAt ?? null,
-    updatedAt: project.updatedAt ?? null,
-  };
-}
-
-function assertNotArchived(thread: Thread, threadId: string): void {
-  if (thread.archivedAt) {
-    throw new GatewayError("thread_archived", `Thread ${threadId} is archived. Unarchive it before changing snooze or settlement.`);
-  }
-}
-
-function resolveSnoozeWakeTime(input: ThreadSnoozeInput, now: Date = new Date()): string {
-  if (input.snoozedUntil !== undefined) {
-    return new Date(Date.parse(input.snoozedUntil)).toISOString();
-  }
-  const presetId = input.preset ?? "default";
-  const resolved = presetId === "default"
-    ? defaultSnoozePreset(now)
-    : resolveSnoozePresets(now).find((candidate) => candidate.id === presetId);
-  if (!resolved) {
-    throw new GatewayError("invalid_snooze_preset", `Unknown snooze preset ${JSON.stringify(presetId)}.`);
-  }
-  return resolved.snoozedUntil;
-}
-
-function presetOf(input: ThreadSnoozeInput, _snoozedUntil: string): SnoozePresetId | "custom" {
-  if (input.snoozedUntil !== undefined) return "custom";
-  const presetId = input.preset ?? "default";
-  if (presetId !== "default") return presetId;
-  return defaultSnoozePreset().id;
 }
 
 function threadSummary(
@@ -3187,7 +2331,7 @@ function threadDetail(
   return { failureOrder, detail: {
     ...threadSummary(source, projectTitle, environmentId, now),
     failure,
-    // Latest response is bounded to the observed turn; full history needs t3_thread_messages.
+    // Latest response is bounded to the observed turn; full history comes from t3_thread_read.
     latestResponse: latestAssistant(
       thread.messages,
       source.latestTurn?.turnId ?? null,
@@ -3223,10 +2367,6 @@ function threadIsBusy(thread: Thread): boolean {
   }
   const status = asRecord(thread.session)?.status;
   return status === "starting" || status === "running";
-}
-
-function associatedTurnId(thread: Thread, _runId: string): string | null {
-  return thread.latestTurn?.state === "running" ? thread.latestTurn.turnId : null;
 }
 
 function latestTurnToRunStatus(latestTurn: LatestTurn, thread: Thread): RunStatus {
@@ -3320,38 +2460,12 @@ function permittedOperations(scopes: ReadonlyArray<string>): string[] {
   return operations;
 }
 
-function isTerminal(status: RunStatus): boolean {
-  return status === "completed" || status === "failed" || status === "interrupted";
-}
-
-function waitCanContinue(result: RunResult): boolean {
-  return result.connectionStatus === "connected" && result.error === undefined && !isTerminal(result.runStatus) &&
-    result.runStatus !== "awaiting_approval" && result.runStatus !== "awaiting_input" &&
-    !result.pendingActions.approvals && !result.pendingActions.userInput;
-}
-
-function hasRelevantChange(initial: RunResult, current: RunResult): boolean {
-  return (
-    current.connectionStatus !== initial.connectionStatus ||
-    current.runStatus !== initial.runStatus ||
-    current.t3TurnId !== initial.t3TurnId ||
-    current.latestResponse?.id !== initial.latestResponse?.id ||
-    current.pendingActions.approvals !== initial.pendingActions.approvals ||
-    current.pendingActions.userInput !== initial.pendingActions.userInput ||
-    current.threadQuality !== initial.threadQuality
-  );
-}
-
 function asRecord(value: unknown): Record<string, any> | null {
   return typeof value === "object" && value !== null ? (value as Record<string, any>) : null;
 }
 
 function safeErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
 export function makeGateway(config: GatewayConfig): {
@@ -3365,5 +2479,6 @@ export function makeGateway(config: GatewayConfig): {
   const journal = new OperationJournal(join(config.dataDir, "operations.json"), auditLog);
   const gitInspector = new GitInspector(auditLog);
   const gitWorktrees = new GitWorktreeManager(config.worktreeRoot, auditLog);
-  return { gateway: new T3Gateway(client, journal, config, gitInspector, auditLog, gitWorktrees), client, journal, auditLog };
+  const native = new NativeMcpClient(config.t3NativeMcpUrl, NativeCredentialStore.inDataDir(config.dataDir), auditLog);
+  return { gateway: new T3Gateway(client, journal, config, gitInspector, auditLog, gitWorktrees, native), client, journal, auditLog };
 }

@@ -41,7 +41,9 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
       const entry = tools.get(name) ?? { calls: 0, completed: 0, errors: 0, latency: newLatency() };
       if (event.event === "tool.call") {
         entry.calls += 1; toolCalls += 1;
-        if (["t3_task_start", "t3_thread_create", "t3_thread_send"].includes(event.operation ?? "")) {
+        // t3_thread_create, t3_run_wait and t3_thread_get below were removed in
+        // schema 10; they stay so audit files from older gateways still summarize.
+        if (["t3_task_start", "t3_thread_launch", "t3_thread_create", "t3_thread_send"].includes(event.operation ?? "")) {
           dispatchCalls += 1;
           if (object(details.arguments).modelSelection == null) omittedModelSelection += 1;
         }

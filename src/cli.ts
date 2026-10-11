@@ -1,9 +1,13 @@
 import { resolve } from "node:path";
 import { summarizeUsage } from "./operations/usage-summary.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, loadNativeEndpointConfig } from "./config.js";
 import { runDoctor } from "./doctor.js";
 import { makeGateway } from "./gateway.js";
 import { listenHttp, runStdio } from "./mcp/transport.js";
+import { loginNative, parseNativeLoginArgs, readPairingCode } from "./native-login.js";
+import { AuditLog } from "./operations/audit-log.js";
+import { NativeCredentialStore } from "./t3/native-credential.js";
+import { NativeMcpClient } from "./t3/native-mcp.js";
 import { parseSetupArgs, renderSetup } from "./setup.js";
 
 async function main(): Promise<void> {
@@ -30,6 +34,31 @@ async function main(): Promise<void> {
     console.error(
       "Setup rendered without secrets. Edit the env file to set T3_ACCESS_TOKEN, MCP_BEARER_TOKEN, and CONTROL_PLANE_API_KEY (mode 600), then enable the user services.",
     );
+    return;
+  }
+  if (command === "native-login") {
+    // Needs no T3_ACCESS_TOKEN: the pairing code is the only credential.
+    const { access } = parseNativeLoginArgs(process.argv.slice(3));
+    const endpoint = loadNativeEndpointConfig();
+    const credential = await loginNative({ resource: endpoint.t3NativeMcpUrl, access, pairingCode: await readPairingCode() });
+    const verifier = new NativeMcpClient(
+      endpoint.t3NativeMcpUrl,
+      { read: async () => ({ state: "valid", credential }) },
+      new AuditLog(resolve(endpoint.dataDir, "audit.jsonl")),
+    );
+    const snapshot = await verifier.snapshot();
+    await verifier.close();
+    if (snapshot.error !== null) throw new Error(`Login succeeded, but the token could not list native tools: ${snapshot.error.message}`);
+    await NativeCredentialStore.inDataDir(endpoint.dataDir).write(credential);
+    console.log(JSON.stringify({
+      ok: true,
+      access: credential.access,
+      scopes: credential.scopes,
+      expiresAt: credential.expiresAt,
+      nativeTools: snapshot.tools.length,
+      missingNativeTools: snapshot.missing,
+    }, null, 2));
+    console.error("A running gateway uses the new credential on its next native call; no restart is needed.");
     return;
   }
   const config = loadConfig();
@@ -72,10 +101,9 @@ async function main(): Promise<void> {
       // Run after every interface deployment, then repeat from the actual client.
       const status = await gateway.connectionStatus();
       const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
-      const providers = await gateway.providersList();
       const bounded = overview.highlights.length <= 5 &&
         overview.highlights.every((h) => (h.latestResponseExcerpt ?? "").length <= 201);
-      console.log(JSON.stringify({ status, overview, providers: { options: providers.options.length } }, null, 2));
+      console.log(JSON.stringify({ status, overview }, null, 2));
       if (!bounded) throw new Error("Smoke failed: overview highlights exceed bounds.");
       console.error(
         `Smoke ok: fingerprint=${status.toolSchemaFingerprint} total=${overview.total} needsAttention=${overview.needsAttentionCount}. ` +
@@ -85,8 +113,8 @@ async function main(): Promise<void> {
     }
     case "spike": {
       const status = await gateway.connectionStatus();
-      const projects = await gateway.projectsList({ limit: 5 });
-      console.log(JSON.stringify({ status, projects: projects.page }, null, 2));
+      const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 });
+      console.log(JSON.stringify({ status, overview }, null, 2));
       if (process.env.T3_SPIKE_ENABLE_MUTATIONS !== "true") {
         console.error(
           "Read-only connection spike complete. Set T3_SPIKE_ENABLE_MUTATIONS=true and T3_SPIKE_CONFIRM=I_UNDERSTAND to create a thread and submit a prompt.",
@@ -103,18 +131,18 @@ async function main(): Promise<void> {
       }
       const title = process.env.T3_SPIKE_THREAD_TITLE?.trim() || "t3-code-mcp connection spike";
       const keyPrefix = process.env.T3_SPIKE_IDEMPOTENCY_KEY?.trim() || `spike-${Date.now()}`;
-      const run = await gateway.threadStart({
+      const task = await gateway.taskStart({
         projectId,
         title,
-        message: prompt,
+        instruction: prompt,
         runtimeMode: "full-access",
         idempotencyKey: `${keyPrefix}-thread`,
       });
-      console.log(JSON.stringify({ run }, null, 2));
+      console.log(JSON.stringify({ task }, null, 2));
       return;
     }
     default:
-      throw new Error(`Unknown command ${command}. Use serve, status, doctor, smoke, spike, setup, or usage-summary.`);
+      throw new Error(`Unknown command ${command}. Use serve, status, doctor, smoke, spike, setup, native-login, or usage-summary.`);
   }
 }
 

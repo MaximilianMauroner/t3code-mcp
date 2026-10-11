@@ -379,7 +379,7 @@ describe("structured provider failures", () => {
     thread.activities = payload.activities.map((value) => ({ ...value, turnId }));
     thread.messages.push(...captured.messages.map((message) => ({ ...message, turnId })));
     const expected = { category, code, source, turnId, class: null, retryable: null, resetAt: null, retryAfter: null };
-    expect((await fixture.gateway.runWait(run.runId, 0.1)).failure).toMatchObject(expected);
+    expect((await fixture.gateway.runGet(run.runId)).failure).toMatchObject(expected);
     expect((await fixture.gateway.threadGet(thread.id)).thread.failure).toMatchObject(expected);
     expect((await fixture.gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0]?.failure).toMatchObject(expected);
   });
@@ -894,7 +894,7 @@ describe("structured provider failures", () => {
       failureCategory: "quota", failureCode: "usage_limit",
     };
 
-    const observed = await fixture.gateway.runWait(run.runId, 0.1);
+    const observed = await fixture.gateway.runGet(run.runId);
     expect(observed).toMatchObject({
       runStatus: "failed", latestResponse: null,
       failure: { category: "quota", resetAt: null, retryAfter: null, turnId },

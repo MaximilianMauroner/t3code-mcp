@@ -44,15 +44,11 @@ describe("recoverable task delegation", () => {
   it("does not send the initial message while wrapper thread creation is uncertain", async () => {
     const { fake, gateway } = await setup({ dispatchStatus: 503, dispatchErrorMessage: "gateway unavailable" });
 
-    await expect(gateway.threadStart({
-      projectId: "project-task",
-      title: "Wrapped thread",
-      message: "Only send after creation is accepted.",
-      runtimeMode: "approval-required",
-      idempotencyKey: "wrapped-thread-key",
-    })).rejects.toMatchObject({ code: "thread_create_uncertain" });
+    const started = await gateway.taskStart(taskInput);
 
-    expect(fake.dispatches.filter(({ command }) => command.type === "thread.turn.start")).toHaveLength(0);
+    expect(started).toMatchObject({ stage: "thread_create_uncertain", runId: null });
+    // Only the thread.create attempt reached T3; the initial message was never sent.
+    expect(fake.countRequests("/api/orchestration/dispatch")).toBe(1);
   });
 
   it("starts a managed worktree from the selected origin branch", async () => {
@@ -84,8 +80,6 @@ describe("recoverable task delegation", () => {
     expect(fake.dispatches[1]?.command).toMatchObject({
       type: "thread.turn.start",
     });
-    if (fake.dispatches[1]?.command.type !== "thread.turn.start") throw new Error("expected turn start");
-    expect(fake.dispatches[1].command.bootstrap).toBeUndefined();
     const created = fake.dispatches[0]!.command;
     if (created.type !== "thread.create" || created.worktreePath === null) throw new Error("expected explicit worktree");
     expect((await execute("git", ["branch", "--show-current"], { cwd: created.worktreePath })).stdout.trim()).toBe(created.branch);
@@ -289,19 +283,6 @@ describe("recoverable task delegation", () => {
     if (!started.runId) throw new Error("expected run");
     await fake.close();
     expect(await gateway.runGet(started.runId)).toMatchObject({ runStatus: "unknown", connectionStatus: "disconnected" });
-  });
-
-  it("stops run waits after one missing-target observation", async () => {
-    const { fixture, gateway } = await setup();
-    const started = await gateway.taskStart(taskInput);
-    if (!started.runId || !started.threadId) throw new Error("expected run");
-    const reads = vi.spyOn(fixture.client, "getThread").mockRejectedValue(new T3HttpError(
-      404, "GET", `/api/orchestration/threads/${encodeURIComponent(started.threadId)}`, null, "missing target", "thread_not_found",
-    ));
-    expect(await gateway.runWait(started.runId, 30)).toMatchObject({
-      runStatus: "unknown", connectionStatus: "connected", stateFreshness: "unknown",
-    });
-    expect(reads).toHaveBeenCalledTimes(1);
   });
 
   it("retains confirmed terminal failure when a target is later removed", async () => {
