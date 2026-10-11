@@ -23,7 +23,7 @@ flowchart LR
 - Record redacted tool, transport, upstream, Git, and journal activity for later review through `t3_audit_log`.
 - Connect through local stdio or authenticated Streamable HTTP.
 
-The gateway supports T3 orchestration protocols 1 and 2. Protocol 2, introduced by [upstream PR #2829](https://github.com/pingdotgg/t3code/pull/2829), uses HTTP snapshot reads and authenticated WebSocket RPC for thread control. Protocol 1 retains HTTP dispatch for older deployments. The recorded live integration target is `v0.0.41-nightly.20260910.1507`; V2 has source-contract and local fixture coverage, with live verification still required. See [orchestrator compatibility](docs/orchestrator-compatibility.md). See [usage and tool behavior](docs/usage.md) for examples, supported tools, and current limits.
+The gateway supports T3 orchestration protocols 1 and 2. Protocol 2, introduced by [upstream PR #2829](https://github.com/pingdotgg/t3code/pull/2829), uses HTTP snapshot reads and authenticated WebSocket RPC for thread control. Protocol 1 retains HTTP dispatch for older deployments. The recorded live integration target is `v0.0.41-nightly.20260910.1507`. V2 has source-contract and local fixture coverage. A candidate [protocol transition acceptance](docs/protocol-refresh-acceptance.md) passed on 2026-10-06 in an isolated V1 to V2 upgrade and rollback. It did not verify the full V2 surface or an installed service, so live verification of the deployed V2 build is still required. See [orchestrator compatibility](docs/orchestrator-compatibility.md). See [usage and tool behavior](docs/usage.md) for examples, supported tools, and current limits.
 
 ## Security
 
