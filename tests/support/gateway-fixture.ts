@@ -19,13 +19,16 @@ export interface GatewayFixture {
 
 export async function gatewayFixture(fake: FakeT3, overrides: Partial<GatewayConfig> = {}): Promise<GatewayFixture> {
   const directory = await mkdtemp(join(tmpdir(), "t3-code-mcp-gateway-test-"));
+  const t3HttpBaseUrl = overrides.t3HttpBaseUrl ?? fake.baseUrl;
   const config: GatewayConfig = {
-    t3HttpBaseUrl: overrides.t3HttpBaseUrl ?? fake.baseUrl,
+    t3HttpBaseUrl,
+    t3NativeMcpUrl: `${t3HttpBaseUrl}/mcp`,
     t3AccessToken: fake.accessToken,
     mcpBearerToken: "gateway-test-token",
     readOnly: false,
     host: "127.0.0.1",
     port: 0,
+    maxBodyBytes: 2 * 1024 * 1024,
     environmentId: null,
     environmentLabel: null,
     dataDir: directory,

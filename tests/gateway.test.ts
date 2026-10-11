@@ -98,11 +98,13 @@ async function makeGateway(port: number, readOnly: boolean): Promise<T3Gateway> 
   temporaryDirectories.push(directory);
   const config: GatewayConfig = {
     t3HttpBaseUrl: `http://127.0.0.1:${port}`,
+    t3NativeMcpUrl: `http://127.0.0.1:${port}/mcp`,
     t3AccessToken: "test-token",
     mcpBearerToken: "gateway-token",
     readOnly,
     host: "127.0.0.1",
     port: 0,
+    maxBodyBytes: 2 * 1024 * 1024,
     environmentId: null,
     environmentLabel: null,
     dataDir: directory,

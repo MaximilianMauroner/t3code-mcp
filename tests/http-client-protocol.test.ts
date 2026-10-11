@@ -5,7 +5,14 @@ import { gatewayFixture } from "./support/gateway-fixture.js";
 
 const descriptor = { environmentId: "test-env", label: "Test", serverVersion: "test" };
 const shell = { snapshotSequence: 1, projects: [], threads: [], updatedAt: "2026-10-03T08:47:00.000Z" };
-const command = { type: "thread.archive", commandId: "archive-1", threadId: "thread-1" } as const;
+const command = {
+  type: "thread.approval.respond",
+  commandId: "approval-1",
+  threadId: "thread-1",
+  requestId: "request-1",
+  decision: "accept",
+  createdAt: "2026-10-03T08:47:00.000Z",
+} as const;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 afterEach(() => vi.restoreAllMocks());
@@ -129,15 +136,15 @@ describe("protocol discovery during gateway uptime", () => {
         }
         return fetch(url, init);
       });
-      const input = { threadId: "thread-1", idempotencyKey: "not-sent" };
-      const rejected = await fixture.gateway.threadArchive(input);
+      const input = { threadId: "thread-1", message: "x", idempotencyKey: "not-sent" };
+      const rejected = await fixture.gateway.threadSend(input);
       expect(rejected).toMatchObject({ status: "rejected", reason: expect.stringContaining("command not sent") });
       expect(rejected).toMatchObject({ reason: expect.stringContaining("new idempotency key") });
       expect(fake.dispatches).toHaveLength(0);
       expect(await fixture.journal.getByIdempotencyKey(input.idempotencyKey)).toMatchObject({ status: "rejected" });
-      expect(await fixture.gateway.threadArchive(input)).toMatchObject({ status: "rejected", operationId: rejected.operationId });
+      expect(await fixture.gateway.threadSend(input)).toMatchObject({ status: "rejected", operationId: rejected.operationId });
       expect(fake.dispatches).toHaveLength(0);
-      expect(await fixture.gateway.threadArchive({ ...input, idempotencyKey: "safe-retry" })).toMatchObject({ status: "accepted" });
+      expect(await fixture.gateway.threadSend({ ...input, idempotencyKey: "safe-retry" })).toMatchObject({ status: "accepted" });
       expect(fake.dispatches).toHaveLength(1);
     } finally {
       await fixture.cleanup();

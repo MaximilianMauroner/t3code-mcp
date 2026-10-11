@@ -10,6 +10,13 @@ interface Latency {
 const LATENCY_BOUNDS = [1, 5, 10, 50, 100, 500, 1_000, 5_000, 10_000, 30_000, 60_000, Infinity];
 const MAX_TRACKED_THREADS = 10_000;
 const MAX_OPERATIONS = 1_000;
+// t3_thread_create, t3_run_wait and t3_thread_get were removed in schema 10.
+// They stay below so that audit files from older gateways still summarize.
+const DISPATCH_TOOLS = new Set(["t3_task_start", "t3_thread_launch", "t3_thread_create", "t3_thread_send"]);
+/** Tools that always accept `modelSelection`. `acceptsModelSelection` decides for `t3_thread_send`. */
+const MODEL_SELECTION_TOOLS = new Set(["t3_task_start", "t3_thread_launch", "t3_thread_create"]);
+/** Native `t3_thread_wait` statuses of a run that is still active. */
+const ACTIVE_RUN_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 
 /** Fixed-cardinality aggregation; no prompt text or per-call history is retained. */
 export async function summarizeUsage(filePath: string, window: { since?: string; until?: string }) {
@@ -22,7 +29,7 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
   const errors = new Map<string, number>();
   const previous = new Map<string, string>();
   let includedEvents = 0, toolCalls = 0, upstreamRequests = 0, attributedRequests = 0;
-  let dispatchCalls = 0, omittedModelSelection = 0, waits = 0, unchangedActiveWaits = 0;
+  let dispatchCalls = 0, modelSelectionCalls = 0, omittedModelSelection = 0, waits = 0, unchangedActiveWaits = 0;
   let comparableThreadPairs = 0, unchangedThreadPairs = 0, evictedThreadStates = 0;
   let waitObservations = 0, measuredWaits = 0;
   let first: string | null = null, last: string | null = null;
@@ -41,8 +48,9 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
       const entry = tools.get(name) ?? { calls: 0, completed: 0, errors: 0, latency: newLatency() };
       if (event.event === "tool.call") {
         entry.calls += 1; toolCalls += 1;
-        if (["t3_task_start", "t3_thread_create", "t3_thread_send"].includes(event.operation ?? "")) {
-          dispatchCalls += 1;
+        if (DISPATCH_TOOLS.has(event.operation ?? "")) dispatchCalls += 1;
+        if (acceptsModelSelection(event.operation ?? "", details)) {
+          modelSelectionCalls += 1;
           if (object(details.arguments).modelSelection == null) omittedModelSelection += 1;
         }
       }
@@ -53,6 +61,10 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
         } else if (event.outcome === "completed") entry.completed += 1;
         addLatency(entry.latency, event.durationMs);
         const result = object(details.result);
+        if (event.operation === "t3_thread_wait" && event.outcome === "completed") {
+          waits += 1;
+          if (result.timedOut === true && ACTIVE_RUN_STATUSES.has(String(result.status))) unchangedActiveWaits += 1;
+        }
         if (event.operation === "t3_run_wait" && event.outcome === "completed") {
           waits += 1;
           if (result.timedOut === true && ["running", "accepted"].includes(String(result.runStatus))) unchangedActiveWaits += 1;
@@ -93,7 +105,7 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
   return {
     window: { since: window.since ?? null, until: window.until ?? null, firstEventAt: first, lastEventAt: last },
     scan: { ...scan, includedEvents },
-    denominators: { toolCalls, dispatchCalls, upstreamRequests, waits, comparableThreadPairs },
+    denominators: { toolCalls, dispatchCalls, modelSelectionCalls, upstreamRequests, waits, comparableThreadPairs },
     launches: { omittedModelSelection, omissionMeans: "May intentionally use a project default or thread inheritance; not proof of an incorrect model." },
     monitoring: {
       unchangedActiveWaits, measuredWaits, waitObservations, unchangedThreadPairs, evictedThreadStates,
@@ -115,6 +127,15 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
 
 function object(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+/**
+ * Reports whether a `tool.call` accepts `modelSelection`. From schema 10, every
+ * `t3_thread_send` row is a native call marked `native: true`, and native
+ * `t3_thread_send` does not accept `modelSelection`. A row without the mark
+ * comes from a gateway before schema 10, whose send accepted it.
+ */
+function acceptsModelSelection(operation: string, details: Record<string, unknown>): boolean {
+  return MODEL_SELECTION_TOOLS.has(operation) || (operation === "t3_thread_send" && details.native !== true);
 }
 function boundedKey(map: Map<string, unknown>, key: string): string {
   return map.has(key) || map.size < MAX_OPERATIONS - 1 ? key : "other";

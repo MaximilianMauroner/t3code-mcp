@@ -257,16 +257,6 @@ export class FakeT3 {
   private applyCommand(command: T3Command): void {
     const now = new Date().toISOString();
     switch (command.type) {
-      case "project.create":
-        this.projects.push({
-          id: command.projectId,
-          title: command.title,
-          workspaceRoot: command.workspaceRoot,
-          defaultModelSelection: command.defaultModelSelection ?? null,
-          createdAt: now,
-          updatedAt: now,
-        });
-        return;
       case "thread.create":
         this.addThread({
           id: command.threadId,
@@ -280,25 +270,9 @@ export class FakeT3 {
         });
         return;
       case "thread.turn.start": {
-        if (command.bootstrap?.createThread) {
-          this.addThread({
-            id: command.threadId,
-            projectId: command.bootstrap.createThread.projectId,
-            title: command.bootstrap.createThread.title,
-            modelSelection: command.bootstrap.createThread.modelSelection,
-            runtimeMode: command.bootstrap.createThread.runtimeMode,
-            interactionMode: command.bootstrap.createThread.interactionMode,
-            branch: command.bootstrap.createThread.branch,
-            worktreePath: command.bootstrap.createThread.worktreePath,
-          });
-        }
         const thread = this.thread(command.threadId);
         if (command.modelSelection) thread.modelSelection = command.modelSelection;
         thread.runtimeMode = command.runtimeMode;
-        if (command.bootstrap?.prepareWorktree) {
-          thread.branch = command.bootstrap.prepareWorktree.branch ?? command.bootstrap.prepareWorktree.baseBranch;
-          thread.worktreePath = `/remote/worktrees/${command.threadId}`;
-        }
         const turnId = `turn-${command.message.messageId}`;
         thread.messages.push({
           id: command.message.messageId,
@@ -321,15 +295,6 @@ export class FakeT3 {
         thread.updatedAt = now;
         return;
       }
-      case "thread.turn.interrupt": {
-        const thread = this.thread(command.threadId);
-        if (thread.latestTurn) {
-          thread.latestTurn = { ...thread.latestTurn, state: "interrupted", completedAt: now };
-        }
-        thread.session = { status: "stopped" };
-        thread.updatedAt = now;
-        return;
-      }
       case "thread.approval.respond": {
         const thread = this.thread(command.threadId);
         thread.hasPendingApprovals = false;
@@ -339,42 +304,6 @@ export class FakeT3 {
       case "thread.user-input.respond": {
         const thread = this.thread(command.threadId);
         thread.hasPendingUserInput = false;
-        thread.updatedAt = now;
-        return;
-      }
-      case "thread.archive": {
-        const thread = this.thread(command.threadId);
-        thread.archivedAt = now;
-        thread.updatedAt = now;
-        return;
-      }
-      case "thread.snooze": {
-        const thread = this.thread(command.threadId);
-        thread.snoozedUntil = command.snoozedUntil;
-        thread.snoozedAt = now;
-        thread.updatedAt = now;
-        return;
-      }
-      case "thread.unsnooze": {
-        const thread = this.thread(command.threadId);
-        thread.snoozedUntil = null;
-        thread.snoozedAt = null;
-        thread.updatedAt = now;
-        return;
-      }
-      case "thread.settle": {
-        const thread = this.thread(command.threadId);
-        thread.settledOverride = "settled";
-        thread.settledAt = now;
-        thread.snoozedUntil = null;
-        thread.snoozedAt = null;
-        thread.pinnedAt = null;
-        thread.updatedAt = now;
-        return;
-      }
-      case "thread.unsettle": {
-        const thread = this.thread(command.threadId);
-        thread.settledOverride = "active";
         thread.updatedAt = now;
         return;
       }

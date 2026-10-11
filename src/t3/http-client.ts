@@ -270,15 +270,9 @@ export class T3HttpClient {
   private async dispatchV2(command: T3Command, signal?: AbortSignal): Promise<DispatchResult> {
     const dispatch = (payload: unknown) => this.rpc("orchestration.dispatchCommand", payload, DispatchResultSchema, signal);
     switch (command.type) {
-      case "project.create": {
-        await this.request("POST", "/api/projects/mutate", command, z.object({ id: z.string() }).passthrough(), signal, true);
-        // Project mutation is a separate store in V2 and has no event sequence.
-        return { sequence: (await this.getShell(signal)).snapshotSequence };
-      }
       case "thread.create":
         return dispatch({ ...command, createdBy: "user", creationSource: "mcp" });
       case "thread.turn.start": {
-        if (command.bootstrap) throw new T3HttpError(400, "POST", "/ws", "unsupported_bootstrap", "V2 turn dispatch requires an existing thread and workspace.");
         // V2 persists these settings on the thread before admitting a message.
         await dispatch({ type: "thread.runtime-mode.set", commandId: `${command.commandId}:runtime`, threadId: command.threadId, runtimeMode: command.runtimeMode });
         await dispatch({ type: "thread.interaction-mode.set", commandId: `${command.commandId}:interaction`, threadId: command.threadId, interactionMode: command.interactionMode });
@@ -290,17 +284,10 @@ export class T3HttpClient {
           ...(command.titleSeed ? { titleSeed: command.titleSeed } : {}),
         });
       }
-      case "thread.turn.interrupt": {
-        const runId = command.turnId ?? (await this.getThread(command.threadId, signal)).thread.latestTurn?.turnId;
-        if (!runId) throw new T3HttpError(400, "POST", "/ws", "run_not_found", "T3 has no run to interrupt.");
-        return dispatch({ type: "run.interrupt", commandId: command.commandId, threadId: command.threadId, runId });
-      }
       case "thread.approval.respond":
         return dispatch({ type: "runtime-request.respond", commandId: command.commandId, threadId: command.threadId, requestId: command.requestId, decision: command.decision });
       case "thread.user-input.respond":
         return dispatch({ type: "runtime-request.respond", commandId: command.commandId, threadId: command.threadId, requestId: command.requestId, answers: command.answers });
-      default:
-        return dispatch(command);
     }
   }
 

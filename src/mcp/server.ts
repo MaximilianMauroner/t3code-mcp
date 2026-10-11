@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { GATEWAY_VERSION } from "../contract.js";
+import { GATEWAY_VERSION, isNativeMutatingTool, type NativeToolName } from "../contract.js";
 import { summarizeForAudit, withAuditContext, type AuditLog } from "../operations/audit-log.js";
 import {
   GatewayError,
@@ -12,11 +12,9 @@ import {
   type PendingActionRespondInput,
   type GitDiffInput,
   type GitCompareInput,
-  type ProjectCreateInput,
   type TaskStartInput,
-  type ThreadSendInput,
-  type ThreadStartInput,
 } from "../gateway.js";
+import type { NativeSnapshot, NativeTool } from "../t3/native-mcp.js";
 
 const modelSelection = z
   .object({
@@ -72,17 +70,6 @@ const messageOutput = z
     createdAt: z.string().optional(),
     updatedAt: z.string().optional(),
     attachments: z.unknown().optional(),
-  })
-  .passthrough();
-
-const projectSummaryOutput = z
-  .object({
-    id: z.string(),
-    title: z.string(),
-    workspaceRoot: z.string(),
-    defaultModelSelection: modelSelectionOutput.nullable(),
-    createdAt: z.string().nullable(),
-    updatedAt: z.string().nullable(),
   })
   .passthrough();
 
@@ -184,7 +171,7 @@ const mutationResultShape = {
 const disabledOperationOutput = z
   .object({
     operation: z.string(),
-    reasonCode: z.enum(["gateway_read_only", "t3_scope_required"]),
+    reasonCode: z.enum(["gateway_read_only", "t3_scope_required", "native_unavailable"]),
     reason: z.string(),
   })
   .passthrough();
@@ -207,6 +194,17 @@ const connectionStatusOutputSchema = {
   upstreamScopes: z.array(z.string()),
   gatewayOperations: z.array(z.string()),
   sessionExpiresAt: z.string().nullable(),
+  native: z.object({
+    url: z.string().nullable(),
+    credential: z.enum(["missing", "expired", "valid"]),
+    access: z.string().nullable(),
+    scopes: z.array(z.string()),
+    expiresAt: z.string().nullable(),
+    catalogFetchedAt: z.string().nullable(),
+    availableTools: z.number().int().nonnegative(),
+    missingTools: z.array(z.string()),
+    error: z.string().nullable(),
+  }),
   error: z.string().optional(),
 };
 
@@ -239,18 +237,6 @@ const auditLogOutputSchema = {
       hasMore: z.boolean(),
       total: z.number().int().nonnegative(),
       invalidLines: z.number().int().nonnegative(),
-    })
-    .passthrough(),
-};
-
-const projectsListOutputSchema = {
-  environmentId: z.string(),
-  page: z
-    .object({
-      items: z.array(projectSummaryOutput),
-      nextCursor: z.string().nullable(),
-      hasMore: z.boolean(),
-      total: z.number(),
     })
     .passthrough(),
 };
@@ -369,12 +355,6 @@ const gitCompareOutputSchema = {
   }),
 };
 
-const projectCreateOutputSchema = {
-  ...mutationResultShape,
-  projectId: z.string(),
-  workspaceRoot: z.string(),
-};
-
 const threadsListOutputSchema = {
   environmentId: z.string(),
   observedAt: z.string(),
@@ -417,48 +397,11 @@ const threadsOverviewOutputSchema = {
   highlights: z.array(overviewHighlightOutput),
 };
 
-const threadGetOutputSchema = {
-  environmentId: z.string(),
-  thread: threadDetailOutput,
-};
-
-const threadMessagesOutputSchema = {
-  environmentId: z.string(),
-  page: z
-    .object({
-      threadId: z.string(),
-      messages: z.array(messageOutput.extend({
-        textRange: z.object({
-          offset: z.number().int().nonnegative(),
-          totalChars: z.number().int().nonnegative(),
-          nextOffset: z.number().int().nonnegative().nullable(),
-        }),
-      })),
-      nextCursor: z.string().nullable(),
-      hasMore: z.boolean(),
-      total: z.number(),
-      truncated: z.boolean(),
-    })
-    .passthrough(),
-};
-
 const settingsObservationOutput = settingsReceiptSchema.extend({
   effective: settingsReceiptSchema.shape.resolved.extend({ observedAt: z.string() }).nullable(),
   state: z.enum(["observed", "unresolved"]),
   matchesResolved: z.boolean().nullable(),
 });
-
-const threadSendOutputSchema = {
-  settings: settingsObservationOutput.optional(),
-  ...mutationResultShape,
-  projectId: z.string(),
-  threadId: z.string(),
-  runId: z.string(),
-  messageId: z.string(),
-  t3TurnId: z.string().nullable(),
-  providerTurnId: z.string().nullable(),
-  nextAction: z.string(),
-};
 
 const runResultOutputSchema = {
   settings: settingsObservationOutput.optional(),
@@ -492,8 +435,6 @@ const runResultOutputSchema = {
       userInput: z.boolean(),
     })
     .passthrough(),
-  monitoring: z.object({ observations: z.number(), requestedTimeoutSeconds: z.number(), elapsedMs: z.number() }).optional(),
-  timedOut: z.boolean().optional(),
   error: z.string().optional(),
   failure: failureOutput.nullable(),
 };
@@ -568,39 +509,6 @@ const resultPackageOutputSchema = {
   limitations: z.array(z.string()),
 };
 
-const threadInterruptOutputSchema = {
-  ...mutationResultShape,
-  threadId: z.string(),
-  expectedTurnId: z.string(),
-  verification: z
-    .object({
-      observed: z.enum(["interrupted", "still_running", "target_changed", "not_running", "inconsistent", "unknown"]),
-      observedTurnId: z.string().nullable(),
-      observedAt: z.string(),
-      detail: z.string(),
-    })
-    .nullable(),
-};
-
-const providersListOutputSchema = {
-  environmentId: z.string(),
-  observedAt: z.string(),
-  defaultsByProject: z.record(z.string(), modelSelectionOutput.nullable()),
-  options: z
-    .array(
-      z
-        .object({
-          instanceId: z.string().nullable(),
-          provider: z.string().nullable(),
-          model: z.string(),
-          label: z.string(),
-          projectsWithDefault: z.array(z.string()),
-          threadsUsing: z.number(),
-        })
-        .passthrough(),
-    ),
-};
-
 const pendingActionsListOutputSchema = {
   environmentId: z.string(),
   threadId: z.string(),
@@ -610,33 +518,22 @@ const pendingActionsListOutputSchema = {
   detailsAvailable: z.boolean(),
 };
 
-const threadSnoozeOutputSchema = {
-  ...mutationResultShape,
-  threadId: z.string(),
-  snoozedUntil: z.string(),
-  preset: z.enum(["hour", "three-hours", "evening", "tomorrow", "next-week", "custom"]),
-  wakeDescription: z.string(),
-  note: z.string().optional(),
-};
-
-const threadSettleOutputSchema = {
-  ...mutationResultShape,
-  threadId: z.string(),
-  settledOverride: z.enum(["settled", "active"]).nullable(),
-  lifecycle: z.enum(["open", "snoozed", "settled", "archived"]).nullable(),
-  note: z.string().optional(),
-};
-
-export function createMcpServer(gateway: T3Gateway): McpServer {
+/**
+ * Builds the MCP surface: the gateway's own tools plus the allowlisted native
+ * T3 tools in `native`, which are forwarded unchanged. Callers fetch the
+ * snapshot first because tool registration is synchronous.
+ */
+export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | null = null): McpServer {
   const auditLog = gateway.audit;
   const server = new McpServer(
     { name: "t3-code-mcp", version: GATEWAY_VERSION },
     {
       instructions:
-        "This gateway controls one configured remote T3 Code environment. T3 remains authoritative for projects, threads, messages, runs, and workspaces. Mutation tools return after T3 accepts command intent; poll a returned runId with t3_run_get or t3_run_wait. " +
-        "Prefer t3_task_start for a new assignment so creation and initial dispatch are recoverable; use t3_tasks_list/t3_task_get after reconnect and t3_result_get for task-bound review evidence. " +
-        "Name-based resolution: zero results need a broader retry, one exact candidate may be selected, multiple candidates need clarification with project/title/branch/activity. " +
-        "Interruptions are non-atomic: T3 interrupts by provider session, so always carry observedTarget (environmentId/threadId/turnId/observedAt) and verify with t3_thread_get. " +
+        "This gateway controls one configured T3 Code environment for an orchestrator outside T3. T3 remains authoritative for projects, threads, messages, runs, and workspaces. " +
+        "Native T3 tools (t3_project_*, t3_thread_*, t3_queue_*, schedules, pull requests, orchestrator_capabilities) are forwarded unchanged. As an outside client, pass projectId or threadId explicitly. " +
+        "Use t3_threads_list and t3_threads_overview to see every project's threads and what needs attention, t3_thread_read (view=activity for tool calls) for detail, and t3_thread_send with mode=steer, queue, or restart to redirect running work. " +
+        "Prefer t3_task_start for delegated work: it is retry-safe with an idempotencyKey, can prepare a worktree, and pairs with t3_task_get, t3_result_get, and t3_task_cancel. Monitor it with t3_thread_wait using the task's threadId. " +
+        "Answer approvals with t3_pending_action_respond; native tools cannot. Interrupts are requests: confirm them with t3_thread_read or t3_thread_wait. " +
         "Usage is recorded in a local redacted audit trail; use t3_audit_log to inspect tool calls, upstream requests, Git commands, outcomes, and timings.",
     },
   );
@@ -645,7 +542,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_connection_status",
     {
       title: "T3 connection status",
-      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. toolSchemaFingerprint changes when the tool set or output shapes change, which makes cached tool definitions stale.",
+      description: "Inspect gateway build (version/commit/fingerprint), effective access mode with callable/disabled operations and reasons, upstream T3 scopes, and freshness. toolSchemaFingerprint identifies this build's declared tool contract (gateway tools and the native allowlist), not the native tools that T3 offers now; tools/list and native.availableTools and native.missingTools show those.",
       inputSchema: {},
       outputSchema: connectionStatusOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -673,37 +570,6 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async (args) => runTool(auditLog, "t3_audit_log", args, () => gateway.auditQuery(args)),
-  );
-
-  server.registerTool(
-    "t3_projects_list",
-    {
-      title: "List T3 projects",
-      description: "Find projects by case-insensitive title, workspace path, or ID substring. Filtering happens before pagination.",
-      inputSchema: { query, cursor, limit },
-      outputSchema: projectsListOutputSchema,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_projects_list", args, () => gateway.projectsList(args)),
-  );
-
-  server.registerTool(
-    "t3_project_create",
-    {
-      title: "Register a T3 project",
-      description:
-        "Register a remote workspace as a T3 project. Set createWorkspaceRootIfMissing to request creation of a missing directory. This does not clone a repository. Requires orchestration control scope and an idempotencyKey.",
-      inputSchema: {
-        title: z.string().trim().min(1).max(200),
-        workspaceRoot: z.string().trim().min(1).max(4096),
-        createWorkspaceRootIfMissing: z.boolean().optional(),
-        defaultModelSelection: modelSelection.nullable().optional(),
-        idempotencyKey,
-      },
-      outputSchema: projectCreateOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_project_create", args, () => gateway.projectCreate(args satisfies ProjectCreateInput)),
   );
 
   server.registerTool(
@@ -766,7 +632,7 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     "t3_threads_list",
     {
       title: "List T3 threads",
-      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters lifecycle (open/snoozed/settled/archived) only; activity/onlyRunning/sessionStatus filter execution, and running is not a lifecycle value. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page and excludes full transcripts, which come from t3_thread_messages.",
+      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters lifecycle (open/snoozed/settled/archived) only; activity/onlyRunning/sessionStatus filter execution, and running is not a lifecycle value. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page and excludes full transcripts, which come from t3_thread_read. Unlike native t3_thread_list, it spans every project when projectId is omitted.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
@@ -805,48 +671,11 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
   );
 
   server.registerTool(
-    "t3_providers_list",
-    {
-      title: "List T3 provider options",
-      description: "Read-only discovery of model selections observed in this environment: distinct instanceId/provider/model labels, per-project defaults, and thread usage. These are the selections valid for new threads in projects without a default model.",
-      inputSchema: {},
-      outputSchema: providersListOutputSchema,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async () => runTool(auditLog, "t3_providers_list", {}, () => gateway.providersList()),
-  );
-
-  server.registerTool(
-    "t3_thread_create",
-    {
-      title: "Create and start a T3 thread",
-      description:
-        `Create a thread and start its required initial message as one MCP operation. The gateway safely sequences T3's ordinary thread.create and thread.turn.start commands and never sends if creation is uncertain. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree and attach it to the T3 thread before the turn starts. Use t3_thread_send only for follow-ups on idle threads. Prefer t3_task_start for a durable taskRef; this tool returns a runId. Model/runtime preferences must be arguments, not message prose. modelSelection omission uses the project default. Example: {"projectId":"project-id","title":"Repair Undo","message":"Repair the owned Undo defect and report checks","runtimeMode":"full-access","modelSelection":{"instanceId":"configured-instance","model":"requested-model"},"workspaceMode":"worktree","branch":"main","idempotencyKey":"unique-assignment-key"}. branch is the base, not the generated task branch; omit worktreePath.`,
-      inputSchema: {
-        projectId: z.string().trim().min(1),
-        title: z.string().trim().min(1).max(200),
-        message: z.string().min(1).max(120_000),
-        modelSelection: modelSelection.optional(),
-        runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]),
-        interactionMode: z.enum(["default", "plan"]).optional(),
-        workspaceMode: z.enum(["local", "worktree"]).optional(),
-        branch: z.string().trim().min(1).nullable().optional(),
-        worktreePath: z.string().trim().min(1).nullable().optional(),
-        startFromOrigin: z.boolean().optional(),
-        idempotencyKey,
-      },
-      outputSchema: threadSendOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_create", args, () => gateway.threadStart(args satisfies ThreadStartInput)),
-  );
-
-  server.registerTool(
     "t3_task_start",
     {
       title: "Start a recoverable T3 task",
       description:
-        `Create one T3 thread and dispatch its required initial instruction as a recoverable two-command operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree from the selected local or origin base branch and attach it through ordinary HTTP thread creation. runtimeMode is required. Put requested model/runtime settings in arguments; omitted modelSelection uses the project default. branch is the base (for example main), not the generated task branch; omit worktreePath in worktree mode. Example: {"projectId":"project-id","title":"Repair Undo","instruction":"Repair the owned Undo defect and report checks","runtimeMode":"full-access","workspaceMode":"worktree","branch":"main","idempotencyKey":"unique-assignment-key"}. Add modelSelection:{"instanceId":"configured-instance","model":"requested-model"} when a model preference is known. Save taskRef and runId for monitoring. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.`,
+        `Create one T3 thread and dispatch its required initial instruction as a recoverable two-command operation. Set workspaceMode=worktree with branch and optional startFromOrigin to have the gateway create an explicit isolated Git worktree from the selected local or origin base branch and attach it through ordinary HTTP thread creation. runtimeMode is required. Put requested model/runtime settings in arguments; omitted modelSelection uses the project default. branch is the base (for example main), not the generated task branch; omit worktreePath in worktree mode. Example: {"projectId":"project-id","title":"Repair Undo","instruction":"Repair the owned Undo defect and report checks","runtimeMode":"full-access","workspaceMode":"worktree","branch":"main","idempotencyKey":"unique-assignment-key"}. Add modelSelection:{"instanceId":"configured-instance","model":"requested-model"} when a model preference is known. Save taskRef and threadId: monitor with t3_thread_wait (threadId) or t3_task_get, steer with t3_thread_send, and stop with t3_task_cancel. Retries must reuse the same idempotencyKey and identical input; the gateway never stores the instruction text in its journal.`,
       inputSchema: {
         projectId: z.string().trim().min(1),
         title: z.string().trim().min(1).max(200),
@@ -915,111 +744,51 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
   );
 
   server.registerTool(
-    "t3_thread_get",
+    "t3_task_cancel",
     {
-      title: "Get a T3 thread",
-      description: "Return a compact thread summary, latest response, active run, pending flags, and workspace.",
-      inputSchema: { threadId: z.string().trim().min(1) },
-      outputSchema: threadGetOutputSchema,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_get", args, () => gateway.threadGet(args.threadId)),
-  );
-
-  server.registerTool(
-    "t3_thread_messages",
-    {
-      title: "Read T3 thread messages",
-      description: "Read paginated thread history. Use limit=1 and a small maxChars for large transcripts. Each message reports textRange; read remaining text with messageId and textOffset=textRange.nextOffset until null. Offsets count JavaScript UTF-16 code units.",
-      inputSchema: {
-        threadId: z.string().trim().min(1),
-        cursor,
-        limit,
-        maxChars: z.number().int().min(100).max(100_000).default(20_000),
-        messageId: z.string().trim().min(1).optional(),
-        textOffset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
-      },
-      outputSchema: threadMessagesOutputSchema,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async (args) =>
-      runTool(auditLog, "t3_thread_messages", args, () => gateway.threadMessages(args.threadId, { cursor: args.cursor, limit: args.limit, maxChars: args.maxChars, messageId: args.messageId, textOffset: args.textOffset })),
-  );
-
-  server.registerTool(
-    "t3_thread_send",
-    {
-      title: "Send a T3 thread message",
+      title: "Cancel a recoverable T3 task",
       description:
-        "Send a new or follow-up message to an idle existing thread, start one T3 agent turn, and return after command intent is accepted. Busy threads return thread_busy with the active turn/session and valid next actions. Uncertain results carry a durable operation handle for status lookup. Each idempotencyKey maps to one input. Omitted modelSelection/runtimeMode inherit the thread settings; put any user preference in these arguments. Save runId, inspect requested/resolved/effective settings, and use t3_run_wait for monitoring. Do not resend on a timeout or uncertainty with a fresh key.",
+        "Ask T3 to stop the run that a t3_task_start task started. It interrupts only that run, never a later one in the same thread, and is safe to repeat. Acceptance is not proof of a stop; confirm with t3_thread_wait or t3_task_get.",
       inputSchema: {
-        threadId: z.string().trim().min(1),
-        message: z.string().min(1).max(120_000),
-        modelSelection: modelSelection.optional(),
-        runtimeMode: z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]).optional(),
-        interactionMode: z.enum(["default", "plan"]).optional(),
-        titleSeed: z.string().trim().min(1).max(200).optional(),
-        idempotencyKey,
+        taskRef: z.string().trim().min(1),
+        reason: z.string().trim().min(1).max(2000).optional(),
       },
-      outputSchema: threadSendOutputSchema,
+      outputSchema: {
+        taskRef: z.string(),
+        threadId: z.string(),
+        t3RunId: z.string(),
+        status: z.string(),
+        nextAction: z.string(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => runTool(auditLog, "t3_task_cancel", args, () => gateway.taskCancel(args)),
+  );
+
+  server.registerTool(
+    "t3_attachment_upload",
+    {
+      title: "Upload a T3 attachment",
+      description:
+        "Upload base64 file bytes to T3 for a later t3_thread_send_attachments call. The gateway performs the signed upload because T3's upload URL is not reachable from remote clients. Images (gif, jpeg, png, webp) may be up to 10 MiB; other files up to 50 MiB, within the gateway's request body limit. The upload expires if no message uses it.",
+      inputSchema: {
+        name: z.string().trim().min(1).max(255),
+        mimeType: z.string().trim().min(1).max(255),
+        dataBase64: z.string().min(1),
+      },
+      outputSchema: {
+        attachment: z.object({
+          type: z.enum(["image", "file"]),
+          id: z.string(),
+          name: z.string(),
+          mimeType: z.string(),
+          sizeBytes: z.number().int().positive(),
+        }),
+        nextAction: z.string(),
+      },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (args) => runTool(auditLog, "t3_thread_send", args, () => gateway.threadSend(args satisfies ThreadSendInput)),
-  );
-
-  server.registerTool(
-    "t3_run_get",
-    {
-      title: "Get T3 run status",
-      description: "Reconcile a gateway run handle against T3 state. A disconnected result is not evidence that the run failed.",
-      inputSchema: { runId: z.string().trim().min(1) },
-      outputSchema: runResultOutputSchema,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_run_get", args, () => gateway.runGet(args.runId)),
-  );
-
-  server.registerTool(
-    "t3_run_wait",
-    {
-      title: "Wait for a T3 run change",
-      description: "Wait for status, response identity, approval/input, quality or connection change using adaptive polling (up to 2 seconds). Save the runId from dispatch. Returns immediately if already terminal, blocked on approval/input or disconnected. A timeout does not cancel the run; streaming text on the same response ID is not a change trigger. Continue bounded waits or inspect a changed response; avoid duplicate monitors.",
-      inputSchema: {
-        runId: z.string().trim().min(1),
-        timeoutSeconds: z.number().int().min(1).max(30).default(10),
-      },
-      outputSchema: runResultOutputSchema,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_run_wait", args, () => gateway.runWait(args.runId, args.timeoutSeconds)),
-  );
-
-  server.registerTool(
-    "t3_run_interrupt",
-    {
-      title: "Interrupt a T3 run",
-      description: "Request interruption of one accepted T3 run. The interruption itself is journaled and is never replayed automatically.",
-      inputSchema: { runId: z.string().trim().min(1), idempotencyKey },
-      outputSchema: mutationResultShape,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_run_interrupt", args, () => gateway.runInterrupt(args)),
-  );
-
-  server.registerTool(
-    "t3_thread_interrupt",
-    {
-      title: "Interrupt work in an existing T3 thread",
-      description: "Request stopping the active turn in a thread, including one started outside this gateway. expectedTurnId is the observedTarget.turnId from a current thread read. Returns acceptance plus post-dispatch verification (interrupted/still_running/target_changed/not_running/inconsistent/unknown). Acceptance records dispatch and is not a confirmed stop. Stale observations return turn_changed/thread_not_running. T3 interrupts by provider session without an atomic turn condition.",
-      inputSchema: {
-        threadId: z.string().trim().min(1),
-        expectedTurnId: z.string().trim().min(1),
-        idempotencyKey,
-      },
-      outputSchema: threadInterruptOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_interrupt", args, () => gateway.threadInterrupt(args)),
+    async (args) => runTool(auditLog, "t3_attachment_upload", args, () => gateway.attachmentUpload(args)),
   );
 
   server.registerTool(
@@ -1053,74 +822,68 @@ export function createMcpServer(gateway: T3Gateway): McpServer {
     async (args) => runTool(auditLog, "t3_pending_action_respond", args, () => gateway.pendingActionRespond(args satisfies PendingActionRespondInput)),
   );
 
-  server.registerTool(
-    "t3_thread_archive",
-    {
-      title: "Archive a T3 thread",
-      description: "Archive a thread without deleting its remote workspace files.",
-      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
-      outputSchema: mutationResultShape,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_archive", args, () => gateway.threadArchive(args)),
-  );
-
-  server.registerTool(
-    "t3_thread_snooze",
-    {
-      title: "Snooze a T3 thread",
-      description:
-        "Hide a thread from the inbox until a wake time. Omit preset and snoozedUntil to snooze until this evening (before evening) or tomorrow morning. Preset options: hour, three-hours, evening, tomorrow, next-week. Alternatively supply an explicit future ISO snoozedUntil. Snooze never stops a running agent; pending approvals, user input, or queued turns are rejected.",
-      inputSchema: {
-        threadId: z.string().trim().min(1),
-        preset: z.enum(["default", "hour", "three-hours", "evening", "tomorrow", "next-week"]).optional(),
-        snoozedUntil: z.string().trim().min(1).optional(),
-        idempotencyKey,
-      },
-      outputSchema: threadSnoozeOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_snooze", args, () => gateway.threadSnooze(args)),
-  );
-
-  server.registerTool(
-    "t3_thread_unsnooze",
-    {
-      title: "Wake a snoozed T3 thread",
-      description: "Bring a snoozed thread back to the inbox immediately.",
-      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
-      outputSchema: { ...mutationResultShape, threadId: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_unsnooze", args, () => gateway.threadUnsnooze(args)),
-  );
-
-  server.registerTool(
-    "t3_thread_settle",
-    {
-      title: "Settle a T3 thread",
-      description:
-        "Mark a thread done. Clears snooze and pin. Blocked while the thread is running, has a pending approval, or has a queued turn start.",
-      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
-      outputSchema: threadSettleOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_settle", args, () => gateway.threadSettle(args)),
-  );
-
-  server.registerTool(
-    "t3_thread_unsettle",
-    {
-      title: "Reopen a settled T3 thread",
-      description: "Return a settled thread to the active list.",
-      inputSchema: { threadId: z.string().trim().min(1), idempotencyKey },
-      outputSchema: threadSettleOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (args) => runTool(auditLog, "t3_thread_unsettle", args, () => gateway.threadUnsettle(args)),
-  );
+  for (const tool of native?.tools ?? []) {
+    registerNativeTool(server, gateway, tool);
+  }
 
   return server;
+}
+
+function registerNativeTool(server: McpServer, gateway: T3Gateway, tool: NativeTool): void {
+  const mutating = isNativeMutatingTool(tool.name);
+  server.registerTool(
+    tool.name,
+    {
+      ...(tool.title === undefined ? {} : { title: tool.title }),
+      ...(tool.description === undefined ? {} : { description: tool.description }),
+      inputSchema: nativeInputSchema(tool.inputSchema),
+      annotations: { ...tool.annotations, readOnlyHint: !mutating },
+    },
+    async (args) => auditedTool(gateway.audit, tool.name, args, async () => {
+      const result = await gateway.callNative(tool.name, args);
+      return { result, auditSummary: nativeAuditSummary(tool.name, result) };
+    }, { native: true }),
+  );
+}
+
+/** Run statuses in the output schema of native `t3_thread_wait`. */
+const NATIVE_RUN_STATUSES = new Set<string>([
+  "idle", "preparing", "queued", "starting", "running", "waiting", "completed", "interrupted", "failed", "cancelled", "rolled_back",
+]);
+
+/**
+ * The audited shape of a native result: the result keys only, because native
+ * results carry thread content under keys the redactor does not know. For
+ * `t3_thread_wait` it also keeps `timedOut` and a known `status`, which the
+ * usage summary counts.
+ */
+function nativeAuditSummary(name: NativeToolName, result: CallToolResult): Record<string, unknown> {
+  const structured = result.structuredContent ?? {};
+  const summary = { isError: result.isError === true, keys: Object.keys(structured) };
+  if (name !== "t3_thread_wait") return summary;
+  return {
+    ...summary,
+    ...(typeof structured.timedOut === "boolean" ? { timedOut: structured.timedOut } : {}),
+    ...(typeof structured.status === "string" && NATIVE_RUN_STATUSES.has(structured.status) ? { status: structured.status } : {}),
+  };
+}
+
+/**
+ * Converts a native JSON Schema for advertisement. The gateway checks each
+ * call against the converted schema, and unknown keys pass unless the schema
+ * sets `additionalProperties: false`. T3 validates the call again and stays
+ * authoritative for keywords that the conversion does not support.
+ */
+function nativeInputSchema(schema: NativeTool["inputSchema"]): z.ZodObject {
+  try {
+    // MCP types nested schemas loosely as `object`; by protocol they are JSON Schema.
+    const converted = z.fromJSONSchema(schema as z.core.JSONSchema.JSONSchema);
+    if (converted instanceof z.ZodObject) return converted;
+  } catch {
+    // Fall through below rather than hiding the tool.
+  }
+  // A schema that does not convert to an object accepts any arguments; T3 checks them.
+  return z.looseObject({});
 }
 
 async function runTool<T extends object>(
@@ -1128,6 +891,32 @@ async function runTool<T extends object>(
   toolName: string,
   input: unknown,
   operation: () => Promise<T>,
+): Promise<CallToolResult> {
+  return auditedTool(auditLog, toolName, input, async () => {
+    const value = await operation();
+    return {
+      result: {
+        content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+        structuredContent: value as Record<string, unknown>,
+      },
+      auditSummary: value,
+    };
+  });
+}
+
+/**
+ * Records one MCP tool call and its outcome. `callDetails` adds fields to the
+ * `tool.call` event: native tools add `native: true`, so the usage summary can
+ * tell them from gateway tools of the same name in older audit files.
+ * `auditSummary` lets proxied tools log only the result shape: native results
+ * carry thread content under keys the redactor does not know.
+ */
+async function auditedTool(
+  auditLog: AuditLog,
+  toolName: string,
+  input: unknown,
+  operation: () => Promise<{ readonly result: CallToolResult; readonly auditSummary: unknown }>,
+  callDetails: Readonly<Record<string, unknown>> = {},
 ): Promise<CallToolResult> {
   const correlationId = `mcp_${randomUUID()}`;
   return withAuditContext(correlationId, toolName, async () => {
@@ -1138,23 +927,20 @@ async function runTool<T extends object>(
       correlationId,
       operation: toolName,
       outcome: "started",
-      details: { arguments: summarizeForAudit(input) },
+      details: { arguments: summarizeForAudit(input), ...callDetails },
     });
     try {
-      const result = await operation();
+      const { result, auditSummary } = await operation();
       await auditLog.record({
         source: "mcp",
         event: "tool.result",
         correlationId,
         operation: toolName,
-        outcome: "completed",
+        outcome: result.isError === true ? "error" : "completed",
         durationMs: Date.now() - startedAt,
-        details: { result: summarizeForAudit(result) },
+        details: { result: summarizeForAudit(auditSummary) },
       });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        structuredContent: result as Record<string, unknown>,
-      };
+      return result;
     } catch (error) {
       const code = error instanceof GatewayError ? error.code : "gateway_error";
       const message = error instanceof Error ? error.message : String(error);

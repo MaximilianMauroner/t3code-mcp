@@ -69,8 +69,8 @@ describe("read-only usage summary", () => {
     const path = await file();
     const thread = { id: "thread", activity: "idle", latestTurn: { turnId: "turn" }, updatedAt: "unchanged" };
     const rows = [
-      event(0, { details: { arguments: {} } }),
-      event(1, { details: { arguments: { modelSelection: { model: "selected" } } } }),
+      event(0, { operation: "t3_task_start", details: { arguments: {} } }),
+      event(1, { details: { arguments: { idempotencyKey: "key-1", modelSelection: { model: "selected" } } } }),
       event(2, { event: "tool.result", outcome: "error", durationMs: 12, details: { errorCode: "thread_busy" } }),
       event(3, { operation: "t3_thread_get", event: "tool.result", outcome: "completed", details: { result: { thread } } }),
       event(4, { operation: "t3_thread_get", event: "tool.result", outcome: "completed", details: { result: { thread } } }),
@@ -83,13 +83,33 @@ describe("read-only usage summary", () => {
     await writeFile(path, rows.map((item) => JSON.stringify(item)).join("\n") + "\ninvalid\n");
     const report = await summarizeUsage(path, { since: "2026-09-30T12:00:00Z", until: "2026-09-30T12:00:08Z" });
     expect(report.scan).toMatchObject({ includedEvents: 9, invalidLines: 1 });
-    expect(report.denominators).toEqual({ toolCalls: 2, dispatchCalls: 2, upstreamRequests: 2, waits: 1, comparableThreadPairs: 1 });
+    expect(report.denominators).toEqual({ toolCalls: 2, dispatchCalls: 2, modelSelectionCalls: 2, upstreamRequests: 2, waits: 1, comparableThreadPairs: 1 });
     expect(report.launches.omittedModelSelection).toBe(1);
     expect(report.monitoring).toMatchObject({ unchangedActiveWaits: 1, measuredWaits: 1, waitObservations: 18, unchangedThreadPairs: 1 });
     expect(report.attribution).toEqual({ attributedRequests: 1, unattributedRequests: 1, requestsByTool: { t3_run_wait: 1 } });
     expect(report.errorCodes).toEqual({ "t3_thread_send:thread_busy": 1 });
     expect(report.endpoints["GET /api/orchestration/threads/:threadId"]?.latency).toMatchObject({ count: 1, meanMs: 33, p95UpperBoundMs: 50 });
     expect(JSON.stringify(report)).not.toContain('"id":"thread"');
+  });
+
+  it("counts native wait results, and model omissions only for calls that accept modelSelection", async () => {
+    const path = await file();
+    const wait = (index: number, outcome: string, result: Record<string, unknown>) =>
+      event(index, { operation: "t3_thread_wait", event: "tool.result", outcome, details: { result } });
+    const rows = [
+      event(0, { details: { arguments: { clientRequestId: "request-1", idempotencyKey: "key-0" }, native: true } }),
+      event(1, { details: { arguments: { idempotencyKey: "key-1" } } }),
+      event(2, { operation: "t3_thread_launch", details: { arguments: {}, native: true } }),
+      wait(3, "completed", { timedOut: true, status: "running" }),
+      wait(4, "completed", { timedOut: true, status: "idle" }),
+      wait(5, "completed", { timedOut: false, status: "completed" }),
+      wait(6, "error", {}),
+    ];
+    await writeFile(path, rows.map((item) => JSON.stringify(item)).join("\n") + "\n");
+    const report = await summarizeUsage(path, {});
+    expect(report.launches.omittedModelSelection).toBe(2);
+    expect(report.denominators).toMatchObject({ toolCalls: 3, dispatchCalls: 3, modelSelectionCalls: 2, waits: 3 });
+    expect(report.monitoring).toMatchObject({ unchangedActiveWaits: 1, measuredWaits: 0, waitObservations: 0 });
   });
 
   it("handles absent logs and rejects inverted or malformed windows", async () => {

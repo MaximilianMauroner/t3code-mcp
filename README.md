@@ -11,15 +11,17 @@ flowchart LR
     User[You] <--> Client[Any compatible MCP client]
     Client <-->|MCP over stdio or Streamable HTTP| Gateway[t3-code-mcp]
     Gateway <-->|Authenticated HTTP and WebSocket RPC| T3[T3 Code and its coding agents]
+    Gateway <-->|Native T3 MCP, forwarded tools| T3
     Gateway -->|Read-only Git status and revision comparison| Workspace[T3-selected workspace]
 ```
 
 ## What you can do
 
-- Find projects and threads, inspect progress, and retrieve agent responses.
+- See every project and thread, triage what needs attention, and read full thread timelines.
 - Inspect structured Git status, bounded uncommitted diffs, and committed base-to-head comparisons in T3-selected workspaces.
-- Start recoverable one-call tasks, find them after reconnecting, respond to input requests, and interrupt work.
-- Snooze, settle, reopen, and archive threads.
+- Start recoverable one-call tasks, find them after reconnecting, review their changes, and cancel them.
+- Steer, queue, interrupt, fork, configure, and organize threads, manage schedules and pull request watches, and upload attachments, through T3's own native MCP tools that the gateway forwards.
+- Answer approval and input requests.
 - Record redacted tool, transport, upstream, Git, and journal activity for later review through `t3_audit_log`.
 - Connect through local stdio or authenticated Streamable HTTP.
 
@@ -52,7 +54,7 @@ node --env-file=.env dist/cli.js serve
 
 Connect your MCP client to `http://127.0.0.1:8787/mcp` with `Authorization: Bearer <MCP_BEARER_TOKEN>`. This address is local to the gateway machine; remote clients need an authenticated tunnel or HTTPS proxy. For a local client that launches the process, use `MCP_TRANSPORT=stdio` instead.
 
-Request connection status, list projects, and read an existing thread to verify the connection. Follow the [configuration and client connection guide](docs/configuration.md) for all environment variables and the first write-enabled check.
+Run `native-login` with a T3 pairing code to enable the forwarded native tools; see [native T3 login](docs/configuration.md#native-t3-login). Request connection status, list projects, and read an existing thread to verify the connection. Follow the [configuration and client connection guide](docs/configuration.md) for all environment variables and the first write-enabled check.
 
 The gateway writes its append-only redacted usage trail to `audit.jsonl` in `T3_MCP_DATA_DIR`; a future agent can query the bounded history with `t3_audit_log`. For offline aggregate analysis without T3 credentials, run `pnpm usage-summary --file ./data/audit.jsonl --since <ISO> --until <ISO>`. See [usage analysis](docs/usage.md#usage-analysis) for metric definitions and [task briefs](docs/task-briefs.md) for precise launch/continuation examples.
 
@@ -60,8 +62,8 @@ The gateway writes its append-only redacted usage trail to `audit.jsonl` in `T3_
 
 | Guide | Contents |
 | --- | --- |
-| [Usage and tool behavior](docs/usage.md) | Example requests, thread lifecycle, status fields, retries, and current limits |
-| [Configuration and client connections](docs/configuration.md) | Environment variables, transports, connection checks, and integration references |
+| [Usage and tool behavior](docs/usage.md) | Example requests, native T3 tools, delegation from outside, status fields, retries, and current limits |
+| [Configuration and client connections](docs/configuration.md) | Environment variables, native T3 login and renewal, transports, connection checks, and integration references |
 | [Security and access risks](docs/security.md) | Host access, credentials, approvals, data exposure, deployment risks, and mitigations |
 | [Linux deployment](docs/deployment.md) | Systemd services, tunnel setup, credentials, and startup checks |
 | [Development and verification](docs/development.md) | Build and test commands, diagnostics, and opt-in live integration tests |
@@ -72,11 +74,11 @@ These references record the V1 limits checked on 2026-09-11. Several are address
 
 | Gateway limit | Upstream item | Effect here |
 | --- | --- | --- |
-| Busy threads reject new turns. Queueing and steering are not implemented. | Issue [#9672](https://github.com/pingdotgg/t3code/issues/9672), PR [#7240](https://github.com/pingdotgg/t3code/pull/7240), PR [#10132](https://github.com/pingdotgg/t3code/pull/10132) | Server-side queued turn intent (`after-current`) would let `t3_thread_send` queue a follow-up instead of returning `thread_busy`, and would keep the queued message after a restart. |
-| Interrupt acceptance never confirms a stop, so the gateway must poll and report a separate verification result. | Issue [#4713](https://github.com/pingdotgg/t3code/issues/4713), issue [#8618](https://github.com/pingdotgg/t3code/issues/8618) | Both describe interrupt requests recorded as accepted while the session projection stays `running`. A terminal session event after interruption would make `verification` reliable instead of best effort. |
+| Busy threads reject new turns. Queueing and steering are not implemented. | Issue [#9672](https://github.com/pingdotgg/t3code/issues/9672), PR [#7240](https://github.com/pingdotgg/t3code/pull/7240), PR [#10132](https://github.com/pingdotgg/t3code/pull/10132) | Resolved for clients of the native tools: native `t3_thread_send` queues and steers. The gateway's own task dispatch still returns `thread_busy`. |
+| Interrupt acceptance never confirms a stop. The removed gateway interrupt tools polled for a separate verification result; native `t3_thread_interrupt` and `t3_task_cancel` do not. | Issue [#4713](https://github.com/pingdotgg/t3code/issues/4713), issue [#8618](https://github.com/pingdotgg/t3code/issues/8618) | Both describe interrupt requests recorded as accepted while the session projection stays `running`. A terminal session event after interruption would make `verification` reliable instead of best effort. |
 | Pending-action details are inferred from activity records and can include historical entries. | Issue [#5454](https://github.com/pingdotgg/t3code/issues/5454), PR [#10586](https://github.com/pingdotgg/t3code/pull/10586), PR [#8425](https://github.com/pingdotgg/t3code/pull/8425), issue [#7825](https://github.com/pingdotgg/t3code/issues/7825) | Server-side dismissal of orphaned questions and of approvals on revert would make `t3_pending_actions_list` match what the agent can still accept. #7825 covers request types reported as unknown. |
 | The HTTP orchestration route does not implement every WebSocket command field. | Issue [#8319](https://github.com/pingdotgg/t3code/issues/8319), PR [#7996](https://github.com/pingdotgg/t3code/pull/7996) | `thread.turn.start` with `bootstrap` fails or ignores worktree attachment over HTTP. This gateway works around it by creating a deterministic explicit Git worktree and attaching it through ordinary `thread.create`; upstream parity would restore T3-owned setup-script execution and rollback. |
-| There are no push notifications. `t3_run_wait` polls and can return before completion. | Issue [#10929](https://github.com/pingdotgg/t3code/issues/10929) | An authenticated read-only thread status stream would replace polling for run progress and pending requests, and would lower load for always-on clients. |
+| There are no push notifications. Clients wait with native `t3_thread_wait` or poll the task tools. | Issue [#10929](https://github.com/pingdotgg/t3code/issues/10929) | An authenticated read-only thread status stream would replace polling for run progress and pending requests, and would lower load for always-on clients. |
 | Settled and open lists can differ from the T3 UI, which derives settlement from inputs the API does not expose. | Issue [#5476](https://github.com/pingdotgg/t3code/issues/5476), issue [#6368](https://github.com/pingdotgg/t3code/issues/6368), issue [#10099](https://github.com/pingdotgg/t3code/issues/10099) | These report PR-driven auto-settling, completion waking snoozed threads, and clients disagreeing about settlement. Server-owned lifecycle state would let `status` and `statusReason` agree with every client. |
 | V1 error strings can conflate rate limits and quota; unbound start errors lack turn identity. | Issue [#10545](https://github.com/pingdotgg/t3code/issues/10545), completed by merged PR [#2829](https://github.com/pingdotgg/t3code/pull/2829) on 2026-10-02; PR [#10550](https://github.com/pingdotgg/t3code/pull/10550) closed unmerged. | V2 exposes root error `failure.class`, `code`, `retryable`, optional `resetAt`, and retry progress; shell rows expose `lastErrorClass` and `usageLimitResetAt`. The gateway supports both APIs and retains turn-bound failures. Specific V1 provider evidence improves classification. V2's broad `usage_limit` class still includes some rate limits. See [failure authority and limits](docs/usage.md). |
 | `T3_ACCESS_TOKEN` cannot be narrowed. `t3 auth session issue` mints `AuthAdministrativeScopes` only, so `MCP_READ_ONLY=true` is enforced by this gateway, not by the T3 token. | PR [#10411](https://github.com/pingdotgg/t3code/pull/10411) | `t3 drive` mints a per-invocation session holding only `orchestration:read`, adds `orchestration:operate` for mutations, and revokes it afterwards. The server therefore supports narrow sessions already; a scope flag on `t3 auth session issue` would let a read-only deployment hold a read-only token. The `drive` commands themselves are an HTTP client for the same orchestration endpoints, so they are not a transport alternative for this gateway. |

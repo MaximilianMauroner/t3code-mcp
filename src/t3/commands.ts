@@ -3,17 +3,6 @@ import type { ModelSelection } from "./types.js";
 export type RuntimeMode = "approval-required" | "auto-accept-edits" | "auto" | "full-access";
 export type InteractionMode = "default" | "plan";
 
-export interface ProjectCreateCommand {
-  readonly type: "project.create";
-  readonly commandId: string;
-  readonly projectId: string;
-  readonly title: string;
-  readonly workspaceRoot: string;
-  readonly createWorkspaceRootIfMissing?: boolean;
-  readonly defaultModelSelection?: ModelSelection | null;
-  readonly createdAt: string;
-}
-
 export interface ThreadCreateCommand {
   readonly type: "thread.create";
   readonly commandId: string;
@@ -42,34 +31,6 @@ export interface ThreadTurnStartCommand {
   readonly titleSeed?: string;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: InteractionMode;
-  readonly bootstrap?: {
-    readonly createThread?: {
-      readonly projectId: string;
-      readonly title: string;
-      readonly modelSelection: ModelSelection;
-      readonly runtimeMode: RuntimeMode;
-      readonly interactionMode: InteractionMode;
-      readonly branch: string | null;
-      readonly worktreePath: string | null;
-      readonly createdAt: string;
-    };
-    readonly prepareWorktree?: {
-      readonly projectCwd: string;
-      readonly baseBranch: string;
-      readonly branch?: string;
-      readonly startFromOrigin?: boolean;
-      readonly requireWorktree?: boolean;
-    };
-    readonly runSetupScript?: boolean;
-  };
-  readonly createdAt: string;
-}
-
-export interface ThreadTurnInterruptCommand {
-  readonly type: "thread.turn.interrupt";
-  readonly commandId: string;
-  readonly threadId: string;
-  readonly turnId?: string;
   readonly createdAt: string;
 }
 
@@ -91,48 +52,8 @@ export interface ThreadUserInputResponseCommand {
   readonly createdAt: string;
 }
 
-export interface ThreadArchiveCommand {
-  readonly type: "thread.archive";
-  readonly commandId: string;
-  readonly threadId: string;
-}
-
-export interface ThreadSnoozeCommand {
-  readonly type: "thread.snooze";
-  readonly commandId: string;
-  readonly threadId: string;
-  readonly snoozedUntil: string;
-}
-
-export interface ThreadUnsnoozeCommand {
-  readonly type: "thread.unsnooze";
-  readonly commandId: string;
-  readonly threadId: string;
-  readonly reason: "user";
-}
-
-export interface ThreadSettleCommand {
-  readonly type: "thread.settle";
-  readonly commandId: string;
-  readonly threadId: string;
-}
-
-export interface ThreadUnsettleCommand {
-  readonly type: "thread.unsettle";
-  readonly commandId: string;
-  readonly threadId: string;
-  readonly reason: "user";
-}
-
 export type T3Command =
-  | ProjectCreateCommand
   | ThreadCreateCommand
   | ThreadTurnStartCommand
-  | ThreadTurnInterruptCommand
   | ThreadApprovalResponseCommand
-  | ThreadUserInputResponseCommand
-  | ThreadArchiveCommand
-  | ThreadSnoozeCommand
-  | ThreadUnsnoozeCommand
-  | ThreadSettleCommand
-  | ThreadUnsettleCommand;
+  | ThreadUserInputResponseCommand;

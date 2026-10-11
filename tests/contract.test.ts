@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { TOOL_NAMES, toolSchemaFingerprint, GATEWAY_VERSION } from "../src/contract.js";
+import { GATEWAY_TOOL_NAMES, TOOL_NAMES, toolSchemaFingerprint, GATEWAY_VERSION } from "../src/contract.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { gatewayFixture, type GatewayFixture } from "./support/gateway-fixture.js";
 import { FakeT3 } from "./support/fake-t3.js";
@@ -36,8 +36,10 @@ describe("slice 1: dependable check-ins", () => {
     expect(status.toolSchemaFingerprint).toBe(toolSchemaFingerprint());
     expect(status.observedAt).toBeTruthy();
     expect(status.effectiveAccessMode).toBe("read-write");
-    expect(status.callableOperations).toContain("t3_thread_send");
-    expect(status.disabledOperations).toEqual([]);
+    expect(status.callableOperations).toContain("t3_task_start");
+    // The fixture has no native credential, so only native-backed tools are disabled.
+    expect(new Set(status.disabledOperations.map((d) => d.reasonCode))).toEqual(new Set(["native_unavailable"]));
+    expect([...status.callableOperations, ...status.disabledOperations.map((d) => d.operation)].sort()).toEqual([...TOOL_NAMES].sort());
     expect(status.upstreamScopes).toEqual(status.t3Scopes);
     expect(status.upstreamScopes).toContain("orchestration:operate");
   });
@@ -140,14 +142,6 @@ describe("slice 2: deterministic resolution", () => {
 });
 
 describe("slices 3-4: safe follow-up and honest interruption", () => {
-  it("discovers provider options read-only", async () => {
-    const { fake, gateway } = await setup();
-    fake.addProject({ id: "p1", defaultModelSelection: { instanceId: "codex_openai", model: "gpt-5.3-codex-spark" } });
-    const providers = await gateway.providersList();
-    expect(providers.defaultsByProject["p1"]).toMatchObject({ model: "gpt-5.3-codex-spark" });
-    expect(providers.options[0]?.label).toContain("gpt-5.3-codex-spark");
-  });
-
   it("rejects busy threads with the active turn and next actions", async () => {
     const { fake, gateway } = await setup();
     fake.addThread({
@@ -177,18 +171,6 @@ describe("slices 3-4: safe follow-up and honest interruption", () => {
       expect(first.reason).toContain(first.operationId);
     }
   });
-
-  it("verifies interruption instead of claiming success", async () => {
-    const { fake, gateway } = await setup();
-    fake.addThread({
-      id: "stop",
-      latestTurn: { turnId: "turn-stop", state: "running", requestedAt: new Date().toISOString() },
-      session: { status: "running", updatedAt: new Date().toISOString() },
-    });
-    const result = await gateway.threadInterrupt({ threadId: "stop", expectedTurnId: "turn-stop", idempotencyKey: "s1" });
-    expect(result.status).toBe("accepted");
-    expect(result.verification?.observed).toBe("interrupted");
-  });
 });
 
 describe("transport contract", () => {
@@ -213,7 +195,7 @@ describe("transport contract", () => {
     servers.push(server);
 
     const tools = await client.listTools();
-    expect(tools.tools.map((t) => t.name).sort()).toEqual([...TOOL_NAMES].sort());
+    expect(tools.tools.map((t) => t.name).sort()).toEqual([...GATEWAY_TOOL_NAMES].sort());
     const status = await client.callTool({ name: "t3_connection_status", arguments: {} });
     expect(status.structuredContent).toMatchObject({
       gatewayVersion: GATEWAY_VERSION,

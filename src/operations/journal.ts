@@ -19,18 +19,27 @@ export type TaskStage =
   | "run_accepted"
   | "rejected";
 
-export type OperationKind =
-  | "project.create"
+/** Operations the gateway still starts. */
+export type WritableOperationKind =
   | "thread.create"
   | "thread.turn.start"
-  | "thread.turn.interrupt"
   | "thread.approval.respond"
-  | "thread.user-input.respond"
+  | "thread.user-input.respond";
+
+/**
+ * Kinds written by tools that native T3 tools replaced. Stored records stay
+ * readable and keep their idempotency keys reserved; nothing writes them now.
+ */
+export type LegacyOperationKind =
+  | "project.create"
+  | "thread.turn.interrupt"
   | "thread.archive"
   | "thread.snooze"
   | "thread.unsnooze"
   | "thread.settle"
   | "thread.unsettle";
+
+export type OperationKind = WritableOperationKind | LegacyOperationKind;
 
 export interface OperationRecord {
   readonly operationId: string;
@@ -100,7 +109,7 @@ export interface BeginTaskInput {
 }
 
 export interface BeginOperationInput {
-  readonly kind: OperationKind;
+  readonly kind: WritableOperationKind;
   readonly idempotencyKey: string;
   readonly payloadHash: string;
   readonly commandId?: string;
@@ -109,7 +118,6 @@ export interface BeginOperationInput {
   readonly runId?: string;
   readonly messageId?: string;
   readonly turnId?: string;
-  readonly snoozedUntil?: string;
   readonly settings?: SettingsReceipt;
 }
 
@@ -247,7 +255,6 @@ export class OperationJournal {
       ...(input.runId === undefined ? {} : { runId: input.runId }),
       ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
       ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
-      ...(input.snoozedUntil === undefined ? {} : { snoozedUntil: input.snoozedUntil }),
       ...(input.settings === undefined ? {} : { settings: settingsReceiptSchema.parse(input.settings) }),
     };
     this.entries.set(input.idempotencyKey, record);

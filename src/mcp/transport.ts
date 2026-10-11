@@ -7,8 +7,6 @@ import { T3Gateway } from "../gateway.js";
 import { summarizeForAudit } from "../operations/audit-log.js";
 import { createMcpServer } from "./server.js";
 
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
-
 export async function runStdio(gateway: T3Gateway): Promise<void> {
   const correlationId = `stdio_${randomUUID()}`;
   const startedAt = Date.now();
@@ -19,7 +17,10 @@ export async function runStdio(gateway: T3Gateway): Promise<void> {
     outcome: "started",
     details: { transport: "stdio" },
   });
-  const server = createMcpServer(gateway);
+  // A stdio session lists the native tools it finds at start. If it lists none, it needs a
+  // restart after the cause is fixed (login, credential, or T3 availability), and also after a
+  // T3 upgrade that changes the tools. A renewal needs no restart while native tools are listed.
+  const server = createMcpServer(gateway, await gateway.nativeSnapshot());
   const transport = new StdioServerTransport();
   try {
     await server.connect(transport);
@@ -139,14 +140,14 @@ async function handleHttpRequest(
     authOutcome = "accepted";
     let body: unknown;
     try {
-      body = request.method === "POST" ? await readJsonBody(request) : undefined;
+      body = request.method === "POST" ? await readJsonBody(request, config.maxBodyBytes) : undefined;
     } catch (error) {
       writeJson(response, 400, { error: error instanceof Error ? error.message : "Invalid request body." });
       return;
     }
     rpcDetails = mcpRequestDetails(body);
 
-    const server = createMcpServer(gateway);
+    const server = createMcpServer(gateway, await gateway.nativeSnapshot());
     // The gateway creates a fresh server for each HTTP request. Keep the
     // transport stateless so a client is not handed a session ID that cannot be
     // resolved by the next request. Durable run identity lives in the journal.
@@ -228,13 +229,13 @@ function authorized(request: IncomingMessage, expected: string | null): boolean 
   return supplied.length === configured.length && timingSafeEqual(supplied, configured);
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<unknown> {
+async function readJsonBody(request: IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) {
+    if (size > maxBytes) {
       throw new Error("Request body is too large.");
     }
     chunks.push(buffer);
