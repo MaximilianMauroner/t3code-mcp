@@ -2049,10 +2049,12 @@ function partitionOperations(access: {
 }): { readonly callableOperations: string[]; readonly disabledOperations: DisabledOperation[] } {
   const callableOperations: string[] = [];
   const disabledOperations: DisabledOperation[] = [];
-  const credentialValid = access.native.status.credential === "valid";
-  // Without a valid credential the snapshot still lists the last known tools, but none of them can be called.
-  const offered = new Set<string>(credentialValid ? access.native.snapshot?.tools.map((tool) => tool.name) ?? [] : []);
-  const nativeUsable = credentialValid && access.native.snapshot?.error === null;
+  // T3 can refuse a credential that is valid on disk, for example after `t3 auth session revoke`.
+  const credentialUsable = access.native.status.credential === "valid" &&
+    access.native.snapshot?.error?.code !== "native_credential_rejected";
+  // Without a usable credential the snapshot still lists the last known tools, but none of them can be called.
+  const offered = new Set<string>(credentialUsable ? access.native.snapshot?.tools.map((tool) => tool.name) ?? [] : []);
+  const nativeUsable = credentialUsable && access.native.snapshot?.error === null;
   const nativeReason = access.native.status.error ?? "Native T3 does not offer this tool.";
   for (const operation of [...GATEWAY_TOOL_NAMES, ...NATIVE_TOOL_NAMES]) {
     const nativeTool = isNativeToolName(operation);

@@ -847,10 +847,10 @@ function registerNativeTool(server: McpServer, gateway: T3Gateway, tool: NativeT
 }
 
 /**
- * Converts a native JSON Schema for advertisement and local shape checks.
- * Unknown keys pass through unless the schema sets `additionalProperties:
- * false`. The conversion drops a few keywords such as `format`, so T3 remains
- * the authoritative validator.
+ * Converts a native JSON Schema for advertisement. The gateway checks each
+ * call against the converted schema, and unknown keys pass unless the schema
+ * sets `additionalProperties: false`. T3 validates the call again and stays
+ * authoritative for keywords that the conversion does not support.
  */
 function nativeInputSchema(schema: NativeTool["inputSchema"]): z.ZodObject {
   try {

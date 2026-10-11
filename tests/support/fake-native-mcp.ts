@@ -28,6 +28,8 @@ export class FakeNativeMcp {
   restartOnDrop = false;
   /** Leave every new /mcp request unanswered, as a hung T3 does. */
   stallRequests = false;
+  /** End each t3_thread_wait after this many ms, as a run that ends does. When null, a wait uses its whole budget. */
+  runEndsAfterMs: number | null = null;
   /** /mcp requests refused because they did not carry `token`. */
   unauthorizedRequests = 0;
   /** Fail the next upload with this HTTP status. */
@@ -208,9 +210,9 @@ export class FakeNativeMcp {
       { description: "Wait for a run to end.", inputSchema: loose({ threadId: z.string(), timeoutMs: z.number().optional() }), annotations: { readOnlyHint: true } },
       async (args) => {
         record("t3_thread_wait", args);
-        // No run ends here, so every wait uses its whole budget.
-        await new Promise((resolve) => setTimeout(resolve, typeof args.timeoutMs === "number" ? args.timeoutMs : 0));
-        const value = { threadId: args.threadId, timedOut: true };
+        const endsAfterMs = this.runEndsAfterMs;
+        await new Promise((resolve) => setTimeout(resolve, endsAfterMs ?? (typeof args.timeoutMs === "number" ? args.timeoutMs : 0)));
+        const value = { threadId: args.threadId, timedOut: endsAfterMs === null };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );

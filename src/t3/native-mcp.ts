@@ -31,6 +31,11 @@ interface Connection {
   readonly tokenId: string;
 }
 
+interface CatalogRefresh {
+  readonly tokenId: string;
+  readonly snapshot: Promise<NativeSnapshot>;
+}
+
 const CATALOG_TTL_MS = 60_000;
 const CATALOG_FAILURE_TTL_MS = 10_000;
 const CATALOG_TIMEOUT_MS = 10_000;
@@ -40,6 +45,8 @@ const WAIT_MARGIN_MS = 15_000;
 // when it is "Infinity". A shorter request timeout would end the wait early and
 // look like a lost result.
 const UNBOUNDED_WAIT_TIMEOUT_MS = 60 * 60_000 + WAIT_MARGIN_MS;
+// Node fires a timer that is longer than 2^31-1 ms after 1 ms.
+const MAX_TIMER_MS = 2_147_483_647;
 // The first try, one retry, and one more try on a fresh connection when T3 forgot the session.
 const MAX_ATTEMPTS = 3;
 
@@ -54,7 +61,7 @@ export class NativeMcpClient {
   private connection: Connection | null = null;
   private connecting: Promise<Connection> | null = null;
   private catalog: { readonly snapshot: NativeSnapshot; readonly tokenId: string; readonly expiresAt: number } | null = null;
-  private refreshing: Promise<NativeSnapshot> | null = null;
+  private refreshing: CatalogRefresh | null = null;
 
   constructor(
     readonly url: string,
@@ -68,22 +75,21 @@ export class NativeMcpClient {
   }
 
   /**
-   * The native tools to advertise. A cached catalog for the current token is
-   * returned at once, even when stale, and refreshed in the background, so a
-   * slow T3 does not delay the gateway's own tools. Without a valid credential
-   * the last known tools stay listed, so a call can explain how to renew it.
+   * The native tools to advertise. Only a cold start waits for T3. Otherwise
+   * the last known catalog is returned at once, even when it is stale or was
+   * read with an earlier token, and a refresh for the current token runs in the
+   * background, so a slow T3 does not delay the gateway's own tools. Without a
+   * valid credential the last known tools stay listed, so a call can explain
+   * how to renew it. A tool call still checks the current credential.
    */
   async snapshot(): Promise<NativeSnapshot> {
     const state = await this.credentials.read();
     if (state.state !== "valid") return failedSnapshot(this.catalog?.snapshot, credentialError(state));
     const tokenId = tokenIdentity(state.credential.accessToken);
-    const cached = this.catalog?.tokenId === tokenId ? this.catalog : null;
-    if (cached !== null && cached.expiresAt > Date.now()) return cached.snapshot;
-    // refreshCatalog never rejects, so an unawaited refresh cannot leave an unhandled rejection.
-    this.refreshing ??= this.refreshCatalog(state.credential, tokenId).finally(() => {
-      this.refreshing = null;
-    });
-    return cached?.snapshot ?? this.refreshing;
+    const known = this.catalog;
+    if (known?.tokenId === tokenId && known.expiresAt > Date.now()) return known.snapshot;
+    const refreshed = this.refresh(state.credential, tokenId);
+    return known?.snapshot ?? refreshed;
   }
 
   async callTool(name: string, args: Record<string, unknown>, mutating: boolean): Promise<CallToolResult> {
@@ -206,8 +212,28 @@ export class NativeMcpClient {
     return state.credential;
   }
 
-  /** Lists the native tools. Never rejects: a failure keeps the previous tools and sets `error`. */
-  private async refreshCatalog(credential: NativeCredential, tokenId: string): Promise<NativeSnapshot> {
+  /** Starts a catalog refresh for this token, or joins the one in progress for it. */
+  private refresh(credential: NativeCredential, tokenId: string): Promise<NativeSnapshot> {
+    if (this.refreshing?.tokenId === tokenId) return this.refreshing.snapshot;
+    const refresh: CatalogRefresh = {
+      tokenId,
+      // readCatalog never rejects, so an unawaited refresh cannot leave an unhandled rejection.
+      snapshot: this.readCatalog(credential).then((snapshot) => {
+        // A refresh for an earlier token that ends late must not replace the newer catalog.
+        if (this.refreshing === refresh) {
+          const ttl = snapshot.error === null ? CATALOG_TTL_MS : CATALOG_FAILURE_TTL_MS;
+          this.catalog = { snapshot, tokenId, expiresAt: Date.now() + ttl };
+          this.refreshing = null;
+        }
+        return snapshot;
+      }),
+    };
+    this.refreshing = refresh;
+    return refresh.snapshot;
+  }
+
+  /** Lists the native tools. Never rejects: a failure keeps the last known tools and sets `error`. */
+  private async readCatalog(credential: NativeCredential): Promise<NativeSnapshot> {
     let connection: Connection | null = null;
     try {
       connection = await this.connect(credential);
@@ -228,22 +254,18 @@ export class NativeMcpClient {
           }]
         : []);
       const offered = new Set<string>(tools.map((tool) => tool.name));
-      const snapshot: NativeSnapshot = {
+      return {
         tools,
         missing: NATIVE_TOOL_NAMES.filter((name) => !offered.has(name)),
         fetchedAt: new Date().toISOString(),
         error: null,
       };
-      this.catalog = { snapshot, tokenId, expiresAt: Date.now() + CATALOG_TTL_MS };
-      return snapshot;
     } catch (error) {
       await this.dropIfInvalid(connection, error);
       const failure = isCredentialRejection(error)
         ? credentialRejectedError()
         : new GatewayError("native_unavailable", `Native T3 tool catalog is unavailable: ${errorMessage(error)}`);
-      const snapshot = failedSnapshot(this.catalog?.tokenId === tokenId ? this.catalog.snapshot : undefined, failure);
-      this.catalog = { snapshot, tokenId, expiresAt: Date.now() + CATALOG_FAILURE_TTL_MS };
-      return snapshot;
+      return failedSnapshot(this.catalog?.snapshot, failure);
     }
   }
 
@@ -293,7 +315,7 @@ export class NativeMcpClient {
   private timeoutFor(name: string, args: Record<string, unknown>): number {
     const budget = args.timeoutMs;
     if (typeof budget === "number" && Number.isFinite(budget) && budget > 0) {
-      return Math.max(this.requestTimeoutMs, budget + WAIT_MARGIN_MS);
+      return Math.min(MAX_TIMER_MS, Math.max(this.requestTimeoutMs, budget + WAIT_MARGIN_MS));
     }
     return name === "t3_thread_wait" ? UNBOUNDED_WAIT_TIMEOUT_MS : this.requestTimeoutMs;
   }
