@@ -97,9 +97,9 @@ describe("read-only usage summary", () => {
     const wait = (index: number, outcome: string, result: Record<string, unknown>) =>
       event(index, { operation: "t3_thread_wait", event: "tool.result", outcome, details: { result } });
     const rows = [
-      event(0, { details: { arguments: { clientRequestId: "request-1" } } }),
+      event(0, { details: { arguments: { clientRequestId: "request-1", idempotencyKey: "key-0" }, native: true } }),
       event(1, { details: { arguments: { idempotencyKey: "key-1" } } }),
-      event(2, { operation: "t3_thread_launch", details: { arguments: {} } }),
+      event(2, { operation: "t3_thread_launch", details: { arguments: {}, native: true } }),
       wait(3, "completed", { timedOut: true, status: "running" }),
       wait(4, "completed", { timedOut: true, status: "idle" }),
       wait(5, "completed", { timedOut: false, status: "completed" }),

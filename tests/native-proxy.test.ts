@@ -145,13 +145,14 @@ describe("native T3 tool proxy", () => {
     expect(send?.inputSchema.required).toEqual(["threadId", "message"]);
   });
 
-  it("forwards calls and returns the upstream result unchanged, with a redacted audit trail", async () => {
+  it("forwards calls and returns the upstream result unchanged, with a redacted audit trail that marks native calls", async () => {
     const native = await startNative();
     const { gateway, store, directory } = await nativeGateway(native);
     await login(native, store);
     const client = await connect(gateway);
 
     const result = await client.callTool({ name: "t3_thread_send", arguments: { threadId: "thread-1", message: "secret steering text", mode: "steer" } });
+    await client.callTool({ name: "t3_audit_log", arguments: { limit: 1 } });
 
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toEqual({ threadId: "thread-1", runId: "run-1", status: "running" });
@@ -160,6 +161,13 @@ describe("native T3 tool proxy", () => {
     expect(audit).toContain('"operation":"mcp:t3_thread_send"');
     expect(audit).not.toContain("secret steering text");
     expect(audit).not.toContain(native.token);
+    const events = audit.trim().split("\n").map((line): unknown => JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({
+      event: "tool.call",
+      operation: "t3_thread_send",
+      details: { arguments: expect.objectContaining({ threadId: "thread-1", mode: "steer" }), native: true },
+    }));
+    expect(events).toContainEqual(expect.objectContaining({ event: "tool.call", operation: "t3_audit_log", details: { arguments: { limit: 1 } } }));
   });
 
   it("keeps only timedOut and status from a wait result in the audit trail", async () => {

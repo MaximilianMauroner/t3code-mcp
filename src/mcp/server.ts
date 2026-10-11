@@ -842,7 +842,7 @@ function registerNativeTool(server: McpServer, gateway: T3Gateway, tool: NativeT
     async (args) => auditedTool(gateway.audit, tool.name, args, async () => {
       const result = await gateway.callNative(tool.name, args);
       return { result, auditSummary: nativeAuditSummary(tool.name, result) };
-    }),
+    }, { native: true }),
   );
 }
 
@@ -905,15 +905,18 @@ async function runTool<T extends object>(
 }
 
 /**
- * Records one MCP tool call and its outcome. `auditSummary` lets proxied tools
- * log only the result shape: native results carry thread content under keys
- * the redactor does not know.
+ * Records one MCP tool call and its outcome. `callDetails` adds fields to the
+ * `tool.call` event: native tools add `native: true`, so the usage summary can
+ * tell them from gateway tools of the same name in older audit files.
+ * `auditSummary` lets proxied tools log only the result shape: native results
+ * carry thread content under keys the redactor does not know.
  */
 async function auditedTool(
   auditLog: AuditLog,
   toolName: string,
   input: unknown,
   operation: () => Promise<{ readonly result: CallToolResult; readonly auditSummary: unknown }>,
+  callDetails: Readonly<Record<string, unknown>> = {},
 ): Promise<CallToolResult> {
   const correlationId = `mcp_${randomUUID()}`;
   return withAuditContext(correlationId, toolName, async () => {
@@ -924,7 +927,7 @@ async function auditedTool(
       correlationId,
       operation: toolName,
       outcome: "started",
-      details: { arguments: summarizeForAudit(input) },
+      details: { arguments: summarizeForAudit(input), ...callDetails },
     });
     try {
       const { result, auditSummary } = await operation();

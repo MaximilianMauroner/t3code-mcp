@@ -49,10 +49,9 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
       if (event.event === "tool.call") {
         entry.calls += 1; toolCalls += 1;
         if (DISPATCH_TOOLS.has(event.operation ?? "")) dispatchCalls += 1;
-        const args = object(details.arguments);
-        if (acceptsModelSelection(event.operation ?? "", args)) {
+        if (acceptsModelSelection(event.operation ?? "", details)) {
           modelSelectionCalls += 1;
-          if (args.modelSelection == null) omittedModelSelection += 1;
+          if (object(details.arguments).modelSelection == null) omittedModelSelection += 1;
         }
       }
       if (event.event === "tool.result") {
@@ -130,12 +129,13 @@ function object(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 /**
- * Reports whether a call accepts `modelSelection`. The `t3_thread_send` of a
- * gateway before schema 10 accepted it and required `idempotencyKey`. Native
- * `t3_thread_send` has neither, and the audit keeps argument names.
+ * Reports whether a `tool.call` accepts `modelSelection`. From schema 10, every
+ * `t3_thread_send` row is a native call marked `native: true`, and native
+ * `t3_thread_send` does not accept `modelSelection`. A row without the mark
+ * comes from a gateway before schema 10, whose send accepted it.
  */
-function acceptsModelSelection(operation: string, args: Record<string, unknown>): boolean {
-  return MODEL_SELECTION_TOOLS.has(operation) || (operation === "t3_thread_send" && "idempotencyKey" in args);
+function acceptsModelSelection(operation: string, details: Record<string, unknown>): boolean {
+  return MODEL_SELECTION_TOOLS.has(operation) || (operation === "t3_thread_send" && details.native !== true);
 }
 function boundedKey(map: Map<string, unknown>, key: string): string {
   return map.has(key) || map.size < MAX_OPERATIONS - 1 ? key : "other";
