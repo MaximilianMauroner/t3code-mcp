@@ -24,8 +24,16 @@ export class FakeNativeMcp {
   expiresInSeconds = 30 * 24 * 3600;
   /** Destroy the socket instead of answering the next tools/call; the tool still runs. */
   dropNextToolResponse = false;
+  /** With `dropNextToolResponse`, also forget every MCP session, as a T3 restart does. */
+  restartOnDrop = false;
+  /** Leave every new /mcp request unanswered, as a hung T3 does. */
+  stallRequests = false;
+  /** /mcp requests refused because they did not carry `token`. */
+  unauthorizedRequests = 0;
   /** Fail the next upload with this HTTP status. */
   failNextUpload: number | null = null;
+  /** Answer the next upload with a 307 redirect to this URL. */
+  redirectNextUpload: string | null = null;
   private server: Server | null = null;
   private readonly sessions = new Map<string, StreamableHTTPServerTransport>();
   private readonly authorizations = new Map<string, { readonly challenge: string; readonly clientId: string; readonly scope: string }>();
@@ -95,12 +103,17 @@ export class FakeNativeMcp {
         response.writeHead(status).end("upload refused");
         return;
       }
+      if (this.redirectNextUpload !== null) {
+        response.writeHead(307, { location: this.redirectNextUpload }).end();
+        this.redirectNextUpload = null;
+        return;
+      }
       this.uploads.push({ path: url.pathname, contentType: request.headers["content-type"], bytes: body });
       response.writeHead(204).end();
       return;
     }
     if (url.pathname === "/mcp") {
-      await this.handleMcp(request, response, body);
+      if (!this.stallRequests) await this.handleMcp(request, response, body);
       return;
     }
     json(response, 404, { error: "not_found" });
@@ -138,6 +151,7 @@ export class FakeNativeMcp {
 
   private async handleMcp(request: IncomingMessage, response: ServerResponse, body: Buffer): Promise<void> {
     if (request.headers.authorization !== `Bearer ${this.token}`) {
+      this.unauthorizedRequests += 1;
       json(response, 401, { error: "invalid_mcp_credential" });
       return;
     }
@@ -160,10 +174,13 @@ export class FakeNativeMcp {
       transport = created;
     }
     if (this.dropNextToolResponse && isToolCall(parsed)) {
+      const restart = this.restartOnDrop;
       this.dropNextToolResponse = false;
+      this.restartOnDrop = false;
       // Let the tool run, then lose its answer.
       response.writeHead = () => response;
       response.end = () => {
+        if (restart) this.dropSessions();
         request.socket.destroy();
         return response;
       };
@@ -183,6 +200,17 @@ export class FakeNativeMcp {
       async (args) => {
         record("t3_thread_list", args);
         const value = { projectId: args.projectId, threads: [{ threadId: "thread-1", title: "Native thread" }] };
+        return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
+      },
+    );
+    server.registerTool(
+      "t3_thread_wait",
+      { description: "Wait for a run to end.", inputSchema: loose({ threadId: z.string(), timeoutMs: z.number().optional() }), annotations: { readOnlyHint: true } },
+      async (args) => {
+        record("t3_thread_wait", args);
+        // No run ends here, so every wait uses its whole budget.
+        await new Promise((resolve) => setTimeout(resolve, typeof args.timeoutMs === "number" ? args.timeoutMs : 0));
+        const value = { threadId: args.threadId, timedOut: true };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );

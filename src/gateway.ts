@@ -2049,8 +2049,10 @@ function partitionOperations(access: {
 }): { readonly callableOperations: string[]; readonly disabledOperations: DisabledOperation[] } {
   const callableOperations: string[] = [];
   const disabledOperations: DisabledOperation[] = [];
-  const offered = new Set<string>(access.native.snapshot?.tools.map((tool) => tool.name) ?? []);
-  const nativeUsable = access.native.status.credential === "valid" && access.native.snapshot?.error === null;
+  const credentialValid = access.native.status.credential === "valid";
+  // Without a valid credential the snapshot still lists the last known tools, but none of them can be called.
+  const offered = new Set<string>(credentialValid ? access.native.snapshot?.tools.map((tool) => tool.name) ?? [] : []);
+  const nativeUsable = credentialValid && access.native.snapshot?.error === null;
   const nativeReason = access.native.status.error ?? "Native T3 does not offer this tool.";
   for (const operation of [...GATEWAY_TOOL_NAMES, ...NATIVE_TOOL_NAMES]) {
     const nativeTool = isNativeToolName(operation);

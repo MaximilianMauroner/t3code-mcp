@@ -848,17 +848,19 @@ function registerNativeTool(server: McpServer, gateway: T3Gateway, tool: NativeT
 
 /**
  * Converts a native JSON Schema for advertisement and local shape checks.
- * Unknown keys pass through and T3 remains the authoritative validator; the
- * conversion drops a few keywords such as `format`.
+ * Unknown keys pass through unless the schema sets `additionalProperties:
+ * false`. The conversion drops a few keywords such as `format`, so T3 remains
+ * the authoritative validator.
  */
 function nativeInputSchema(schema: NativeTool["inputSchema"]): z.ZodObject {
   try {
     // MCP types nested schemas loosely as `object`; by protocol they are JSON Schema.
     const converted = z.fromJSONSchema(schema as z.core.JSONSchema.JSONSchema);
-    if (converted instanceof z.ZodObject) return converted.loose();
+    if (converted instanceof z.ZodObject) return converted;
   } catch {
-    // Fall through to an unconstrained object rather than hiding the tool.
+    // Fall through below rather than hiding the tool.
   }
+  // A schema that does not convert to an object accepts any arguments; T3 checks them.
   return z.looseObject({});
 }
 

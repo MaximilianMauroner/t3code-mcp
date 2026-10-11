@@ -37,7 +37,7 @@ A task can keep running in T3 after the client disconnects. Composite tasks star
 
 ## Native T3 tools
 
-T3 builds that serve MCP to outside clients at `/mcp` have their own orchestration tools. The gateway logs in to that endpoint once (see [native login](configuration.md#native-t3-login)) and forwards an allowlist of those tools under their native names, schemas, and results. The gateway does not reimplement them.
+T3 builds that serve MCP to outside clients at `/mcp` have their own orchestration tools. The gateway logs in to that endpoint once (see [native login](configuration.md#native-t3-login)) and forwards an allowlist of those tools under their native names and results. The gateway converts each tool's input schema before it advertises it, and T3 validates every call. The gateway does not reimplement the tools.
 
 | Group | Forwarded tools |
 | --- | --- |
@@ -52,16 +52,16 @@ T3 builds that serve MCP to outside clients at `/mcp` have their own orchestrati
 
 Tool schema version 10 removed the gateway tools that these native tools replace: `t3_projects_list`, `t3_project_create`, `t3_providers_list`, `t3_thread_get`, `t3_thread_messages`, `t3_thread_create`, `t3_thread_archive`, the snooze and settle tools, and the `t3_run_*` tools. `t3_thread_send` and `t3_thread_interrupt` are now the native tools of the same name. Clients that cache tool lists must refresh them; the `toolSchemaFingerprint` changes.
 
-The gateway lists a native tool only when the connected T3 build offers it. `t3_connection_status` reports the native credential, its expiry, and any allowlisted tools that T3 did not offer.
+The gateway lists a native tool only when the connected T3 build offers it. It keeps the tool list for one minute. After that it serves the kept list and refreshes it in the background, so a slow T3 does not delay the gateway's own tools. When the native credential expires, a running gateway continues to list the last tools it read, so a call to one of them returns the renewal command. The gateway does not store this list. After a restart with an expired credential, it lists no native tools. `t3_connection_status` and `doctor` report the expiry and the renewal command. `t3_connection_status` also reports the native credential, its expiry, and any allowlisted tools that T3 did not offer.
 
 The gateway applies its own policy before it forwards a call:
 
 - `MCP_READ_ONLY=true` blocks every native tool that changes state, with `gateway_read_only`. The gateway decides which tools change state; it does not trust T3's tool annotations.
 - A native login approved as `read-only` blocks the same tools with `t3_scope_required`.
-- A missing or expired native credential returns `native_credential_missing` or `native_credential_expired` and names the command that renews it.
+- A call to a listed native tool with a missing, expired, or refused native credential returns `native_credential_missing`, `native_credential_expired`, or `native_credential_rejected` and names the command that renews it.
 - The audit trail records each native call with redacted arguments and only the shape of the result.
 
-The gateway sends a call that changes state at most once. If T3 forgot the MCP session or refused the connection, nothing ran, and the gateway resends once. If the connection failed after T3 received the call, the gateway returns `native_outcome_unknown`. Read state before you retry. Tools that accept `clientRequestId` make a retry with the same value safe. A read is retried once.
+The gateway sends a call that changes state at most once. If T3 forgot the MCP session or refused the connection, nothing ran, and the gateway sends the call again. If the connection failed after T3 received the call, the gateway returns `native_outcome_unknown`. Read state before you retry. Tools that accept `clientRequestId` make a retry with the same value safe. A read whose result was lost is sent again once. When T3 forgot the session, the gateway opens a new connection and can try once more, with at most three attempts in total. A timeout or a lost response on one call does not stop other calls in progress. A forgotten session or a refused token closes the shared connection, and calls in progress on it fail.
 
 These native tools are not forwarded:
 
@@ -172,7 +172,7 @@ A gateway mutation can return `accepted`, `rejected`, or `uncertain`. Accepted m
 
 Preserve `T3_MCP_DATA_DIR` across gateway restarts. Run one gateway process per journal directory; the JSON journal is not a shared database for multiple active gateway processes. Reconnecting MCP clients use that same gateway and journal.
 
-*`t3_thread_wait`* waits in T3 until the thread's run reaches a terminal state or its `timeoutMs` budget ends. A timeout does not cancel the run; call again. The gateway allows the upstream request 15 seconds more than `timeoutMs`, and 15 minutes when `timeoutMs` is omitted.
+*`t3_thread_wait`* waits in T3 until the thread's run reaches a terminal state or its `timeoutMs` budget ends. A timeout does not cancel the run; call again. The gateway allows the upstream request 15 seconds more than `timeoutMs`. T3 waits up to 10 minutes when `timeoutMs` is omitted, and up to 60 minutes when it is `"Infinity"`. Without a finite budget, the gateway allows 60 minutes and 15 seconds.
 
 ## Current limits
 

@@ -3,13 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GatewayConfig } from "../src/config.js";
 import { GATEWAY_TOOL_NAMES } from "../src/contract.js";
 import { makeGateway, type T3Gateway } from "../src/gateway.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { loginNative, parseNativeLoginArgs } from "../src/native-login.js";
+import { AuditLog } from "../src/operations/audit-log.js";
 import { NativeCredentialStore, type NativeCredential } from "../src/t3/native-credential.js";
+import { NativeMcpClient } from "../src/t3/native-mcp.js";
 import { FakeNativeMcp } from "./support/fake-native-mcp.js";
 import { FakeT3 } from "./support/fake-t3.js";
 import { gatewayFixture } from "./support/gateway-fixture.js";
@@ -192,6 +194,71 @@ describe("native T3 tool proxy", () => {
     expect(native.calls).toEqual([]);
   });
 
+  it("keeps native tools listed after the credential expires, so a call explains how to renew it", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    const credential = await login(native, store);
+    await gateway.nativeSnapshot();
+    await store.write({ ...credential, expiresAt: new Date(Date.now() - 1000).toISOString() });
+
+    const result = await (await connect(gateway)).callTool({ name: "t3_thread_send", arguments: { threadId: "thread-1", message: "go" } });
+
+    expect(errorCode(result)).toBe("native_credential_expired");
+    expect(native.calls).toEqual([]);
+  });
+
+  it("reports a token that T3 refuses at connect as a rejected credential, without a retry", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+    native.token = "native-token-revoked";
+
+    await expect(gateway.callNative("t3_thread_list", { projectId: "project-1" })).rejects.toMatchObject({
+      code: "native_credential_rejected",
+      message: expect.stringContaining("native-login"),
+    });
+    expect(native.unauthorizedRequests).toBe(1);
+    expect((await gateway.nativeSnapshot())?.error?.code).toBe("native_credential_rejected");
+    expect(native.calls).toEqual([]);
+  });
+
+  it("serves a stale tool catalog at once while T3 does not answer", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+    const fresh = await gateway.nativeSnapshot();
+
+    native.stallRequests = true;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    cleanups.push(async () => {
+      vi.useRealTimers();
+    });
+    vi.setSystemTime(Date.now() + 61_000);
+    const started = performance.now();
+    const stale = await gateway.nativeSnapshot();
+
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(stale?.tools.length).toBeGreaterThan(0);
+    expect(stale?.tools).toEqual(fresh?.tools);
+  });
+
+  it("keeps the shared session open when one call times out, so a concurrent call runs once", async () => {
+    const native = await startNative();
+    const { store, directory } = await nativeGateway(native);
+    await login(native, store);
+    // A 100 ms request timeout. A wait gets its own budget plus a margin instead.
+    const client = new NativeMcpClient(native.mcpUrl, store, new AuditLog(join(directory, "audit.jsonl")), 100);
+    cleanups.push(() => client.close());
+
+    const wait = client.callTool("t3_thread_wait", { threadId: "thread-1", timeoutMs: 500 }, false);
+    await vi.waitFor(() => expect(native.calls).toHaveLength(1));
+    native.stallRequests = true;
+    await expect(client.callTool("t3_thread_list", { projectId: "project-1" }, false)).rejects.toMatchObject({ code: "native_unavailable" });
+
+    expect((await wait).structuredContent).toEqual({ threadId: "thread-1", timedOut: true });
+    expect(native.calls.map((call) => call.name)).toEqual(["t3_thread_wait"]);
+  });
+
   it("resends once after T3 forgets the MCP session, because nothing ran", async () => {
     const native = await startNative();
     const { gateway, store } = await nativeGateway(native);
@@ -218,6 +285,52 @@ describe("native T3 tool proxy", () => {
     const read = await gateway.callNative("t3_thread_list", { projectId: "project-1" });
     expect(read.isError).toBeFalsy();
     expect(native.calls.filter((call) => call.name === "t3_thread_list")).toHaveLength(2);
+  });
+
+  it("retries a read on a fresh connection when T3 restarts after losing its response", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+
+    native.dropNextToolResponse = true;
+    native.restartOnDrop = true;
+    const read = await gateway.callNative("t3_thread_list", { projectId: "project-1" });
+
+    expect(read.isError).toBeFalsy();
+    // The first attempt ran, the retry met the forgotten session, and the third attempt ran.
+    expect(native.calls.filter((call) => call.name === "t3_thread_list")).toHaveLength(2);
+  });
+
+  it("never replays a mutation whose response T3 lost in a restart", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+
+    native.dropNextToolResponse = true;
+    native.restartOnDrop = true;
+    await expect(gateway.callNative("t3_thread_send", { threadId: "thread-1", message: "go" })).rejects.toMatchObject({ code: "native_outcome_unknown" });
+
+    expect(native.calls.filter((call) => call.name === "t3_thread_send")).toHaveLength(1);
+    expect((await gateway.callNative("t3_thread_list", { projectId: "project-1" })).isError).toBeFalsy();
+  });
+
+  it("reports every native tool as unavailable after the credential expires", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    const credential = await login(native, store);
+    await gateway.nativeSnapshot();
+    await store.write({ ...credential, expiresAt: new Date(Date.now() - 1000).toISOString() });
+
+    const status = await gateway.connectionStatus();
+
+    for (const operation of ["t3_thread_list", "t3_thread_send"]) {
+      expect(status.callableOperations).not.toContain(operation);
+      expect(status.disabledOperations).toContainEqual({
+        operation,
+        reasonCode: "native_unavailable",
+        reason: expect.stringContaining("native-login"),
+      });
+    }
   });
 });
 
@@ -251,6 +364,18 @@ describe("native-backed gateway tools", () => {
     await expect(gateway.attachmentUpload({ name: "x.txt", mimeType: "text/plain", dataBase64: "not base64!" }))
       .rejects.toMatchObject({ code: "invalid_attachment" });
     expect(native.calls).toHaveLength(2);
+  });
+
+  it("does not follow a redirect on the byte upload", async () => {
+    const native = await startNative();
+    const elsewhere = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+
+    native.redirectNextUpload = `${elsewhere.baseUrl}/api/attachments/upload/elsewhere`;
+    await expect(gateway.attachmentUpload({ name: "notes.txt", mimeType: "text/plain", dataBase64: Buffer.from("hi").toString("base64") }))
+      .rejects.toMatchObject({ code: "native_upload_failed" });
+    expect(elsewhere.uploads).toEqual([]);
   });
 
   async function taskGateway(native: FakeNativeMcp, options: ConstructorParameters<typeof FakeT3>[0] = {}) {

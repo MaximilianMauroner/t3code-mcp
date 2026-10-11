@@ -35,15 +35,20 @@ const CATALOG_TTL_MS = 60_000;
 const CATALOG_FAILURE_TTL_MS = 10_000;
 const CATALOG_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 120_000;
-// A wait without a finite budget would otherwise hit the request timeout and
-// look like a lost result.
-const UNBOUNDED_WAIT_TIMEOUT_MS = 15 * 60_000;
 const WAIT_MARGIN_MS = 15_000;
+// T3 waits up to 10 minutes when `timeoutMs` is omitted and up to 60 minutes
+// when it is "Infinity". A shorter request timeout would end the wait early and
+// look like a lost result.
+const UNBOUNDED_WAIT_TIMEOUT_MS = 60 * 60_000 + WAIT_MARGIN_MS;
+// The first try, one retry, and one more try on a fresh connection when T3 forgot the session.
+const MAX_ATTEMPTS = 3;
 
 /**
  * An MCP client for T3's own `/mcp` endpoint. One connection is shared by every
- * gateway request and is rebuilt when the stored credential changes. A
- * mutation is never sent twice unless the upstream provably did not process it.
+ * gateway request. It is rebuilt when the stored credential changes, or when T3
+ * forgets its session or refuses its token. A failed call does not close it, so
+ * other calls in progress are not affected. A mutation is never sent twice
+ * unless the upstream provably did not process it.
  */
 export class NativeMcpClient {
   private connection: Connection | null = null;
@@ -62,20 +67,23 @@ export class NativeMcpClient {
     return this.credentials.read();
   }
 
+  /**
+   * The native tools to advertise. A cached catalog for the current token is
+   * returned at once, even when stale, and refreshed in the background, so a
+   * slow T3 does not delay the gateway's own tools. Without a valid credential
+   * the last known tools stay listed, so a call can explain how to renew it.
+   */
   async snapshot(): Promise<NativeSnapshot> {
     const state = await this.credentials.read();
-    if (state.state !== "valid") {
-      const error = credentialError(state);
-      return { tools: [], missing: [...NATIVE_TOOL_NAMES], fetchedAt: null, error: { code: error.code, message: error.message } };
-    }
+    if (state.state !== "valid") return failedSnapshot(this.catalog?.snapshot, credentialError(state));
     const tokenId = tokenIdentity(state.credential.accessToken);
-    if (this.catalog !== null && this.catalog.tokenId === tokenId && this.catalog.expiresAt > Date.now()) {
-      return this.catalog.snapshot;
-    }
-    this.refreshing ??= this.refreshCatalog(state.credential).finally(() => {
+    const cached = this.catalog?.tokenId === tokenId ? this.catalog : null;
+    if (cached !== null && cached.expiresAt > Date.now()) return cached.snapshot;
+    // refreshCatalog never rejects, so an unawaited refresh cannot leave an unhandled rejection.
+    this.refreshing ??= this.refreshCatalog(state.credential, tokenId).finally(() => {
       this.refreshing = null;
     });
-    return this.refreshing;
+    return cached?.snapshot ?? this.refreshing;
   }
 
   async callTool(name: string, args: Record<string, unknown>, mutating: boolean): Promise<CallToolResult> {
@@ -91,10 +99,9 @@ export class NativeMcpClient {
         outcome: "started",
         details: { attempt, arguments: summarizeForAudit(args) },
       });
-      let sent = false;
+      let connection: Connection | null = null;
       try {
-        const connection = await this.connect(credential);
-        sent = true;
+        connection = await this.connect(credential);
         const result = await connection.client.request(
           { method: "tools/call", params: { name, arguments: args } },
           CallToolResultSchema,
@@ -111,7 +118,7 @@ export class NativeMcpClient {
         });
         return result;
       } catch (error) {
-        const failure = classifyFailure(error, sent);
+        const failure = classifyFailure(error, connection !== null);
         await this.auditLog.record({
           source: "t3",
           event: "upstream.response",
@@ -121,18 +128,16 @@ export class NativeMcpClient {
           durationMs: Date.now() - startedAt,
           details: { attempt, failure, error: errorMessage(error) },
         });
+        const dropped = await this.dropIfInvalid(connection, error);
         if (failure === "rejected") {
           throw new GatewayError("native_rejected", `Native T3 rejected ${name}: ${errorMessage(error)}`);
         }
-        await this.reset();
-        if (failure === "unauthorized") {
-          throw new GatewayError(
-            "native_credential_rejected",
-            "Native T3 rejected the stored MCP credential. Run `t3-code-mcp native-login` with a new pairing code.",
-          );
-        }
+        if (failure === "unauthorized") throw credentialRejectedError();
         const processed = failure === "unknown";
-        if (attempt === 1 && (!processed || !mutating)) continue;
+        // Here `dropped` means T3 forgot the session: nothing ran, and the next
+        // attempt opens a fresh connection, so it may follow even the retry.
+        const retry = attempt === 1 ? !processed || !mutating : dropped && attempt < MAX_ATTEMPTS;
+        if (retry) continue;
         if (processed && mutating) {
           throw new GatewayError(
             "native_outcome_unknown",
@@ -168,6 +173,8 @@ export class NativeMcpClient {
         method: "POST",
         headers: { "content-type": mimeType, "content-length": String(bytes.byteLength) },
         body: bytes,
+        // A redirect could send the bytes past the origin check above.
+        redirect: "error",
         signal: AbortSignal.timeout(this.requestTimeoutMs),
       });
       status = response.status;
@@ -190,7 +197,7 @@ export class NativeMcpClient {
   }
 
   async close(): Promise<void> {
-    await this.reset();
+    if (this.connection !== null) await this.discard(this.connection);
   }
 
   private async requireCredential(): Promise<NativeCredential> {
@@ -199,10 +206,11 @@ export class NativeMcpClient {
     return state.credential;
   }
 
-  private async refreshCatalog(credential: NativeCredential): Promise<NativeSnapshot> {
-    const tokenId = tokenIdentity(credential.accessToken);
+  /** Lists the native tools. Never rejects: a failure keeps the previous tools and sets `error`. */
+  private async refreshCatalog(credential: NativeCredential, tokenId: string): Promise<NativeSnapshot> {
+    let connection: Connection | null = null;
     try {
-      const connection = await this.connect(credential);
+      connection = await this.connect(credential);
       const listed: Tool[] = [];
       let cursor: string | undefined;
       do {
@@ -229,14 +237,11 @@ export class NativeMcpClient {
       this.catalog = { snapshot, tokenId, expiresAt: Date.now() + CATALOG_TTL_MS };
       return snapshot;
     } catch (error) {
-      await this.reset();
-      const previous = this.catalog?.tokenId === tokenId ? this.catalog.snapshot : null;
-      const snapshot: NativeSnapshot = {
-        tools: previous?.tools ?? [],
-        missing: previous?.missing ?? [...NATIVE_TOOL_NAMES],
-        fetchedAt: previous?.fetchedAt ?? null,
-        error: { code: "native_unavailable", message: `Native T3 tool catalog is unavailable: ${errorMessage(error)}` },
-      };
+      await this.dropIfInvalid(connection, error);
+      const failure = isCredentialRejection(error)
+        ? credentialRejectedError()
+        : new GatewayError("native_unavailable", `Native T3 tool catalog is unavailable: ${errorMessage(error)}`);
+      const snapshot = failedSnapshot(this.catalog?.tokenId === tokenId ? this.catalog.snapshot : undefined, failure);
       this.catalog = { snapshot, tokenId, expiresAt: Date.now() + CATALOG_FAILURE_TTL_MS };
       return snapshot;
     }
@@ -245,7 +250,7 @@ export class NativeMcpClient {
   private async connect(credential: NativeCredential): Promise<Connection> {
     const tokenId = tokenIdentity(credential.accessToken);
     if (this.connection?.tokenId === tokenId) return this.connection;
-    if (this.connection !== null) await this.reset();
+    if (this.connection !== null) await this.discard(this.connection);
     this.connecting ??= this.open(credential.accessToken, tokenId).finally(() => {
       this.connecting = null;
     });
@@ -264,10 +269,25 @@ export class NativeMcpClient {
     return this.connection;
   }
 
-  private async reset(): Promise<void> {
-    const connection = this.connection;
-    this.connection = null;
-    await connection?.client.close().catch(() => undefined);
+  /**
+   * Closes the connection when T3 forgot its session (HTTP 404) or refuses its
+   * token (401 or 403), and reports whether it did. Other failures leave it
+   * open, because other calls can still be in progress on it.
+   */
+  private async dropIfInvalid(connection: Connection | null, error: unknown): Promise<boolean> {
+    if (connection === null || !invalidatesConnection(error)) return false;
+    await this.discard(connection);
+    return true;
+  }
+
+  /**
+   * Closes one connection, which fails every call still in progress on it. A
+   * concurrent failure can name a connection that was already replaced; the
+   * replacement stays open.
+   */
+  private async discard(connection: Connection): Promise<void> {
+    if (this.connection === connection) this.connection = null;
+    await connection.client.close().catch(() => undefined);
   }
 
   private timeoutFor(name: string, args: Record<string, unknown>): number {
@@ -281,6 +301,7 @@ export class NativeMcpClient {
 
 /**
  * `rejected`: upstream answered with a protocol error, so nothing ran.
+ * `unauthorized`: T3 refused the token (HTTP 401 or 403), so nothing ran.
  * `unprocessed`: the request provably never reached a tool (no connection, or
  * an unknown MCP session after a T3 restart), so it is safe to send again.
  * `unknown`: the request may have run.
@@ -288,21 +309,37 @@ export class NativeMcpClient {
 type Failure = "rejected" | "unauthorized" | "unprocessed" | "unknown";
 
 function classifyFailure(error: unknown, sent: boolean): Failure {
+  // T3 refuses a revoked token already at `initialize`, before the call is sent.
+  if (isCredentialRejection(error)) return "unauthorized";
   if (!sent) return "unprocessed";
-  if (error instanceof StreamableHTTPError) {
-    if (error.code === 401 || error.code === 403) return "unauthorized";
-    if (error.code === 404) return "unprocessed";
-    return "unknown";
-  }
+  if (error instanceof StreamableHTTPError) return error.code === 404 ? "unprocessed" : "unknown";
   if (error instanceof McpError) {
     return error.code === ErrorCode.RequestTimeout || error.code === ErrorCode.ConnectionClosed ? "unknown" : "rejected";
   }
   return isConnectionRefused(error) ? "unprocessed" : "unknown";
 }
 
+function isCredentialRejection(error: unknown): boolean {
+  return error instanceof StreamableHTTPError && (error.code === 401 || error.code === 403);
+}
+
+/** True when T3 forgot the MCP session (404) or refuses its token, so the connection cannot be used again. */
+function invalidatesConnection(error: unknown): boolean {
+  return isCredentialRejection(error) || (error instanceof StreamableHTTPError && error.code === 404);
+}
+
 function isConnectionRefused(error: unknown): boolean {
   const cause = error instanceof Error ? error.cause : undefined;
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ECONNREFUSED";
+}
+
+function failedSnapshot(previous: NativeSnapshot | undefined, error: GatewayError): NativeSnapshot {
+  return {
+    tools: previous?.tools ?? [],
+    missing: previous?.missing ?? [...NATIVE_TOOL_NAMES],
+    fetchedAt: previous?.fetchedAt ?? null,
+    error: { code: error.code, message: error.message },
+  };
 }
 
 function credentialError(state: Exclude<NativeCredentialState, { readonly state: "valid" }>): GatewayError {
@@ -312,6 +349,13 @@ function credentialError(state: Exclude<NativeCredentialState, { readonly state:
         "native_credential_expired",
         `The native MCP credential expired at ${state.credential.expiresAt}. Run \`t3-code-mcp native-login\` with a new pairing code.`,
       );
+}
+
+function credentialRejectedError(): GatewayError {
+  return new GatewayError(
+    "native_credential_rejected",
+    "Native T3 rejected the stored MCP credential. Run `t3-code-mcp native-login` with a new pairing code.",
+  );
 }
 
 function errorMessage(error: unknown): string {
