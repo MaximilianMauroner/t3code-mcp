@@ -162,6 +162,22 @@ describe("native T3 tool proxy", () => {
     expect(audit).not.toContain(native.token);
   });
 
+  it("keeps only timedOut and status from a wait result in the audit trail", async () => {
+    const native = await startNative();
+    const { gateway, store, directory } = await nativeGateway(native);
+    await login(native, store);
+
+    await (await connect(gateway)).callTool({ name: "t3_thread_wait", arguments: { threadId: "thread-1", timeoutMs: 1 } });
+
+    const events = (await readFile(join(directory, "audit.jsonl"), "utf8")).trim().split("\n").map((line): unknown => JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({
+      source: "mcp",
+      event: "tool.result",
+      operation: "t3_thread_wait",
+      details: { result: { isError: false, keys: ["threadId", "runId", "status", "timedOut"], status: "running", timedOut: true } },
+    }));
+  });
+
   it("enforces gateway read-only mode before anything reaches T3", async () => {
     const native = await startNative();
     const { gateway, store } = await nativeGateway(native, { readOnly: true });
@@ -197,6 +213,57 @@ describe("native T3 tool proxy", () => {
 
     expect(result.isError).toBeFalsy();
     expect(native.calls).toHaveLength(2);
+  });
+
+  /** A new login while T3 keeps the earlier session, as T3 does until that session expires or is revoked. */
+  async function renewKeepingOldSession(native: FakeNativeMcp, store: NativeCredentialStore): Promise<void> {
+    native.acceptedTokens = [native.token];
+    native.token = "native-token-2";
+    await login(native, store);
+  }
+
+  it("lets a wait in progress finish on the old connection after a renewal, and then closes it", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+    const closes = vi.spyOn(Client.prototype, "close");
+    cleanups.push(async () => {
+      closes.mockRestore();
+    });
+
+    native.holdToolCalls = "t3_thread_wait";
+    // Settled at once, so a failure shows in an assertion and not as an unhandled rejection.
+    const wait = gateway.callNative("t3_thread_wait", { threadId: "thread-1" }).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(native.heldToolCallCount).toBe(1));
+    await renewKeepingOldSession(native, store);
+    const list = await gateway.callNative("t3_thread_list", { projectId: "project-1" });
+    const closesWhileWaiting = closes.mock.calls.length;
+    native.holdToolCalls = null;
+    native.releaseToolCalls();
+
+    expect(await wait).toEqual(expect.objectContaining({ structuredContent: { threadId: "thread-1", runId: "run-1", status: "running", timedOut: true } }));
+    expect(list.isError).toBeFalsy();
+    expect(native.calls.map((call) => call.name)).toEqual(["t3_thread_wait", "t3_thread_list"]);
+    expect(native.toolCallTokens).toEqual(["native-token-1", "native-token-2"]);
+    expect(closesWhileWaiting).toBe(0);
+    expect(closes).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the result of a send in progress after a renewal instead of an unknown outcome", async () => {
+    const native = await startNative();
+    const { gateway, store } = await nativeGateway(native);
+    await login(native, store);
+
+    native.holdToolCalls = "t3_thread_send";
+    const send = gateway.callNative("t3_thread_send", { threadId: "thread-1", message: "go" }).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(native.heldToolCallCount).toBe(1));
+    await renewKeepingOldSession(native, store);
+    await gateway.callNative("t3_thread_list", { projectId: "project-1" });
+    native.holdToolCalls = null;
+    native.releaseToolCalls();
+
+    expect(await send).toEqual(expect.objectContaining({ structuredContent: { threadId: "thread-1", runId: "run-1", status: "queued" } }));
+    expect(native.calls.filter((call) => call.name === "t3_thread_send")).toHaveLength(1);
   });
 
   it("explains how to renew a missing or expired credential without calling T3", async () => {
@@ -364,7 +431,7 @@ describe("native T3 tool proxy", () => {
     native.stallRequests = true;
     await expect(client.callTool("t3_thread_list", { projectId: "project-1" }, false)).rejects.toMatchObject({ code: "native_unavailable" });
 
-    expect((await wait).structuredContent).toEqual({ threadId: "thread-1", timedOut: true });
+    expect((await wait).structuredContent).toEqual({ threadId: "thread-1", runId: "run-1", status: "running", timedOut: true });
     expect(native.calls.map((call) => call.name)).toEqual(["t3_thread_wait"]);
   });
 
@@ -377,7 +444,7 @@ describe("native T3 tool proxy", () => {
     // The budget plus the margin is above the largest timer that Node supports.
     const result = await gateway.callNative("t3_thread_wait", { threadId: "thread-1", timeoutMs: 2_200_000_000 });
 
-    expect(result.structuredContent).toEqual({ threadId: "thread-1", timedOut: false });
+    expect(result.structuredContent).toEqual({ threadId: "thread-1", runId: "run-1", status: "completed", timedOut: false });
     expect(native.calls.map((call) => call.name)).toEqual(["t3_thread_wait"]);
   });
 

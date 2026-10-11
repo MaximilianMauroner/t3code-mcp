@@ -18,8 +18,12 @@ export class FakeNativeMcp {
   readonly calls: NativeToolCall[] = [];
   readonly uploads: Array<{ readonly path: string; readonly contentType: string | undefined; readonly bytes: Buffer }> = [];
   readonly decisions: Array<{ readonly access: unknown; readonly code: unknown }> = [];
-  /** The bearer token /mcp accepts. Rotating it simulates a new login. */
+  /** The bearer token that /mcp accepts and a login issues. Rotating it simulates a new login. */
   token = "native-token-1";
+  /** Earlier tokens that /mcp still accepts, as T3 keeps an old session after a new login. */
+  acceptedTokens: ReadonlyArray<string> = [];
+  /** The bearer token of each tools/call request, in order. */
+  readonly toolCallTokens: string[] = [];
   pairingCode = "PAIR-1234";
   expiresInSeconds = 30 * 24 * 3600;
   /** Destroy the socket instead of answering the next tools/call; the tool still runs. */
@@ -32,6 +36,8 @@ export class FakeNativeMcp {
   runEndsAfterMs: number | null = null;
   /** Hold each authorized tools/list request until `releaseToolLists` is called. */
   holdToolLists = false;
+  /** Hold each call to this tool after it is recorded, until `releaseToolCalls` is called. */
+  holdToolCalls: string | null = null;
   /** Tools that new sessions do not offer, as in an older T3 build. */
   omitTools: ReadonlyArray<string> = [];
   /** /mcp requests refused because they did not carry `token`. */
@@ -43,6 +49,7 @@ export class FakeNativeMcp {
   private server: Server | null = null;
   private readonly sessions = new Map<string, StreamableHTTPServerTransport>();
   private readonly heldToolLists: Array<() => void> = [];
+  private readonly heldToolCalls: Array<() => void> = [];
   private readonly authorizations = new Map<string, { readonly challenge: string; readonly clientId: string; readonly scope: string }>();
 
   get baseUrl(): string {
@@ -77,6 +84,16 @@ export class FakeNativeMcp {
   /** Answer every held tools/list request. */
   releaseToolLists(): void {
     for (const release of this.heldToolLists.splice(0)) release();
+  }
+
+  /** Tool calls that `holdToolCalls` holds. */
+  get heldToolCallCount(): number {
+    return this.heldToolCalls.length;
+  }
+
+  /** Let every held tool call finish. */
+  releaseToolCalls(): void {
+    for (const release of this.heldToolCalls.splice(0)) release();
   }
 
   async close(): Promise<void> {
@@ -167,12 +184,14 @@ export class FakeNativeMcp {
   }
 
   private async handleMcp(request: IncomingMessage, response: ServerResponse, body: Buffer): Promise<void> {
-    if (request.headers.authorization !== `Bearer ${this.token}`) {
+    const token = [this.token, ...this.acceptedTokens].find((accepted) => request.headers.authorization === `Bearer ${accepted}`);
+    if (token === undefined) {
       this.unauthorizedRequests += 1;
       json(response, 401, { error: "invalid_mcp_credential" });
       return;
     }
     const parsed: unknown = body.length === 0 ? undefined : JSON.parse(body.toString("utf8"));
+    if (isRequest(parsed, "tools/call")) this.toolCallTokens.push(token);
     const sessionId = request.headers["mcp-session-id"];
     let transport = typeof sessionId === "string" ? this.sessions.get(sessionId) : undefined;
     if (transport === undefined) {
@@ -210,8 +229,9 @@ export class FakeNativeMcp {
 
   private mcpServer(): McpServer {
     const server = new McpServer({ name: "Fake T3 Code", version: "0.0.0-test" });
-    const record = (name: string, args: Record<string, unknown>) => {
+    const record = async (name: string, args: Record<string, unknown>): Promise<void> => {
       this.calls.push({ name, arguments: args });
+      if (this.holdToolCalls === name) await new Promise<void>((resolve) => this.heldToolCalls.push(resolve));
     };
     const loose = (shape: z.ZodRawShape) => z.looseObject(shape);
     const register: McpServer["registerTool"] = (name, config, callback) => {
@@ -223,7 +243,7 @@ export class FakeNativeMcp {
       "t3_thread_list",
       { description: "List threads in a project.", inputSchema: loose({ projectId: z.string(), limit: z.number().int().min(1).max(100).optional() }), annotations: { readOnlyHint: true } },
       async (args) => {
-        record("t3_thread_list", args);
+        await record("t3_thread_list", args);
         const value = { projectId: args.projectId, threads: [{ threadId: "thread-1", title: "Native thread" }] };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
@@ -232,10 +252,11 @@ export class FakeNativeMcp {
       "t3_thread_wait",
       { description: "Wait for a run to end.", inputSchema: loose({ threadId: z.string(), timeoutMs: z.number().optional() }), annotations: { readOnlyHint: true } },
       async (args) => {
-        record("t3_thread_wait", args);
+        await record("t3_thread_wait", args);
         const endsAfterMs = this.runEndsAfterMs;
         await new Promise((resolve) => setTimeout(resolve, endsAfterMs ?? (typeof args.timeoutMs === "number" ? args.timeoutMs : 0)));
-        const value = { threadId: args.threadId, timedOut: endsAfterMs === null };
+        const ended = endsAfterMs !== null;
+        const value = { threadId: args.threadId, runId: "run-1", status: ended ? "completed" : "running", timedOut: !ended };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
     );
@@ -248,7 +269,7 @@ export class FakeNativeMcp {
         annotations: { readOnlyHint: true },
       },
       async (args) => {
-        record("t3_thread_send", args);
+        await record("t3_thread_send", args);
         const value = { threadId: args.threadId, runId: "run-1", status: args.mode === "steer" ? "running" : "queued" };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
@@ -257,7 +278,7 @@ export class FakeNativeMcp {
       "t3_thread_interrupt",
       { description: "Interrupt a run.", inputSchema: loose({ threadId: z.string(), runId: z.string().nullable().optional() }) },
       async (args) => {
-        record("t3_thread_interrupt", args);
+        await record("t3_thread_interrupt", args);
         const value = { threadId: args.threadId, runId: args.runId ?? null, status: "interrupt_requested" };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
@@ -266,7 +287,7 @@ export class FakeNativeMcp {
       "t3_attachment_prepare_upload",
       { description: "Prepare an upload.", inputSchema: loose({ upload: z.looseObject({ type: z.string(), name: z.string(), mimeType: z.string(), sizeBytes: z.number() }) }) },
       async (args) => {
-        record("t3_attachment_prepare_upload", args);
+        await record("t3_attachment_prepare_upload", args);
         const value = { attachmentId: "attachment-1", relativeUrl: "/api/attachments/upload/signed-token", expiresAt: Date.now() + 60_000 };
         return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value };
       },
@@ -275,7 +296,7 @@ export class FakeNativeMcp {
       "t3_attachment_discard",
       { description: "Discard an upload.", inputSchema: loose({ attachmentId: z.string() }) },
       async (args) => {
-        record("t3_attachment_discard", args);
+        await record("t3_attachment_discard", args);
         return { content: [{ type: "text", text: "{}" }], structuredContent: {} };
       },
     );
@@ -283,7 +304,7 @@ export class FakeNativeMcp {
       "delegate_task",
       { description: "Needs a calling thread.", inputSchema: loose({ task: z.string() }) },
       async (args) => {
-        record("delegate_task", args);
+        await record("delegate_task", args);
         return { content: [{ type: "text", text: "unexpected" }], isError: true };
       },
     );

@@ -10,6 +10,13 @@ interface Latency {
 const LATENCY_BOUNDS = [1, 5, 10, 50, 100, 500, 1_000, 5_000, 10_000, 30_000, 60_000, Infinity];
 const MAX_TRACKED_THREADS = 10_000;
 const MAX_OPERATIONS = 1_000;
+// t3_thread_create, t3_run_wait and t3_thread_get were removed in schema 10.
+// They stay below so that audit files from older gateways still summarize.
+const DISPATCH_TOOLS = new Set(["t3_task_start", "t3_thread_launch", "t3_thread_create", "t3_thread_send"]);
+/** Dispatch tools that accept `modelSelection`. Native `t3_thread_send` does not. */
+const MODEL_SELECTION_TOOLS = new Set(["t3_task_start", "t3_thread_launch", "t3_thread_create"]);
+/** Native `t3_thread_wait` statuses of a run that is still active. */
+const ACTIVE_RUN_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 
 /** Fixed-cardinality aggregation; no prompt text or per-call history is retained. */
 export async function summarizeUsage(filePath: string, window: { since?: string; until?: string }) {
@@ -41,12 +48,8 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
       const entry = tools.get(name) ?? { calls: 0, completed: 0, errors: 0, latency: newLatency() };
       if (event.event === "tool.call") {
         entry.calls += 1; toolCalls += 1;
-        // t3_thread_create, t3_run_wait and t3_thread_get below were removed in
-        // schema 10; they stay so audit files from older gateways still summarize.
-        if (["t3_task_start", "t3_thread_launch", "t3_thread_create", "t3_thread_send"].includes(event.operation ?? "")) {
-          dispatchCalls += 1;
-          if (object(details.arguments).modelSelection == null) omittedModelSelection += 1;
-        }
+        if (DISPATCH_TOOLS.has(event.operation ?? "")) dispatchCalls += 1;
+        if (MODEL_SELECTION_TOOLS.has(event.operation ?? "") && object(details.arguments).modelSelection == null) omittedModelSelection += 1;
       }
       if (event.event === "tool.result") {
         if (event.outcome === "error") {
@@ -55,6 +58,10 @@ export async function summarizeUsage(filePath: string, window: { since?: string;
         } else if (event.outcome === "completed") entry.completed += 1;
         addLatency(entry.latency, event.durationMs);
         const result = object(details.result);
+        if (event.operation === "t3_thread_wait" && event.outcome === "completed") {
+          waits += 1;
+          if (result.timedOut === true && ACTIVE_RUN_STATUSES.has(String(result.status))) unchangedActiveWaits += 1;
+        }
         if (event.operation === "t3_run_wait" && event.outcome === "completed") {
           waits += 1;
           if (result.timedOut === true && ["running", "accepted"].includes(String(result.runStatus))) unchangedActiveWaits += 1;

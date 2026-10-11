@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { GATEWAY_VERSION, isNativeMutatingTool } from "../contract.js";
+import { GATEWAY_VERSION, isNativeMutatingTool, type NativeToolName } from "../contract.js";
 import { summarizeForAudit, withAuditContext, type AuditLog } from "../operations/audit-log.js";
 import {
   GatewayError,
@@ -841,9 +841,31 @@ function registerNativeTool(server: McpServer, gateway: T3Gateway, tool: NativeT
     },
     async (args) => auditedTool(gateway.audit, tool.name, args, async () => {
       const result = await gateway.callNative(tool.name, args);
-      return { result, auditSummary: { isError: result.isError === true, keys: Object.keys(result.structuredContent ?? {}) } };
+      return { result, auditSummary: nativeAuditSummary(tool.name, result) };
     }),
   );
+}
+
+/** Run statuses in the output schema of native `t3_thread_wait`. */
+const NATIVE_RUN_STATUSES = new Set<string>([
+  "idle", "preparing", "queued", "starting", "running", "waiting", "completed", "interrupted", "failed", "cancelled", "rolled_back",
+]);
+
+/**
+ * The audited shape of a native result: the result keys only, because native
+ * results carry thread content under keys the redactor does not know. For
+ * `t3_thread_wait` it also keeps `timedOut` and a known `status`, which the
+ * usage summary counts.
+ */
+function nativeAuditSummary(name: NativeToolName, result: CallToolResult): Record<string, unknown> {
+  const structured = result.structuredContent ?? {};
+  const summary = { isError: result.isError === true, keys: Object.keys(structured) };
+  if (name !== "t3_thread_wait") return summary;
+  return {
+    ...summary,
+    ...(typeof structured.timedOut === "boolean" ? { timedOut: structured.timedOut } : {}),
+    ...(typeof structured.status === "string" && NATIVE_RUN_STATUSES.has(structured.status) ? { status: structured.status } : {}),
+  };
 }
 
 /**

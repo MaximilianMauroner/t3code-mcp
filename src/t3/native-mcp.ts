@@ -29,6 +29,8 @@ type CredentialSource = Pick<NativeCredentialStore, "read">;
 interface Connection {
   readonly client: Client;
   readonly tokenId: string;
+  /** Requests in progress on this connection. */
+  active: number;
 }
 
 const CATALOG_TTL_MS = 60_000;
@@ -47,14 +49,18 @@ const MAX_ATTEMPTS = 3;
 
 /**
  * An MCP client for T3's own `/mcp` endpoint. One connection is shared by every
- * gateway request. It is rebuilt when the stored credential changes, or when T3
- * forgets its session or refuses its token. A failed call does not close it, so
- * other calls in progress are not affected. A mutation is never sent twice
+ * gateway request. When the stored credential changes, new requests use a new
+ * connection, and requests in progress finish on the old one, which closes
+ * after its last request. When T3 forgets its session or refuses its token, the
+ * connection closes at once. Any other failed call leaves the connection open,
+ * so other calls in progress are not affected. A mutation is never sent twice
  * unless the upstream provably did not process it.
  */
 export class NativeMcpClient {
   private connection: Connection | null = null;
   private connecting: Promise<Connection> | null = null;
+  /** Connections for an earlier token that still have requests in progress. */
+  private readonly retiring = new Set<Connection>();
   private catalog: { readonly snapshot: NativeSnapshot; readonly tokenId: string; readonly expiresAt: number } | null = null;
   private refreshing: Promise<NativeSnapshot> | null = null;
 
@@ -90,8 +96,9 @@ export class NativeMcpClient {
   }
 
   async callTool(name: string, args: Record<string, unknown>, mutating: boolean): Promise<CallToolResult> {
-    const credential = await this.requireCredential();
     for (let attempt = 1; ; attempt += 1) {
+      // Each attempt reads the credential, so a retry after a renewal uses the new token.
+      const credential = await this.requireCredential();
       const correlationId = `native_${randomUUID()}`;
       const startedAt = Date.now();
       await this.auditLog.record({
@@ -149,6 +156,8 @@ export class NativeMcpClient {
           );
         }
         throw new GatewayError("native_unavailable", `Native T3 MCP is unavailable: ${errorMessage(error)}`);
+      } finally {
+        if (connection !== null) this.release(connection);
       }
     }
   }
@@ -200,7 +209,8 @@ export class NativeMcpClient {
   }
 
   async close(): Promise<void> {
-    if (this.connection !== null) await this.discard(this.connection);
+    const open = [...this.retiring, ...(this.connection === null ? [] : [this.connection])];
+    await Promise.all(open.map((connection) => this.discard(connection)));
   }
 
   private async requireCredential(): Promise<NativeCredential> {
@@ -211,8 +221,9 @@ export class NativeMcpClient {
 
   /**
    * Starts a catalog read, or joins the one in progress, whatever its token.
-   * A second read would discard the first read's connection and fail it. The
-   * result is saved under the token it was read with.
+   * Only one read runs at a time, so an older read cannot end last and save
+   * its catalog over a newer one. The result is saved under the token it was
+   * read with.
    */
   private refresh(credential: NativeCredential, tokenId: string): Promise<NativeSnapshot> {
     // readCatalog never rejects, so an unawaited refresh cannot leave an unhandled rejection.
@@ -259,19 +270,22 @@ export class NativeMcpClient {
         ? credentialRejectedError()
         : new GatewayError("native_unavailable", `Native T3 tool catalog is unavailable: ${errorMessage(error)}`);
       return failedSnapshot(this.catalog?.snapshot, failure);
+    } finally {
+      if (connection !== null) this.release(connection);
     }
   }
 
+  /** Returns a connection for this credential's token. The caller must `release` it. */
   private async connect(credential: NativeCredential): Promise<Connection> {
     const tokenId = tokenIdentity(credential.accessToken);
-    if (this.connection?.tokenId === tokenId) return this.connection;
-    if (this.connection !== null) await this.discard(this.connection);
+    if (this.connection?.tokenId === tokenId) return acquire(this.connection);
+    if (this.connection !== null) await this.retire(this.connection);
     this.connecting ??= this.open(credential.accessToken, tokenId).finally(() => {
       this.connecting = null;
     });
     const connection = await this.connecting;
     if (connection.tokenId !== tokenId) return this.connect(credential);
-    return connection;
+    return acquire(connection);
   }
 
   private async open(token: string, tokenId: string): Promise<Connection> {
@@ -280,8 +294,26 @@ export class NativeMcpClient {
     });
     const client = new Client({ name: "t3-code-mcp", version: GATEWAY_VERSION });
     await client.connect(transport, { timeout: CATALOG_TIMEOUT_MS });
-    this.connection = { client, tokenId };
+    this.connection = { client, tokenId, active: 0 };
     return this.connection;
+  }
+
+  /**
+   * Replaces a connection for an earlier token. Requests in progress finish on
+   * it, and it closes after the last one. An idle connection closes at once.
+   */
+  private async retire(connection: Connection): Promise<void> {
+    if (this.connection === connection) this.connection = null;
+    if (connection.active > 0) this.retiring.add(connection);
+    else await connection.client.close().catch(() => undefined);
+  }
+
+  /** Ends one request on a connection, and closes a retired connection after its last request. */
+  private release(connection: Connection): void {
+    connection.active -= 1;
+    if (connection.active > 0 || !this.retiring.has(connection)) return;
+    this.retiring.delete(connection);
+    void connection.client.close().catch(() => undefined);
   }
 
   /**
@@ -302,6 +334,7 @@ export class NativeMcpClient {
    */
   private async discard(connection: Connection): Promise<void> {
     if (this.connection === connection) this.connection = null;
+    this.retiring.delete(connection);
     await connection.client.close().catch(() => undefined);
   }
 
@@ -332,6 +365,11 @@ function classifyFailure(error: unknown, sent: boolean): Failure {
     return error.code === ErrorCode.RequestTimeout || error.code === ErrorCode.ConnectionClosed ? "unknown" : "rejected";
   }
   return isConnectionRefused(error) ? "unprocessed" : "unknown";
+}
+
+function acquire(connection: Connection): Connection {
+  connection.active += 1;
+  return connection;
 }
 
 function isCredentialRejection(error: unknown): boolean {
