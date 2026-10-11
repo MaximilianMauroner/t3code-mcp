@@ -31,16 +31,41 @@ The default HTTP address is `http://127.0.0.1:8787/mcp`. `/healthz` reports that
 | --- | --- |
 | `T3_HTTP_BASE_URL` | T3 HTTP address; `http://127.0.0.1:3773` |
 | `T3_ACCESS_TOKEN` | Required T3 credential, kept on the gateway server |
+| `T3_NATIVE_MCP_URL` | T3's native MCP endpoint; `${T3_HTTP_BASE_URL}/mcp`. The credential for it comes from [`native-login`](#native-t3-login), not from the environment |
 | `MCP_TRANSPORT` | `stdio` by default; use `http` for a remote MCP connection |
 | `MCP_BEARER_TOKEN` | Required to serve authenticated `/mcp` requests over HTTP |
 | `MCP_READ_ONLY` | Reject mutations when `true`; code default is `false` |
 | `MCP_HOST`, `MCP_PORT` | HTTP listener; `127.0.0.1`, `8787` |
+| `MCP_MAX_BODY_BYTES` | Largest accepted HTTP request body; `2097152` (2 MiB). Raise it to accept larger `t3_attachment_upload` requests; base64 adds a third to the file size |
 | `MCP_HOST_TOOL_NAMES_JSON` | Optional `doctor`-only JSON array captured from the actual MCP host for end-to-end tool discovery comparison |
 | `T3_ENVIRONMENT_ID` | Optional expected environment ID for identity checks |
 | `T3_ENVIRONMENT_LABEL` | Optional fallback label when discovery is unavailable |
-| `T3_MCP_DATA_DIR` | Durable operation journal and redacted usage audit directory; `./data` (`operations.json` and `audit.jsonl`) |
+| `T3_MCP_DATA_DIR` | Durable operation journal, redacted usage audit, and native credential directory; `./data` (`operations.json`, `audit.jsonl`, and `native-mcp-credential.json`) |
 | `T3_MCP_WORKTREE_ROOT` | Optional absolute root for gateway-created isolated worktrees; by default a hidden sibling directory beside each project workspace |
 | `T3_STALE_AFTER_MS` | Freshness threshold; `30000` |
+
+## Native T3 login
+
+The [native T3 tools](usage.md#native-t3-tools) need a separate credential. T3's `/mcp` endpoint accepts only its own MCP OAuth sessions, not `T3_ACCESS_TOKEN`. `native-login` gets that session with a one-time T3 pairing code, so no browser is needed.
+
+1. On the T3 host, create a pairing code that expires soon:
+
+   ```sh
+   t3 auth pairing create --scope orchestration:read --scope orchestration:operate \
+     --scope settings:write --scope source-control:write --ttl 10m --label t3-code-mcp --json
+   ```
+
+2. Run the login with the same environment as the gateway, and supply the code from the `credential` field at the hidden prompt or on stdin:
+
+   ```sh
+   node --env-file=.env dist/cli.js native-login --access full-access
+   ```
+
+The command refuses a pairing code given as an argument, because process lists show arguments. It checks the new session with a native `tools/list`, then writes `native-mcp-credential.json` with mode `600` to `T3_MCP_DATA_DIR`. It prints the access level, scopes, expiry, and tool counts, never the token.
+
+`--access` sets the T3 runtime ceiling for native launches: `read-only`, `approval-required`, `auto-accept-edits`, `auto`, or `full-access` (the default). A `read-only` login blocks every native tool that changes state.
+
+T3 issues the session for 30 days without a refresh token. Run `native-login` again with a new pairing code before it expires. The running gateway uses the new file on the next call, so no restart is needed. `t3_connection_status` and `doctor` report the expiry. The `doctor` check `native_mcp` says "expires soon" when fewer than 7 days remain, and fails when the credential is missing or expired.
 
 ## Connect an MCP client
 
@@ -58,10 +83,10 @@ Configure the connection in your MCP client's settings. The client must support 
 For the first end-to-end check:
 
 1. Start the gateway with `MCP_READ_ONLY=true` and connect the MCP client.
-2. Request connection status, list projects, and summarize an existing thread. Confirm that the results come from the intended environment.
+2. Request connection status, list projects, and summarize an existing thread. Confirm that the results come from the intended environment and that `native.credential` is `valid`.
 3. Set `MCP_READ_ONLY=false` and restart when ready to exercise control tools. The T3 token also needs `orchestration:operate`.
-4. Create a disposable thread, start a small task, check progress, and retrieve the result.
-5. Disconnect and reconnect the client, then inspect the same thread or saved run handle. Check interruption and pending-action responses when applicable.
+4. Start a small task with `t3_task_start`, wait with `t3_thread_wait`, and retrieve the result with `t3_result_get`.
+5. Disconnect and reconnect the client, then find the same task with `t3_tasks_list`. Check `t3_task_cancel` and pending-action responses when applicable.
 
 Verify that the client clearly reports accepted work, completion, requests for input, and connection failures.
 

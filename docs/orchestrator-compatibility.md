@@ -6,6 +6,12 @@ T3 [PR #2829](https://github.com/pingdotgg/t3code/pull/2829), merged on 2026-10-
 
 The source target is merge commit [`de343914273eceb852a1d1d739cd1d38df7796ee`](https://github.com/pingdotgg/t3code/tree/de343914273eceb852a1d1d739cd1d38df7796ee). The review covered `environmentHttp.ts`, `environment.ts`, `orchestrationV2.ts`, `project.ts`, server `orchestration-v2/http.ts`, `ws.ts`, and the Effect JSON RPC envelope and serializer.
 
+## Native MCP for outside clients
+
+The [native T3 tools](usage.md#native-t3-tools) need a T3 build that serves MCP to outside clients at `/mcp` with MCP OAuth and pairing-code approval. The checked build is `0.0.46-nightly.20261011.2980`. On that build, 42 of the 42 allowlisted tools were available to an outside client, and thread-bound tools such as `delegate_task` were listed but rejected. Native `t3_thread_list` requires `projectId` for outside clients, so the gateway keeps `t3_threads_list` for searches across projects.
+
+On an older build, `t3_connection_status` reports the native tools as disabled with `native_unavailable`. The gateway's own tools, including the task tools, keep working over protocol 1 or 2 as described below. The gateway does not add a fallback for the removed thread and project tools.
+
 ## Gateway behavior
 
 The public MCP tools and journal version stay the same. Failure fields and optional internal evidence ordering, including protocol transition boundaries, are additive; older journal records remain readable. These fields stay optional until stored records migrate. Equal observations do not rewrite the journal. The T3 boundary selects its transport from the public descriptor's `orchestrationProtocolVersion`. An absent version means V1. Unknown versions fail before dispatch.
@@ -26,7 +32,7 @@ Both transports use the configured bearer credential. Each RPC connection handle
 
 Pending-action detail comes from pending runtime requests with a `live` or `message` response capability. Resolved, expired, cancelled, and `not_resumable` requests are excluded. Structured failure code and reset time come from the matching run's error item. `provider_error` maps to the additive `provider_error` category. It does not imply a crash. Specific provider codes and exact known refusal messages take priority over the broad `usage_limit` class. Bare HTTP 429, Claude `api_error_429`, and shell-only broad usage-limit evidence stay `unknown`; known quota evidence maps to the existing `quota` category. Other classes stay `unknown` unless an explicit provider type identifies a category. See [failure authority and limits](usage.md).
 
-The gateway still rejects sends to busy threads and polls for updates. This change does not expose V2 queue, steering, fork, or delegation features. Composite tasks retain the gateway's existing explicit worktree preparation. V2 rejects the internal V1 bootstrap payload; MCP task creation uses separate thread creation and message admission.
+The gateway's own task dispatch still rejects busy threads and polls for updates. Queue, steering, and fork features are available through the forwarded native tools; delegation is not, because T3 binds it to a calling thread. Composite tasks retain the gateway's existing explicit worktree preparation. V2 rejects the internal V1 bootstrap payload; MCP task creation uses separate thread creation and message admission.
 
 ## Compatibility lifetime
 

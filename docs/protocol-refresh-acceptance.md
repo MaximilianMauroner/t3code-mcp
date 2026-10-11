@@ -29,6 +29,17 @@ passed. See the [executed acceptance receipt](https://github.com/MaximilianMauro
 The rest of this document is the plan from before the run. Use its procedure
 for future, separately authorized acceptance tests.
 
+Tool schema version 10 removed two tools that the procedure names. For a future
+run, make these changes:
+
+- Instead of `t3_thread_get`, call `t3_threads_list` with the thread ID as
+  `query` and `detail: "full"`. It reads through the same V1/V2 transport.
+- `t3_thread_snooze` and `t3_thread_unsnooze` are gone. Native
+  `t3_thread_organize` does not use the gateway's V1/V2 transport, so it does
+  not test mutation routing. The remaining gateway mutations are
+  `t3_task_start` and `t3_pending_action_respond`, and both can start provider
+  work. Choose the mutation case when the run is authorized.
+
 This plan checks that a gateway stays usable when T3 changes orchestration
 protocol. It was a plan for later execution. No live acceptance run, deployment,
 service restart, provider write, or live setting change was performed when it
