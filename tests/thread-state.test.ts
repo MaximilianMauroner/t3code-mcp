@@ -132,6 +132,8 @@ describe("thread activity and signal clarity", () => {
 describe("open queue: open threads that are not working", () => {
   const running = { session: { status: "running" } } as const;
   const failed = { session: { status: "error" }, latestTurn: { turnId: "t", state: "error" as const, requestedAt: before } };
+  // A failed runtime whose old turn still reads running.
+  const staleFailed = { session: { status: "error" }, latestTurn: { turnId: "t", state: "running" as const, requestedAt: before } };
   const queued = (overrides: Partial<Thread> = {}) => isInOpenQueue(shell(overrides), NOW);
 
   it("treats a running turn or waking background work as working", () => {
@@ -146,6 +148,7 @@ describe("open queue: open threads that are not working", () => {
     expect(isThreadWorking(shell({ ...running, hasPendingApprovals: true }))).toBe(false);
     expect(isThreadWorking(shell({ backgroundLiveness: "working", hasPendingUserInput: true }))).toBe(false);
     expect(isThreadWorking(shell({ ...failed, backgroundLiveness: "working" }))).toBe(false);
+    expect(isThreadWorking(shell(staleFailed))).toBe(false);
     const plan = { interactionMode: "plan", hasActionableProposedPlan: true } as const;
     expect(isThreadWorking(shell({ ...plan, backgroundLiveness: "working" }))).toBe(false);
     expect(isThreadWorking(shell({ ...plan, ...running }))).toBe(true);
@@ -155,6 +158,7 @@ describe("open queue: open threads that are not working", () => {
     expect(queued()).toBe(true);
     expect(queued({ ...running, hasPendingApprovals: true })).toBe(true);
     expect(queued({ ...failed, backgroundLiveness: "working" })).toBe(true);
+    expect(queued(staleFailed)).toBe(true);
     expect(queued({ lineage: { parentThreadId: "parent", relationshipToParent: "fork" } })).toBe(true);
   });
 

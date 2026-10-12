@@ -2176,7 +2176,8 @@ function sortThreads(
 // Highlights come from the open queue, which holds no running threads.
 function highlightRank(thread: ThreadShell): number {
   if (thread.hasPendingApprovals === true || thread.hasPendingUserInput === true) return 0;
-  return threadActivity(thread) === "failed" ? 1 : 2;
+  // A failed session ranks as a failure even when its old turn still reads running.
+  return thread.session?.status === "error" || threadActivity(thread) === "failed" ? 1 : 2;
 }
 
 function threadRecency(thread: ThreadShell): number {

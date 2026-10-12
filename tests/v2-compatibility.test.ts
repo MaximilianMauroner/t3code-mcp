@@ -11,6 +11,7 @@ import { makeGateway } from "../src/gateway.js";
 import type { ThreadCreateCommand } from "../src/t3/commands.js";
 import { T3HttpClient } from "../src/t3/http-client.js";
 import { requestT3Rpc } from "../src/t3/rpc-client.js";
+import { isInOpenQueue, isThreadWorking } from "../src/t3/thread-state.js";
 import { normalizeV2ShellThread, V2ShellSchema, V2ThreadSchema } from "../src/t3/v2.js";
 import providerFailures from "./fixtures/failures/v2-provider-failures.json" with { type: "json" };
 
@@ -138,6 +139,23 @@ describe("merged orchestrator V2 boundary", () => {
     expect(row([{ taskId: "s", kind: "subagent" }, { taskId: "m", kind: "monitor" }]).backgroundLiveness).toBe("working");
     expect(row([{ taskId: "b", kind: "background_task" }]).backgroundLiveness).toBe("working");
     expect(row([]).lineage).toMatchObject({ parentThreadId: "parent-1", relationshipToParent: "subagent" });
+  });
+
+  it("keeps a running thread working through auth_refresh but queues it for an approval", async () => {
+    const row = (kind: string) => normalizeV2ShellThread(V2ShellSchema.parse({
+      schemaVersion: 1, snapshotSequence: 2, projects: [project], archivedThreads: [], threads: [{
+        ...thread, latestRunId: "run", activeRunId: "run", status: "running", pendingRuntimeRequest: { id: "request", kind, createdAt: now },
+      }],
+    }).threads[0]!);
+    expect(row("auth_refresh")).toMatchObject({ hasPendingApprovals: false, hasPendingUserInput: false });
+    expect(isThreadWorking(row("auth_refresh"))).toBe(true);
+    expect(isInOpenQueue(row("auth_refresh"))).toBe(false);
+    expect(row("command_approval")).toMatchObject({ hasPendingApprovals: true, hasPendingUserInput: false });
+    expect(isInOpenQueue(row("command_approval"))).toBe(true);
+    const { client, snapshot } = await setup();
+    snapshot.projection.runtimeRequests.push({ id: "auth", nodeId: "node-root", kind: "auth_refresh", status: "pending",
+      responseCapability: { type: "message" }, createdAt: now });
+    expect((await client.getThread("thread-1")).thread).toMatchObject({ hasPendingApprovals: false, hasPendingUserInput: false });
   });
 
   it("keeps each V2 shell row's source sequence when archived reads are ahead", async () => {
@@ -682,13 +700,18 @@ describe("merged orchestrator V2 boundary", () => {
       runId: run.id, nodeId: run.rootNodeId, title: null, updatedAt: now, failure: providerFailures.codexUsageLimit });
     const older = await client.getThread("thread-1");
     shell.snapshotSequence = 3;
-    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: run.id, status: "running", lastError: null, lastErrorClass: null });
+    Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: run.id, status: "running", lastError: null, lastErrorClass: null,
+      // A question keeps the running thread in the open queue, so the overview highlights and enriches it.
+      pendingRuntimeRequest: reader === "overview" ? { id: "question", kind: "user_input", createdAt: now } : null });
     const getThread = client.getThread.bind(client);
-    client.getThread = async () => older;
-    // A running thread is outside the default open queue, so read it explicitly.
+    let fullReads = 0;
+    client.getThread = async () => { fullReads++; return older; };
+    // A running thread is outside the default open queue, so the list reads it explicitly.
     const observed = reader === "list" ? (await gateway.threadsList({ includeArchived: false, status: "all", detail: "full", limit: 5 })).page.items[0]
-      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).running[0];
-    expect(observed).toMatchObject({ latestTurn: { turnId: run.id, state: "running" }, activity: "running", failure: null });
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0];
+    expect(observed).toMatchObject({ latestTurn: { turnId: run.id, state: "running" },
+      activity: reader === "list" ? "running" : "awaiting_input", failure: null });
+    expect(fullReads).toBe(1);
     expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toBeNull();
     run.status = "running";
     snapshot.snapshotSequence = 3;

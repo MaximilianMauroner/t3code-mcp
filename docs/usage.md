@@ -104,7 +104,8 @@ These tools are available even when `MCP_READ_ONLY=true`; that setting prevents 
 | `snoozed` | A future snooze time, with no pending approval/input, new failure, or completion since snoozing that would wake it early. Snoozing does not stop execution. |
 | `settled` | T3's explicit settled override, subject to activity blockers and pin/snooze precedence. A completed turn alone does not settle a thread. |
 | `archived` | Threads with an archive timestamp. This explicit filter includes archives even when `includeArchived` is false. |
-| `all` or omitted | No lifecycle filter; archives remain hidden unless `includeArchived=true`. |
+| `all` | No lifecycle filter; archives remain hidden unless `includeArchived=true`. |
+| omitted | The open queue when no other selector is set; otherwise no lifecycle filter. |
 
 The gateway uses the lifecycle fields exposed by T3. On V1, the T3 UI also derives settlement from client preferences, inactivity, and linked PR state; those inputs are not available to these tools, so the settled/open lists can differ from the UI's automatic classification. V2 persists settlement on the server; the gateway reads those lifecycle fields. Older servers with no lifecycle fields show unarchived threads as open. This behavior follows the server-backed portion of T3's `threadSettled.ts` and sidebar partitioning, inspected at source revision `4b8388773`.
 

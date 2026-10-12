@@ -53,6 +53,8 @@ export function isThreadRunning(thread: ThreadShell): boolean {
 // Approvals, questions, plan prompts, and failures need the user instead.
 export function isThreadWorking(thread: ThreadShell): boolean {
   if (thread.hasPendingApprovals || thread.hasPendingUserInput) return false;
+  // A failed runtime is not working, even when an old turn still reads running.
+  if (thread.session?.status === "error") return false;
   if (isThreadRunning(thread)) return true;
   if (thread.backgroundLiveness == null || threadActivity(thread) === "failed") return false;
   // A plan prompt outranks lingering background work: the user has to act on it.

@@ -113,10 +113,15 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>, snap
         : "unknown",
       resetAt: hasBoundFailure ? thread.usageLimitResetAt ?? null : null, updatedAt: thread.updatedAt,
     },
-    hasPendingApprovals: request !== null && request.kind !== "user_input",
+    hasPendingApprovals: request !== null && isApprovalKind(request.kind),
     hasPendingUserInput: request?.kind === "user_input",
     backgroundLiveness: backgroundLiveness(thread.pendingBackgroundTasks ?? []),
   });
+}
+
+// As in T3's shell model, auth_refresh is neither an approval nor user input.
+function isApprovalKind(kind: string): boolean {
+  return kind !== "user_input" && kind !== "auth_refresh";
 }
 
 // T3 parks a finished run while subagents, monitors, or background tasks can
@@ -186,7 +191,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
         ...shell.latestTurn,
         assistantMessageId: messages.filter((message) => message.runId === latest?.id && message.role === "assistant").at(-1)?.id ?? null,
       } : null,
-      hasPendingApprovals: pending.some((request) => request.kind !== "user_input"),
+      hasPendingApprovals: pending.some((request) => isApprovalKind(request.kind)),
       hasPendingUserInput: pending.some((request) => request.kind === "user_input"),
       session: { ...shell.session, failureCode: failure?.code ?? null },
       messages: messages.map((message) => ({ ...message, turnId: message.runId })),

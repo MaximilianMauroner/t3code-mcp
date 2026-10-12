@@ -129,6 +129,18 @@ describe("voice discovery and control", () => {
       .toEqual(["approval", "running"]);
   });
 
+  it("queues a failed session with a stale running turn and ranks it with failures", async () => {
+    const { fake, gateway } = await setup();
+    const old = "2026-01-01T00:00:00Z";
+    fake.addThread({ id: "idle", projectId: "p" });
+    fake.addThread({ id: "stale", projectId: "p", createdAt: old, updatedAt: old, session: { status: "error", updatedAt: old },
+      latestTurn: { turnId: "stale-turn", state: "running", requestedAt: old } });
+    const queue = await gateway.threadsList({ includeArchived: false, limit: 20 });
+    expect(queue.page.items.map((item) => item.id).sort()).toEqual(["idle", "stale"]);
+    const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 0 });
+    expect(overview.highlights.map((row) => row.id)).toEqual(["stale", "idle"]);
+  });
+
   it("summarizes lifecycle counts and running threads in one overview call", async () => {
     const { fake, gateway } = await setup();
     fake.addThread({ id: "run-1", projectId: "p", title: "work", session: { status: "running" } });
