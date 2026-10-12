@@ -6,7 +6,7 @@ description: Verify gateway transport and read-only T3 connectivity. Use when ch
 # Verify t3code-mcp
 
 Read README.md, docs/development.md, docs/configuration.md, compatibility and
-[features.md](features.md). Use isolated worktree/journal and local test servers.
+[the feature index](features/README.md). Use isolated worktree/journal and local test servers.
 Check active gateway owners and host resources first. Never restart or reconfigure
 a shared deployed gateway. Select journeys affected by work in the requested
 window. Record gateway revision and target T3 protocol/build.
