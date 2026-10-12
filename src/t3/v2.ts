@@ -113,12 +113,25 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>, snap
         : "unknown",
       resetAt: hasBoundFailure ? thread.usageLimitResetAt ?? null : null, updatedAt: thread.updatedAt,
     },
-    hasPendingApprovals: request !== null && request.kind !== "user_input",
+    hasPendingApprovals: request !== null && isApprovalKind(request.kind),
     hasPendingUserInput: request?.kind === "user_input",
-    backgroundLiveness: thread.pendingBackgroundTasks?.length
-      ? thread.pendingBackgroundTasks.every((task) => task.kind === "monitor") ? "monitoring" : "working"
-      : null,
+    backgroundLiveness: backgroundLiveness(thread.pendingBackgroundTasks ?? []),
   });
+}
+
+// As in T3's shell model, auth_refresh is neither an approval nor user input.
+function isApprovalKind(kind: string): boolean {
+  return kind !== "user_input" && kind !== "auth_refresh";
+}
+
+// T3 parks a finished run while subagents, monitors, or background tasks can
+// still wake it (shared backgroundWorkHoldsCompletion). Commands do not.
+const HOLDING_BACKGROUND_KINDS = new Set(["subagent", "monitor", "background_task"]);
+
+function backgroundLiveness(tasks: ReadonlyArray<{ readonly kind?: string }>): "working" | "monitoring" | null {
+  const holding = tasks.filter((task) => HOLDING_BACKGROUND_KINDS.has(task.kind ?? ""));
+  if (holding.length === 0) return null;
+  return holding.every((task) => task.kind === "monitor") ? "monitoring" : "working";
 }
 
 export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
@@ -178,7 +191,7 @@ export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {
         ...shell.latestTurn,
         assistantMessageId: messages.filter((message) => message.runId === latest?.id && message.role === "assistant").at(-1)?.id ?? null,
       } : null,
-      hasPendingApprovals: pending.some((request) => request.kind !== "user_input"),
+      hasPendingApprovals: pending.some((request) => isApprovalKind(request.kind)),
       hasPendingUserInput: pending.some((request) => request.kind === "user_input"),
       session: { ...shell.session, failureCode: failure?.code ?? null },
       messages: messages.map((message) => ({ ...message, turnId: message.runId })),

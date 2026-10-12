@@ -19,6 +19,7 @@ import {
   type NativeToolName,
 } from "./contract.js";
 import {
+  isInOpenQueue,
   isThreadRunning,
   needsAttentionFor,
   observeThread,
@@ -394,6 +395,7 @@ export interface PendingActionRespondInput extends MutationCommonInput {
 export interface ThreadsListResult {
   readonly environmentId: string;
   readonly observedAt: string;
+  readonly scope: "open_queue" | "filtered";
   readonly page: Page<ThreadSummary>;
   readonly resolutionHint: string | null;
 }
@@ -936,9 +938,15 @@ export class T3Gateway {
     const now = Date.now();
     const observedAt = new Date(now).toISOString();
     const projectTitles = new Map(shell.projects.map((project) => [project.id, project.title]));
+    // Without a lifecycle or execution selector, discovery shows the open queue.
+    // Any selector reviews every matching thread, including working threads and subagent children.
+    const openQueue = input.status === undefined && input.onlyRunning === undefined &&
+      input.sessionStatus === undefined && input.activity === undefined &&
+      input.needsAttention === undefined && !input.includeArchived;
     const filtered = shell.threads.filter((thread) => {
       if (input.projectId !== undefined && thread.projectId !== input.projectId) return false;
       if (!matchesQuery(input.query, thread.title, thread.branch, thread.id)) return false;
+      if (openQueue) return isInOpenQueue(thread, now);
       if (input.onlyRunning === true && !isThreadRunning(thread)) return false;
       if (input.sessionStatus !== undefined && (thread.session?.status ?? null) !== input.sessionStatus) return false;
       if (input.activity !== undefined && threadActivity(thread) !== input.activity) return false;
@@ -973,8 +981,9 @@ export class T3Gateway {
     return {
       environmentId,
       observedAt,
+      scope: openQueue ? "open_queue" : "filtered",
       page,
-      resolutionHint: resolutionHint(filtered.length, input),
+      resolutionHint: resolutionHint(filtered.length, input, openQueue),
     };
   }
 
@@ -1027,7 +1036,8 @@ export class T3Gateway {
       .map((thread) => threadSummary(thread, projectTitles.get(thread.projectId) ?? null, environmentId, now));
     const shellOrders = new Map(filtered.map((thread) => [thread.id,
       failureEvidenceOrder(thread, shell.snapshotSequence, "shell", undefined, readStartedAt)]));
-    const highlights = await Promise.all((await this.buildHighlights(filtered, projectTitles, environmentId, now, shellOrders))
+    const queue = filtered.filter((thread) => isInOpenQueue(thread, now));
+    const highlights = await Promise.all((await this.buildHighlights(queue, projectTitles, environmentId, now, shellOrders))
       .map((highlight) => {
         const thread = filtered.find((candidate) => candidate.id === highlight.id);
         return this.withRetainedFailure(highlight,
@@ -1635,16 +1645,16 @@ export class T3Gateway {
   }
 
   private async buildHighlights(
-    filtered: ReadonlyArray<ThreadShell>,
+    queue: ReadonlyArray<ThreadShell>,
     projectTitles: Map<string, string>,
     environmentId: string,
     now: number,
     shellOrders: ReadonlyMap<string, FailureEvidenceOrder>,
   ): Promise<ReadonlyArray<OverviewHighlight>> {
-    const ranked = [...filtered]
+    const ranked = [...queue]
       .map((thread) => ({
         thread,
-        rank: highlightRank(thread, now),
+        rank: highlightRank(thread),
         recency: threadRecency(thread),
       }))
       .sort((a, b) => a.rank - b.rank || b.recency - a.recency || a.thread.id.localeCompare(b.thread.id))
@@ -2163,13 +2173,11 @@ function sortThreads(
   return copy;
 }
 
-function highlightRank(thread: ThreadShell, now: number): number {
+// Highlights come from the open queue, which holds no running threads.
+function highlightRank(thread: ThreadShell): number {
   if (thread.hasPendingApprovals === true || thread.hasPendingUserInput === true) return 0;
-  const observation = observeThread(thread, now);
-  if (observation.quality === "inconsistent" || observation.quality === "stale") return 1;
-  if (observation.execution === "failed") return 2;
-  if (observation.execution === "running" || observation.execution === "starting") return 3;
-  return 4;
+  // A failed session ranks as a failure even when its old turn still reads running.
+  return thread.session?.status === "error" || threadActivity(thread) === "failed" ? 1 : 2;
 }
 
 function threadRecency(thread: ThreadShell): number {
@@ -2202,6 +2210,7 @@ function asGatewayGitError(error: unknown): GatewayError {
 function resolutionHint(
   total: number,
   input: { readonly query?: string; readonly projectId?: string; readonly status?: ThreadStatus | "all" },
+  openQueue: boolean,
 ): string | null {
   if (total === 1) return "One exact candidate. The client may select it and carry its observedTarget into control calls.";
   if (total > 1) {
@@ -2212,6 +2221,11 @@ function resolutionHint(
   if (input.query) scope.push(`query ${JSON.stringify(input.query)}`);
   if (input.status && input.status !== "all") scope.push(`status ${input.status}`);
   const where = scope.length > 0 ? ` for ${scope.join(", ")}` : "";
+  if (openQueue) {
+    return `No open threads that are not working${where}. The default open queue leaves out working, snoozed, settled, ` +
+      `archived, and subagent threads; retry with status=all, onlyRunning=true, needsAttention=true, or includeArchived=true to review them. ` +
+      `Zero results must not select a thread for control.`;
+  }
   return `No threads${where}. Retry with a broader query, another project, or includeArchived=true. ` +
     `Zero results must not select a thread for control.`;
 }
