@@ -11,7 +11,7 @@ import { makeGateway } from "../src/gateway.js";
 import type { ThreadCreateCommand } from "../src/t3/commands.js";
 import { T3HttpClient } from "../src/t3/http-client.js";
 import { requestT3Rpc } from "../src/t3/rpc-client.js";
-import { V2ShellSchema, V2ThreadSchema } from "../src/t3/v2.js";
+import { normalizeV2ShellThread, V2ShellSchema, V2ThreadSchema } from "../src/t3/v2.js";
 import providerFailures from "./fixtures/failures/v2-provider-failures.json" with { type: "json" };
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -125,6 +125,21 @@ async function setup() {
 }
 
 describe("merged orchestrator V2 boundary", () => {
+  it("parks a thread only for background work that wakes it, and keeps its lineage", () => {
+    const row = (pendingBackgroundTasks: Array<{ taskId: string; kind: string }>) => normalizeV2ShellThread(V2ShellSchema.parse({
+      schemaVersion: 1, snapshotSequence: 2, projects: [project], archivedThreads: [], threads: [{
+        ...thread, latestRunId: null, activeRunId: null, status: "idle", pendingRuntimeRequest: null, pendingBackgroundTasks,
+        lineage: { parentThreadId: "parent-1", relationshipToParent: "subagent", rootThreadId: "parent-1" },
+      }],
+    }).threads[0]!);
+    expect(row([]).backgroundLiveness).toBeNull();
+    expect(row([{ taskId: "c", kind: "command" }]).backgroundLiveness).toBeNull();
+    expect(row([{ taskId: "c", kind: "command" }, { taskId: "m", kind: "monitor" }]).backgroundLiveness).toBe("monitoring");
+    expect(row([{ taskId: "s", kind: "subagent" }, { taskId: "m", kind: "monitor" }]).backgroundLiveness).toBe("working");
+    expect(row([{ taskId: "b", kind: "background_task" }]).backgroundLiveness).toBe("working");
+    expect(row([]).lineage).toMatchObject({ parentThreadId: "parent-1", relationshipToParent: "subagent" });
+  });
+
   it("keeps each V2 shell row's source sequence when archived reads are ahead", async () => {
     const { client, setArchivedSequence } = await setup();
     setArchivedSequence(10);
@@ -670,8 +685,9 @@ describe("merged orchestrator V2 boundary", () => {
     Object.assign(shell.threads[0]!, { latestRunId: run.id, activeRunId: run.id, status: "running", lastError: null, lastErrorClass: null });
     const getThread = client.getThread.bind(client);
     client.getThread = async () => older;
-    const observed = reader === "list" ? (await gateway.threadsList({ includeArchived: false, detail: "full", limit: 5 })).page.items[0]
-      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).highlights[0];
+    // A running thread is outside the default open queue, so read it explicitly.
+    const observed = reader === "list" ? (await gateway.threadsList({ includeArchived: false, status: "all", detail: "full", limit: 5 })).page.items[0]
+      : (await gateway.threadsOverview({ includeArchived: false, runningLimit: 5 })).running[0];
     expect(observed).toMatchObject({ latestTurn: { turnId: run.id, state: "running" }, activity: "running", failure: null });
     expect(await makeGateway(config).journal.getFailureByTurnId("thread-1", run.id)).toBeNull();
     run.status = "running";

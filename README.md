@@ -17,7 +17,7 @@ flowchart LR
 
 ## What you can do
 
-- See every project and thread, triage what needs attention, and read full thread timelines.
+- See the open queue of threads that are not working by default, review every project and thread on request, triage what needs attention, and read full thread timelines.
 - Inspect structured Git status, bounded uncommitted diffs, and committed base-to-head comparisons in T3-selected workspaces.
 - Start recoverable one-call tasks, find them after reconnecting, review their changes, and cancel them.
 - Steer, queue, interrupt, fork, configure, and organize threads, manage schedules and pull request watches, and upload attachments, through T3's own native MCP tools that the gateway forwards.

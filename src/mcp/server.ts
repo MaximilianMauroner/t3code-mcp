@@ -358,6 +358,7 @@ const gitCompareOutputSchema = {
 const threadsListOutputSchema = {
   environmentId: z.string(),
   observedAt: z.string(),
+  scope: z.enum(["open_queue", "filtered"]),
   page: z
     .object({
       items: z.array(threadSummaryOutput),
@@ -531,7 +532,8 @@ export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | nul
       instructions:
         "This gateway controls one configured T3 Code environment for an orchestrator outside T3. T3 remains authoritative for projects, threads, messages, runs, and workspaces. " +
         "Native T3 tools (t3_project_*, t3_thread_*, t3_queue_*, schedules, pull requests, orchestrator_capabilities) are forwarded unchanged. As an outside client, pass projectId or threadId explicitly. " +
-        "Use t3_threads_list and t3_threads_overview to see every project's threads and what needs attention, t3_thread_read (view=activity for tool calls) for detail, and t3_thread_send with mode=steer, queue, or restart to redirect running work. " +
+        "Use t3_threads_list and t3_threads_overview to see what needs attention across projects. By default they show the open queue: open threads that are not working, without subagent children. " +
+        "To supervise working threads, pass status=all or onlyRunning=true to t3_threads_list, or read a known thread with t3_thread_read (view=activity for tool calls) and t3_thread_wait. Use t3_thread_send with mode=steer, queue, or restart to redirect running work. " +
         "Prefer t3_task_start for delegated work: it is retry-safe with an idempotencyKey, can prepare a worktree, and pairs with t3_task_get, t3_result_get, and t3_task_cancel. Monitor it with t3_thread_wait using the task's threadId. " +
         "Answer approvals with t3_pending_action_respond; native tools cannot. Interrupts are requests: confirm them with t3_thread_read or t3_thread_wait. " +
         "Usage is recorded in a local redacted audit trail; use t3_audit_log to inspect tool calls, upstream requests, Git commands, outcomes, and timings.",
@@ -632,7 +634,7 @@ export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | nul
     "t3_threads_list",
     {
       title: "List T3 threads",
-      description: "Find threads by project and case-insensitive title, branch, or ID substring. status filters lifecycle (open/snoozed/settled/archived) only; activity/onlyRunning/sessionStatus filter execution, and running is not a lifecycle value. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page and excludes full transcripts, which come from t3_thread_read. Unlike native t3_thread_list, it spans every project when projectId is omitted.",
+      description: "Find threads by project and case-insensitive title, branch, or ID substring. Without status, activity, onlyRunning, sessionStatus, needsAttention, or includeArchived=true, it returns the open queue (scope=open_queue): open threads that are not working, matching T3's sidebar inbox. Working means a running turn or background work (subagents, monitors) that will wake the thread; approvals, questions, plan prompts, and failures stay in the queue. Subagent children are left out. Any of those selectors returns every matching thread (scope=filtered), including working threads and subagent children; status=all covers every lifecycle except archived. status filters lifecycle (open/snoozed/settled/archived) only; activity/onlyRunning/sessionStatus filter execution, and running is not a lifecycle value. needsAttention filters pending/inconsistent/stale/failed. sort is deterministic (recent/title/status). Zero results return a retry hint; one exact candidate may be selected; multiple candidates need clarification. detail=full adds latest-response enrichment on the page and excludes full transcripts, which come from t3_thread_read. Unlike native t3_thread_list, it spans every project when projectId is omitted.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
@@ -657,12 +659,12 @@ export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | nul
     "t3_threads_overview",
     {
       title: "Summarize T3 threads",
-      description: "One bounded call for 'what's running and does anything need me': lifecycle counts, execution counts, needsAttentionCount, running summaries capped by runningLimit, and up to five deterministic highlights (pending approval/input, inconsistent/stale, failed, running, recent) with project title and a 200-char response excerpt. All rows share one observedAt. Transcripts and full records need detail tools.",
+      description: "One bounded call for 'does anything need me': lifecycle counts, execution counts, needsAttentionCount, and runningCount over every matching thread, plus up to five deterministic highlights from the open queue (open threads that are not working, without subagent children), ranked pending approval/input, failed, then recent, with project title and a 200-char response excerpt. Running summaries appear only when runningLimit is above 0. All rows share one observedAt. Transcripts and full records need detail tools.",
       inputSchema: {
         projectId: z.string().trim().min(1).optional(),
         includeArchived: z.boolean().default(false),
         query,
-        runningLimit: z.number().int().min(1).max(50).default(10),
+        runningLimit: z.number().int().min(0).max(50).default(0),
       },
       outputSchema: threadsOverviewOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },

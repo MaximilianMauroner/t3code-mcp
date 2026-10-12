@@ -115,10 +115,18 @@ export function normalizeV2ShellThread(thread: z.infer<typeof ShellThread>, snap
     },
     hasPendingApprovals: request !== null && request.kind !== "user_input",
     hasPendingUserInput: request?.kind === "user_input",
-    backgroundLiveness: thread.pendingBackgroundTasks?.length
-      ? thread.pendingBackgroundTasks.every((task) => task.kind === "monitor") ? "monitoring" : "working"
-      : null,
+    backgroundLiveness: backgroundLiveness(thread.pendingBackgroundTasks ?? []),
   });
+}
+
+// T3 parks a finished run while subagents, monitors, or background tasks can
+// still wake it (shared backgroundWorkHoldsCompletion). Commands do not.
+const HOLDING_BACKGROUND_KINDS = new Set(["subagent", "monitor", "background_task"]);
+
+function backgroundLiveness(tasks: ReadonlyArray<{ readonly kind?: string }>): "working" | "monitoring" | null {
+  const holding = tasks.filter((task) => HOLDING_BACKGROUND_KINDS.has(task.kind ?? ""));
+  if (holding.length === 0) return null;
+  return holding.every((task) => task.kind === "monitor") ? "monitoring" : "working";
 }
 
 export function normalizeV2Thread(snapshot: z.infer<typeof V2ThreadSchema>) {

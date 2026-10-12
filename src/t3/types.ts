@@ -107,6 +107,10 @@ export const ThreadShellSchema = z
     latestUserMessageAt: z.string().nullable().optional(),
     hasActionableProposedPlan: z.boolean().optional(),
     backgroundLiveness: z.enum(["working", "monitoring"]).nullable().optional(),
+    lineage: z.object({
+      parentThreadId: z.string().nullable().optional(),
+      relationshipToParent: z.string().nullable().optional(),
+    }).catchall(z.unknown()).nullable().optional(),
     hasPendingApprovals: z.boolean().optional(),
     hasPendingUserInput: z.boolean().optional(),
   })

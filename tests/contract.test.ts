@@ -77,10 +77,10 @@ describe("slice 1: dependable check-ins", () => {
       latestTurn: { turnId: "turn-odd", state: "completed", requestedAt: "2026-09-11T06:50:00.000Z", completedAt: "2026-09-11T06:52:00.000Z" },
     });
     const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 10 });
-    const listed = await gateway.threadsList({ includeArchived: false, limit: 10 });
+    const listed = await gateway.threadsList({ includeArchived: false, status: "all", limit: 10 });
     const detail = await gateway.threadGet("odd");
-    expect(overview.highlights[0]?.quality).toBe("inconsistent");
-    expect(overview.highlights[0]?.warning).toContain("disagree");
+    expect(overview.running[0]?.quality).toBe("inconsistent");
+    expect(overview.running[0]?.warning).toContain("disagree");
     expect(listed.page.items[0]).toMatchObject({ quality: "inconsistent", hasConflictingSignals: true });
     expect(detail.thread).toMatchObject({ quality: "inconsistent", hasConflictingSignals: true });
     expect(detail.thread.warning).toContain("disagree");
@@ -90,14 +90,13 @@ describe("slice 1: dependable check-ins", () => {
     const { fake, gateway } = await setup();
     for (let i = 0; i < 7; i++) {
       fake.addThread({
-        id: `run-${i}`,
+        id: `done-${i}`,
         projectId: "p",
         title: `work ${i}`,
-        session: { status: "running", updatedAt: new Date().toISOString() },
-        latestTurn: { turnId: `turn-${i}`, state: "running", requestedAt: new Date().toISOString() },
+        latestTurn: { turnId: `turn-${i}`, state: "completed", requestedAt: new Date().toISOString(), completedAt: new Date().toISOString() },
       });
     }
-    const thread = fake.thread("run-0");
+    const thread = fake.thread("done-0");
     thread.messages.push({
       id: "assistant-long",
       role: "assistant",
@@ -108,15 +107,13 @@ describe("slice 1: dependable check-ins", () => {
       updatedAt: new Date().toISOString(),
     });
     const overview = await gateway.threadsOverview({ includeArchived: false, runningLimit: 50 });
-    expect(overview.executionCounts.running).toBe(7);
-    expect(overview.needsAttentionCount).toBeGreaterThanOrEqual(0);
-    expect(overview.highlights.length).toBeLessThanOrEqual(5);
+    expect(overview.executionCounts.idle).toBe(7);
+    expect(overview.highlights).toHaveLength(5);
     for (const h of overview.highlights) {
       expect((h.latestResponseExcerpt ?? "").length).toBeLessThanOrEqual(201);
       expect(h.projectId).toBeTruthy();
       expect(h.observedAt).toBe(overview.observedAt);
     }
-    expect(overview.running.length).toBeLessThanOrEqual(50);
   });
 });
 
@@ -132,8 +129,10 @@ describe("slice 2: deterministic resolution", () => {
     expect(attention.page.items.map((t) => t.id)).toEqual(["attention"]);
     expect(attention.resolutionHint).toContain("One exact candidate");
     const none = await gateway.threadsList({ includeArchived: false, limit: 10, query: "missing-xyz" });
-    expect(none.resolutionHint).toContain("No threads");
+    expect(none.resolutionHint).toContain("No open threads that are not working");
     expect(none.resolutionHint).toContain("must not select");
+    const noneAll = await gateway.threadsList({ includeArchived: false, limit: 10, status: "all", query: "missing-xyz" });
+    expect(noneAll.resolutionHint).toContain("No threads");
     const multi = await gateway.threadsList({ includeArchived: false, limit: 10, query: "Alpha" });
     expect(multi.resolutionHint).toContain("Multiple candidates");
     const full = await gateway.threadsList({ includeArchived: false, limit: 10, detail: "full", query: "Beta" });
@@ -202,11 +201,12 @@ describe("transport contract", () => {
       toolSchemaFingerprint: toolSchemaFingerprint(),
     });
     const overview = await client.callTool({ name: "t3_threads_overview", arguments: {} });
-    const ov = overview.structuredContent as unknown as {
-      highlights: Array<{ latestResponseExcerpt: string | null; quality: string; warning: string | null }>;
+    expect(overview.structuredContent).toMatchObject({ runningCount: 1, running: [], highlights: [] });
+    const supervised = await client.callTool({ name: "t3_threads_overview", arguments: { runningLimit: 5 } });
+    const ov = supervised.structuredContent as unknown as {
+      running: Array<{ quality: string; warning: string | null }>;
     };
-    expect(ov.highlights.length).toBeLessThanOrEqual(5);
-    expect(ov.highlights[0]?.quality).toBe("inconsistent");
-    expect(ov.highlights[0]?.warning).toBeTruthy();
+    expect(ov.running[0]?.quality).toBe("inconsistent");
+    expect(ov.running[0]?.warning).toBeTruthy();
   });
 });

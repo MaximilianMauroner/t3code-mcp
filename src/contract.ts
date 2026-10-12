@@ -7,7 +7,7 @@ export const GATEWAY_VERSION = "0.1.0";
 export const GATEWAY_COMMIT = (process.env.T3_CODE_MCP_COMMIT ?? "").trim() || "unknown";
 
 // Bump when any MCP output shape changes in a way a stale client must detect.
-export const TOOL_SCHEMA_VERSION = 10;
+export const TOOL_SCHEMA_VERSION = 11;
 
 /** Tools this gateway implements itself. */
 export const GATEWAY_TOOL_NAMES = [

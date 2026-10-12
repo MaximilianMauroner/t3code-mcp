@@ -33,7 +33,10 @@ Tool schema version 10 removed two tools that the procedure names. For a future
 run, make these changes:
 
 - Instead of `t3_thread_get`, call `t3_threads_list` with the thread ID as
-  `query` and `detail: "full"`. It reads through the same V1/V2 transport.
+  `query`, `status: "all"`, and `detail: "full"`. It reads through the same
+  V1/V2 transport. Since tool schema version 11, `status: "all"` is needed
+  for a working or settled thread, because the default lists only the open
+  queue.
 - `t3_thread_snooze` and `t3_thread_unsnooze` are gone. Native
   `t3_thread_organize` does not use the gateway's V1/V2 transport, so it does
   not test mutation routing. The remaining gateway mutations are

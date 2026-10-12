@@ -48,6 +48,26 @@ export function isThreadRunning(thread: ThreadShell): boolean {
   return thread.latestTurn?.state === "running";
 }
 
+// Mirrors T3's Working section (client-runtime threadInbox.ts isThreadWorking):
+// a running thread, or one parked with background work that will wake it.
+// Approvals, questions, plan prompts, and failures need the user instead.
+export function isThreadWorking(thread: ThreadShell): boolean {
+  if (thread.hasPendingApprovals || thread.hasPendingUserInput) return false;
+  if (isThreadRunning(thread)) return true;
+  if (thread.backgroundLiveness == null || threadActivity(thread) === "failed") return false;
+  // A plan prompt outranks lingering background work: the user has to act on it.
+  return !(thread.interactionMode === "plan" && thread.hasActionableProposedPlan === true);
+}
+
+// The default discovery queue, matching T3's sidebar inbox with the Working
+// section on: open threads that are not working. Subagent children are left
+// out, as in T3's roster; their parent shows the delegated work.
+export function isInOpenQueue(thread: ThreadShell, now = Date.now()): boolean {
+  return threadStatus(thread, now) === "open" &&
+    thread.lineage?.relationshipToParent !== "subagent" &&
+    !isThreadWorking(thread);
+}
+
 export function threadActivity(thread: ThreadShell): ThreadActivity {
   if (thread.hasPendingApprovals) return "awaiting_approval";
   if (thread.hasPendingUserInput) return "awaiting_input";

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   hasConflictingSignals,
+  isInOpenQueue,
   isThreadRunning,
+  isThreadWorking,
   threadActivity,
   threadStatus,
   threadStatusReason,
@@ -124,5 +126,44 @@ describe("thread activity and signal clarity", () => {
     }), NOW);
     expect(reason).toContain("open because approval is pending");
     expect(reason).toContain("woken");
+  });
+});
+
+describe("open queue: open threads that are not working", () => {
+  const running = { session: { status: "running" } } as const;
+  const failed = { session: { status: "error" }, latestTurn: { turnId: "t", state: "error" as const, requestedAt: before } };
+  const queued = (overrides: Partial<Thread> = {}) => isInOpenQueue(shell(overrides), NOW);
+
+  it("treats a running turn or waking background work as working", () => {
+    expect(isThreadWorking(shell(running))).toBe(true);
+    expect(isThreadWorking(shell({ backgroundLiveness: "working" }))).toBe(true);
+    expect(isThreadWorking(shell({ backgroundLiveness: "monitoring", latestTurn: completed }))).toBe(true);
+    expect(isThreadWorking(shell())).toBe(false);
+    expect(isThreadWorking(shell({ latestTurn: completed }))).toBe(false);
+  });
+
+  it("keeps approvals, questions, failures, and plan prompts out of working", () => {
+    expect(isThreadWorking(shell({ ...running, hasPendingApprovals: true }))).toBe(false);
+    expect(isThreadWorking(shell({ backgroundLiveness: "working", hasPendingUserInput: true }))).toBe(false);
+    expect(isThreadWorking(shell({ ...failed, backgroundLiveness: "working" }))).toBe(false);
+    const plan = { interactionMode: "plan", hasActionableProposedPlan: true } as const;
+    expect(isThreadWorking(shell({ ...plan, backgroundLiveness: "working" }))).toBe(false);
+    expect(isThreadWorking(shell({ ...plan, ...running }))).toBe(true);
+  });
+
+  it("holds open, top-level threads that are idle or need the user", () => {
+    expect(queued()).toBe(true);
+    expect(queued({ ...running, hasPendingApprovals: true })).toBe(true);
+    expect(queued({ ...failed, backgroundLiveness: "working" })).toBe(true);
+    expect(queued({ lineage: { parentThreadId: "parent", relationshipToParent: "fork" } })).toBe(true);
+  });
+
+  it("leaves out working parents, subagent children, pins that work, and closed lifecycles", () => {
+    expect(queued({ backgroundLiveness: "working" })).toBe(false);
+    expect(queued({ ...running, pinnedAt: before })).toBe(false);
+    expect(queued({ lineage: { parentThreadId: "parent", relationshipToParent: "subagent" } })).toBe(false);
+    expect(queued({ settledOverride: "settled", settledAt: before })).toBe(false);
+    expect(queued({ snoozedUntil: future })).toBe(false);
+    expect(queued({ archivedAt: before })).toBe(false);
   });
 });
