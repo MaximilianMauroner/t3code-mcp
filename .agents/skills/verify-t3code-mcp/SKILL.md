@@ -9,7 +9,9 @@ Read README.md, docs/development.md, docs/configuration.md, compatibility and
 [the feature index](features/README.md). Use isolated worktree/journal and local test servers.
 Check active gateway owners and host resources first. Never restart or reconfigure
 a shared deployed gateway. Select journeys affected by work in the requested
-window. Record gateway revision and target T3 protocol/build.
+window. Before setup or execution, read every selected guide's expectations,
+procedure, existing proof and reset requirements. Record gateway revision and
+target T3 protocol/build.
 
 `pnpm install --frozen-lockfile`, then `pnpm build`, `pnpm test` and
 `pnpm typecheck:test` run disposable transport fixtures without real credentials.
