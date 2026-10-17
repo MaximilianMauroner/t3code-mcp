@@ -3,11 +3,17 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { ListToolsRequestSchema, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 export interface NativeToolCall {
   readonly name: string;
   readonly arguments: Record<string, unknown>;
+}
+
+export interface FakeNativeMcpOptions {
+  readonly outputSchemaCount?: number;
+  readonly paginateWithEmptyCursor?: boolean;
 }
 
 /**
@@ -16,6 +22,7 @@ export interface NativeToolCall {
  */
 export class FakeNativeMcp {
   readonly calls: NativeToolCall[] = [];
+  readonly toolListCursors: Array<string | undefined> = [];
   readonly uploads: Array<{ readonly path: string; readonly contentType: string | undefined; readonly bytes: Buffer }> = [];
   readonly decisions: Array<{ readonly access: unknown; readonly code: unknown }> = [];
   /** The bearer token that /mcp accepts and a login issues. Rotating it simulates a new login. */
@@ -51,6 +58,15 @@ export class FakeNativeMcp {
   private readonly heldToolLists: Array<() => void> = [];
   private readonly heldToolCalls: Array<() => void> = [];
   private readonly authorizations = new Map<string, { readonly challenge: string; readonly clientId: string; readonly scope: string }>();
+  private readonly outputSchemaTools: ReadonlyArray<Tool>;
+
+  constructor(private readonly options: FakeNativeMcpOptions = {}) {
+    this.outputSchemaTools = Array.from({ length: options.outputSchemaCount ?? 0 }, (_, index) => ({
+      name: `output-schema-${index}`,
+      inputSchema: { type: "object", properties: {} },
+      outputSchema: { type: "object", properties: { value: { type: "string", description: `output schema ${index}` } }, required: ["value"] },
+    }));
+  }
 
   get baseUrl(): string {
     const address = this.server?.address() as AddressInfo | null | undefined;
@@ -308,6 +324,25 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: "unexpected" }], isError: true };
       },
     );
+    if (this.options.paginateWithEmptyCursor) {
+      const split = Math.ceil(this.outputSchemaTools.length / 2);
+      const firstPage: Tool[] = [
+        { name: "t3_thread_list", inputSchema: { type: "object", properties: { projectId: { type: "string" } }, required: ["projectId"] } },
+        ...this.outputSchemaTools.slice(0, split),
+      ];
+      const secondPage: Tool[] = [
+        { name: "t3_thread_send", inputSchema: { type: "object", properties: { threadId: { type: "string" }, message: { type: "string" } }, required: ["threadId", "message"] } },
+        ...this.outputSchemaTools.slice(split),
+      ];
+      server.server.removeRequestHandler("tools/list");
+      server.server.setRequestHandler(ListToolsRequestSchema, (request) => {
+        const cursor = request.params?.cursor;
+        this.toolListCursors.push(cursor);
+        if (cursor === undefined) return { tools: firstPage, nextCursor: "" };
+        if (cursor === "") return { tools: secondPage };
+        throw new Error(`Unexpected tools/list cursor: ${cursor}`);
+      });
+    }
     return server;
   }
 }

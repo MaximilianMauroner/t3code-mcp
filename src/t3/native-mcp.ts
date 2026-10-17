@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CallToolResultSchema, ErrorCode, McpError, type CallToolResult, type Tool } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema, ErrorCode, ListToolsResultSchema, McpError, type CallToolResult, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import { GATEWAY_VERSION, NATIVE_CALLED_TOOL_NAMES, isNativeToolName, type NativeCalledToolName, type NativeToolName } from "../contract.js";
 import { GatewayError } from "../errors.js";
 import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
@@ -244,7 +244,11 @@ export class NativeMcpClient {
       const listed: Tool[] = [];
       let cursor: string | undefined;
       do {
-        const page = await connection.client.listTools(cursor === undefined ? {} : { cursor }, { timeout: CATALOG_TIMEOUT_MS });
+        const page = await connection.client.request(
+          { method: "tools/list", params: cursor === undefined ? {} : { cursor } },
+          ListToolsResultSchema,
+          { timeout: CATALOG_TIMEOUT_MS },
+        );
         listed.push(...page.tools);
         cursor = page.nextCursor;
       } while (cursor !== undefined);

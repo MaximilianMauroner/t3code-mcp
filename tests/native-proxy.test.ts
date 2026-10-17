@@ -14,7 +14,7 @@ import { loginNative, parseNativeLoginArgs } from "../src/native-login.js";
 import { AuditLog } from "../src/operations/audit-log.js";
 import { NativeCredentialStore, type NativeCredential } from "../src/t3/native-credential.js";
 import { NativeMcpClient } from "../src/t3/native-mcp.js";
-import { FakeNativeMcp } from "./support/fake-native-mcp.js";
+import { FakeNativeMcp, type FakeNativeMcpOptions } from "./support/fake-native-mcp.js";
 import { FakeT3 } from "./support/fake-t3.js";
 import { gatewayFixture } from "./support/gateway-fixture.js";
 
@@ -24,8 +24,8 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function startNative(): Promise<FakeNativeMcp> {
-  const native = new FakeNativeMcp();
+async function startNative(options?: FakeNativeMcpOptions): Promise<FakeNativeMcp> {
+  const native = new FakeNativeMcp(options);
   await native.start();
   cleanups.push(() => native.close());
   return native;
@@ -128,6 +128,41 @@ describe("native T3 login", () => {
 });
 
 describe("native T3 tool proxy", () => {
+  it("refreshes every catalog page without retaining output-schema validators", async () => {
+    const native = await startNative({ outputSchemaCount: 75, paginateWithEmptyCursor: true });
+    const { store, directory } = await nativeGateway(native);
+    await login(native, store);
+    const client = new NativeMcpClient(native.mcpUrl, store, new AuditLog(join(directory, "audit.jsonl")));
+    cleanups.push(() => client.close());
+
+    const initial = await client.snapshot();
+    // Ajv keeps these compiled validators in the cache reported by issue 19.
+    const sdkClient = (client as unknown as { readonly connection: { readonly client: {
+      readonly _jsonSchemaValidator: { readonly _ajv: { readonly _cache: Map<unknown, unknown> } };
+    } } }).connection.client;
+    const initialCacheSize = sdkClient._jsonSchemaValidator._ajv._cache.size;
+
+    expect(initial.tools.map((tool) => tool.name)).toEqual(["t3_thread_list", "t3_thread_send"]);
+    expect(native.toolListCursors).toEqual([undefined, ""]);
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    cleanups.push(async () => {
+      vi.useRealTimers();
+    });
+    for (let refresh = 0; refresh < 10; refresh += 1) {
+      const previousFetchedAt = (await client.snapshot()).fetchedAt;
+      vi.setSystemTime(Date.now() + 61_000);
+      await client.snapshot();
+      await vi.waitFor(async () => expect((await client.snapshot()).fetchedAt).not.toBe(previousFetchedAt));
+
+      expect(native.toolListCursors.slice(-2)).toEqual([undefined, ""]);
+      expect(sdkClient._jsonSchemaValidator._ajv._cache.size).toBe(initialCacheSize);
+    }
+
+    const forwarded = await client.callTool("t3_thread_list", { projectId: "project-1" }, false);
+    expect(forwarded.structuredContent).toEqual({ projectId: "project-1", threads: [{ threadId: "thread-1", title: "Native thread" }] });
+  });
+
   it("advertises allowlisted native tools beside gateway tools and hides thread-bound ones", async () => {
     const native = await startNative();
     const { gateway, store } = await nativeGateway(native);
