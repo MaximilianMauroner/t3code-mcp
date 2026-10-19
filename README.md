@@ -35,7 +35,9 @@ Start with `MCP_READ_ONLY=true`, connect only trusted clients, and review the [s
 
 ## Quick start
 
-Install Node.js 20.6 or newer and pnpm, then run from the repository root:
+Install Node.js 20.6 or newer and pnpm. The `spike`, `usage-summary`, and `benchmark:audit` package scripts also require Cargo and Rust 1.88 or newer.
+
+Run from the repository root:
 
 ```sh
 pnpm install

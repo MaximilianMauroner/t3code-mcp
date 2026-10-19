@@ -18,10 +18,15 @@ For a read-only connection diagnostic:
 node --env-file=.env dist/cli.js status
 node --env-file=.env dist/cli.js doctor
 node --env-file=.env dist/cli.js smoke
-node --env-file=.env dist/cli.js spike
 ```
 
 `doctor` checks config, journal writability, T3 identity/scopes/expiry, effective access, freshness, build fingerprint, a real local MCP `tools/list` exchange, a harmless overview call, and tunnel readiness without mutation. Its output includes a machine-readable capability manifest. To compare an actual host capture, set `MCP_HOST_TOOL_NAMES_JSON` to a JSON array of the tool names that host discovered before running `doctor`; missing and unexpected operations fail the `host_discovery` check. `smoke` calls status plus the bounded overview path MCP clients use and validates highlight/excerpt bounds. After every interface deployment, run `smoke`, restart gateway then tunnel, force fresh client discovery, compare the discovered `toolSchemaFingerprint` (it identifies the build's declared tool contract, not the native tools that T3 offers now), and invoke status plus overview from your MCP client ("What's running and does anything need me?").
+
+The `spike` package script runs the Rust CLI. Export the configuration variables before you run it. This command does not load `.env`.
+
+```sh
+pnpm spike
+```
 
 `spike` also lists up to five projects. Its optional mutation path requires `T3_SPIKE_ENABLE_MUTATIONS=true`, `T3_SPIKE_CONFIRM=I_UNDERSTAND`, `T3_SPIKE_PROJECT_ID`, and `T3_SPIKE_PROMPT`. Optional `T3_SPIKE_THREAD_TITLE` and `T3_SPIKE_IDEMPOTENCY_KEY` customize the thread title and retry-key prefix. This path creates a thread and submits a prompt; it does not archive the thread afterward.
 
@@ -39,14 +44,13 @@ Set `T3_LIVE_HTTP_BASE_URL` and `T3_LIVE_ENVIRONMENT_ID` for another environment
 
 `tests/usage-improvements.test.ts` exercises adaptive wait request counts with fake time, pending input/approval, disconnection, environment revalidation, failure isolation, settings inheritance and restart provenance. `tests/mcp-server.test.ts` includes a caller journey with no duplicate dispatch plus concurrent audit attribution. `tests/usage-summary.test.ts` verifies filtered streaming cursors, fixed-snapshot appends, invalid lines, aggregation and context isolation.
 
-For bounded-memory evidence, build and run the disposable audit benchmark:
+Run the disposable Rust audit benchmark:
 
 ```sh
-pnpm build
 pnpm benchmark:audit
 ```
 
-It scans 131,072 synthetic events (about 75 MB) for both a one-item page and a usage summary under a 32 MB JavaScript heap, reports elapsed time/peak RSS, and removes its fixture. RSS includes native/runtime memory and is not the JavaScript heap limit. This is an offline workload measurement, not a claim of production token/cost savings.
+The example at `rust/examples/audit-benchmark.rs` scans 131,072 synthetic events for a one-item page and a usage summary. On Linux, the scan child enforces a 32 MiB `RLIMIT_DATA` limit. This limits process data, not RSS. The report includes scan times and the child's peak RSS, including startup. Other platforms report that the memory limit and peak RSS measurement are unavailable. The benchmark removes its fixture and does not read live history or dispatch tasks.
 
 Prompt comparison scenarios live in `evals/task-briefs.json`; [the evaluation recipe](task-briefs.md#offline-evaluation) explains the external caller boundary and evidence required for a model-quality comparison.
 

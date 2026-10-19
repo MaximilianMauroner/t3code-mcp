@@ -1435,7 +1435,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
- "tower",
  "url",
  "uuid",
 ]
