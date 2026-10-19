@@ -1,231 +1,482 @@
-use bytes::Bytes;
-use http::{HeaderMap, Request};
-use http_body::Body;
-use http_body_util::{BodyExt, Full, Limited};
-use serde_json::Value;
+mod arguments;
+mod catalog;
+mod http;
+mod output;
+mod peer;
+mod stdio;
+mod wire;
 
-const LEGACY_PROTOCOL_VERSION: &str = "2024-10-07";
-const RMCP_COMPAT_PROTOCOL_VERSION: &str = "2024-11-05";
-const VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
-pub const DEFAULT_HTTP_BODY_LIMIT: usize = 2 * 1024 * 1024;
+use serde_json::{Map, Value, json};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HttpBodyError {
-    Invalid,
+pub use catalog::{CatalogError, ToolsListPage};
+pub(crate) use http::authorized;
+pub(crate) use http::body_too_large;
+pub use http::{DEFAULT_HTTP_BODY_LIMIT, HttpBody, HttpOptions};
+pub(crate) use output::{Delivery, Output};
+pub use peer::{Invocation, Peer};
+pub(crate) use stdio::FrameWriter;
+pub use stdio::{DEFAULT_STDIO_BUFFER_LIMIT, StdioCodec, StdioError};
+pub use wire::{IncomingMessage, MessageError, RequestId, RpcError, RpcRequest};
+
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+];
+
+const INSTRUCTIONS: &str = concat!(
+    "This gateway controls one configured T3 Code environment for an orchestrator outside T3. T3 remains authoritative for projects, threads, messages, runs, and workspaces. ",
+    "Native T3 tools (t3_project_*, t3_thread_*, t3_queue_*, schedules, pull requests, orchestrator_capabilities) are forwarded unchanged. As an outside client, pass projectId or threadId explicitly. ",
+    "Use t3_threads_list and t3_threads_overview to see what needs attention across projects. By default they show the open queue: open threads that are not working, without subagent children. ",
+    "To supervise working threads, pass status=all or onlyRunning=true to t3_threads_list, or read a known thread with t3_thread_read (view=activity for tool calls) and t3_thread_wait. Use t3_thread_send with mode=steer, queue, or restart to redirect running work. ",
+    "Prefer t3_task_start for delegated work: it is retry-safe with an idempotencyKey, can prepare a worktree, and pairs with t3_task_get, t3_result_get, and t3_task_cancel. Monitor it with t3_thread_wait using the task's threadId. ",
+    "Answer approvals with t3_pending_action_respond; native tools cannot. Interrupts are requests: confirm them with t3_thread_read or t3_thread_wait. ",
+    "Usage is recorded in a local redacted audit trail; use t3_audit_log to inspect tool calls, upstream requests, Git commands, outcomes, and timings."
+);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub request_id: RequestId,
+    pub name: String,
+    pub arguments: Map<String, Value>,
+    pub params: Map<String, Value>,
 }
 
-pub async fn normalize_legacy_protocol_request<B>(
-    request: Request<B>,
-    max_body_bytes: usize,
-) -> Result<Request<Full<Bytes>>, HttpBodyError>
-where
-    B: Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    let (mut parts, body) = request.into_parts();
-    let mut bytes = Limited::new(body, max_body_bytes)
-        .collect()
-        .await
-        .map_err(|_| HttpBodyError::Invalid)?
-        .to_bytes();
-
-    if parts
-        .headers
-        .get("MCP-Protocol-Version")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|version| version == LEGACY_PROTOCOL_VERSION)
-    {
-        bytes = normalize_legacy_message(&mut parts.headers, &bytes);
-    }
-
-    Ok(Request::from_parts(parts, Full::new(bytes)))
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolFailure {
+    pub code: String,
+    pub message: String,
+    pub protocol_error: Option<Box<RpcError>>,
 }
 
-fn normalize_legacy_message(headers: &mut HeaderMap, bytes: &[u8]) -> Bytes {
-    let Ok(mut message) = serde_json::from_slice::<Value>(bytes) else {
-        return Bytes::copy_from_slice(bytes);
-    };
-    let includes_initialize = match &message {
-        Value::Array(messages) => messages.iter().any(is_initialize_message),
-        message => is_initialize_message(message),
-    };
-    if includes_initialize {
-        headers.remove("MCP-Protocol-Version");
-        return Bytes::copy_from_slice(bytes);
+impl ToolFailure {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            protocol_error: None,
+        }
+    }
+}
+
+pub trait ToolHandler: Sync {
+    fn native_client(&self) -> Option<&crate::t3::NativeMcpClient> {
+        None
     }
 
-    headers.insert(
-        "MCP-Protocol-Version",
-        http::HeaderValue::from_static(RMCP_COMPAT_PROTOCOL_VERSION),
-    );
-    let mut modified = false;
-    match &mut message {
-        Value::Array(messages) => {
-            for message in messages {
-                modified |= normalize_meta_version(message);
+    fn tool_catalog(&self) -> impl Future<Output = Option<ToolsListPage>> + Send {
+        async { None }
+    }
+
+    fn call_tool(
+        &self,
+        call: ToolCall,
+        invocation: Option<Invocation>,
+    ) -> impl Future<Output = Result<Map<String, Value>, ToolFailure>> + Send;
+}
+
+#[derive(Clone)]
+pub struct McpServer {
+    catalog: ToolsListPage,
+    peer: Peer,
+    sessions: Arc<Mutex<peer::Sessions>>,
+    workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+pub(crate) struct AdmittedMessage {
+    message: IncomingMessage,
+    peer: Peer,
+    reserved: Option<Result<Invocation, RpcError>>,
+}
+
+impl AdmittedMessage {
+    pub(crate) fn set_output(&self, output: Delivery) {
+        if let Some(Ok(invocation)) = &self.reserved {
+            invocation.set_output(output);
+        }
+    }
+}
+
+impl McpServer {
+    pub fn new(catalog: ToolsListPage) -> Self {
+        Self {
+            catalog,
+            peer: Peer::default(),
+            sessions: Arc::new(Mutex::new(peer::Sessions::default())),
+            workers: Arc::new(Mutex::new(Vec::new())),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn gateway() -> Self {
+        Self::new(ToolsListPage::gateway())
+    }
+
+    pub(crate) fn expire_sessions(&self) {
+        self.sessions.lock().unwrap().expire();
+    }
+
+    pub fn close(&self) {
+        self.shutdown.cancel();
+        self.peer.close();
+        self.sessions.lock().unwrap().close();
+    }
+
+    pub(crate) fn retain_worker(&self, task: tokio::task::JoinHandle<()>) {
+        let mut workers = self.workers.lock().unwrap();
+        workers.retain(|worker| !worker.is_finished());
+        workers.push(task);
+    }
+
+    pub async fn drain(&self) {
+        loop {
+            let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+            if workers.is_empty() {
+                break;
+            }
+            for worker in workers {
+                let _ = worker.await;
             }
         }
-        message => modified = normalize_meta_version(message),
+        self.peer.drain().await;
     }
-    if modified {
-        serde_json::to_vec(&message)
-            .map(Bytes::from)
-            .unwrap_or_else(|_| Bytes::copy_from_slice(bytes))
+
+    pub fn handle_message<'a>(
+        &'a self,
+        message: IncomingMessage,
+        handler: &'a impl ToolHandler,
+    ) -> impl Future<Output = Option<Value>> + Send + 'a {
+        self.handle_peer_message(message, self.peer.clone(), handler)
+    }
+
+    fn handle_peer_message<'a>(
+        &'a self,
+        message: IncomingMessage,
+        peer: Peer,
+        handler: &'a impl ToolHandler,
+    ) -> impl Future<Output = Option<Value>> + Send + 'a {
+        let admitted = self.admit(message, peer);
+        self.execute_message(admitted, handler)
+    }
+
+    pub(crate) fn stdio_output(&self) -> (Delivery, Output) {
+        let (delivery, output) = Delivery::channel();
+        self.peer.set_notification_output(delivery.clone());
+        (delivery, output)
+    }
+
+    pub(crate) fn admit_message(&self, message: IncomingMessage) -> AdmittedMessage {
+        self.admit(message, self.peer.clone())
+    }
+
+    fn admit(&self, message: IncomingMessage, peer: Peer) -> AdmittedMessage {
+        let sessions = self.sessions.lock().unwrap();
+        let reserved = match &message {
+            IncomingMessage::Request(request) => Some(if sessions.is_closed() {
+                Err(RpcError::new(-32000, "MCP server is closing."))
+            } else {
+                peer.reserve(request.id.clone())
+            }),
+            IncomingMessage::Notification {
+                method,
+                params: Some(params),
+            } if method == "notifications/cancelled" => {
+                peer.cancel(params.clone());
+                None
+            }
+            _ => None,
+        };
+        AdmittedMessage {
+            message,
+            peer,
+            reserved,
+        }
+    }
+
+    pub(crate) fn execute_message<'a>(
+        &'a self,
+        admitted: AdmittedMessage,
+        handler: &'a impl ToolHandler,
+    ) -> impl Future<Output = Option<Value>> + Send + 'a {
+        let AdmittedMessage {
+            message,
+            peer,
+            reserved,
+        } = admitted;
+        async move {
+            let IncomingMessage::Request(request) = message else {
+                return None;
+            };
+            let invocation = match reserved.expect("request reservation") {
+                Ok(invocation) => invocation,
+                Err(error) => return Some(error.response(Some(&request.id))),
+            };
+            let result = async {
+                if invocation.is_cancelled() {
+                    return Err(RpcError::new(-32800, "Request cancelled."));
+                }
+                let catalog = if matches!(request.method.as_str(), "tools/list" | "tools/call") {
+                    if let Some(source) = handler.native_client() {
+                        let needs_native_catalog = request.method == "tools/list"
+                            || request
+                                .params
+                                .as_ref()
+                                .and_then(|params| params.get("name"))
+                                .and_then(Value::as_str)
+                                .is_some_and(crate::contract::is_native_tool_name);
+                        if needs_native_catalog {
+                            let snapshot = peer.native(source).snapshot().await;
+                            let mut tools = self
+                                .catalog
+                                .tools()
+                                .iter()
+                                .filter(|tool| {
+                                    !tool["name"]
+                                        .as_str()
+                                        .is_some_and(crate::contract::is_native_tool_name)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            tools.extend(
+                                snapshot
+                                    .tools
+                                    .into_iter()
+                                    .map(|tool| serde_json::to_value(tool).expect("native tool")),
+                            );
+                            ToolsListPage::parse(json!({"tools":tools})).expect("validated catalog")
+                        } else {
+                            self.catalog.clone()
+                        }
+                    } else {
+                        handler
+                            .tool_catalog()
+                            .await
+                            .unwrap_or_else(|| self.catalog.clone())
+                    }
+                } else {
+                    self.catalog.clone()
+                };
+                if invocation.is_cancelled() {
+                    return Err(RpcError::new(-32800, "Request cancelled."));
+                }
+                let server = Self {
+                    catalog,
+                    peer: peer.clone(),
+                    sessions: self.sessions.clone(),
+                    workers: self.workers.clone(),
+                    shutdown: self.shutdown.clone(),
+                };
+                server.dispatch(&request, handler, &invocation).await
+            }
+            .await;
+            Some(match result {
+                Ok(result) => json!({"result": result, "jsonrpc": "2.0", "id": request.id}),
+                Err(error) => error.response(Some(&request.id)),
+            })
+        }
+    }
+
+    async fn dispatch(
+        &self,
+        request: &RpcRequest,
+        handler: &impl ToolHandler,
+        invocation: &Invocation,
+    ) -> Result<Value, RpcError> {
+        if matches!(
+            request.method.as_str(),
+            "initialize" | "ping" | "tools/list" | "tools/call"
+        ) && request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("task"))
+            .is_some_and(|task| {
+                task.as_object().is_some_and(|task| {
+                    task.get("ttl")
+                        .is_none_or(|ttl| ttl.as_f64().is_some_and(f64::is_finite))
+                })
+            })
+        {
+            return Err(RpcError::new(
+                -32602,
+                format!(
+                    "Server does not support task creation (required for {})",
+                    request.method
+                ),
+            ));
+        }
+        match request.method.as_str() {
+            "initialize" => initialize(request.params.as_ref()),
+            "ping" => Ok(json!({})),
+            "tools/list" => {
+                if let Some(cursor) = request.params.as_ref().and_then(|p| p.get("cursor"))
+                    && !cursor.is_string()
+                {
+                    return Err(wire::invalid_type(
+                        "string",
+                        Some(cursor),
+                        &["params", "cursor"],
+                    ));
+                }
+                Ok(self.catalog.as_value().clone())
+            }
+            "tools/call" => self.call_tool(request, handler, invocation).await,
+            _ => Err(RpcError::new(-32601, "Method not found")),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        request: &RpcRequest,
+        handler: &impl ToolHandler,
+        invocation: &Invocation,
+    ) -> Result<Value, RpcError> {
+        let params = request
+            .params
+            .as_ref()
+            .ok_or_else(|| wire::invalid_type("object", None, &["params"]))?;
+        let mut issues = Vec::new();
+        if let Some(task) = params.get("task") {
+            if let Some(task) = task.as_object() {
+                if let Some(ttl) = task.get("ttl")
+                    && !ttl.as_f64().is_some_and(f64::is_finite)
+                {
+                    issues.push(wire::type_issue(
+                        "number",
+                        Some(ttl),
+                        &["params", "task", "ttl"],
+                    ));
+                }
+            } else {
+                issues.push(wire::type_issue("object", Some(task), &["params", "task"]));
+            }
+        }
+        if !params.get("name").is_some_and(Value::is_string) {
+            issues.push(wire::type_issue(
+                "string",
+                params.get("name"),
+                &["params", "name"],
+            ));
+        }
+        if let Some(args) = params.get("arguments")
+            && !args.is_object()
+        {
+            issues.push(wire::type_issue(
+                "record",
+                Some(args),
+                &["params", "arguments"],
+            ));
+        }
+        if !issues.is_empty() {
+            return Err(wire::invalid_params(issues));
+        }
+        let name = params["name"].as_str().expect("checked tool name");
+        let Some(tool) = self
+            .catalog
+            .tools()
+            .iter()
+            .find(|tool| tool["name"] == name)
+        else {
+            return Ok(tool_error(format!(
+                "MCP error -32602: Tool {name} not found"
+            )));
+        };
+        let arguments = match arguments::parse(tool, params.get("arguments")) {
+            Ok(args) => args,
+            Err(message) => {
+                return Ok(tool_error(format!(
+                    "MCP error -32602: Input validation error: Invalid arguments for tool {name}: {message}"
+                )));
+            }
+        };
+        let call = ToolCall {
+            request_id: request.id.clone(),
+            name: name.to_owned(),
+            arguments,
+            params: params.clone(),
+        };
+        let result = match handler.call_tool(call, Some(invocation.clone())).await {
+            Ok(result) => Value::Object(result),
+            Err(failure) => {
+                if let Some(error) = failure.protocol_error {
+                    return Err(*error);
+                }
+                let error = json!({"error": {"code": failure.code, "message": failure.message}});
+                json!({
+                    "isError": true,
+                    "content": [{"type": "text", "text": serde_json::to_string_pretty(&error).expect("JSON value")}],
+                    "structuredContent": error
+                })
+            }
+        };
+        if let Value::Object(result) = &result
+            && let Some(message) = arguments::output_error(tool, result)
+        {
+            return Ok(tool_error(message));
+        }
+        Ok(result)
+    }
+}
+
+fn tool_error(message: String) -> Value {
+    json!({"content": [{"type": "text", "text": message}], "isError": true})
+}
+
+fn initialize(params: Option<&Map<String, Value>>) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| wire::invalid_type("object", None, &["params"]))?;
+    let mut issues = Vec::new();
+    if !params.get("protocolVersion").is_some_and(Value::is_string) {
+        issues.push(wire::type_issue(
+            "string",
+            params.get("protocolVersion"),
+            &["params", "protocolVersion"],
+        ));
+    }
+    for field in ["capabilities", "clientInfo"] {
+        if !params.get(field).is_some_and(Value::is_object) {
+            issues.push(wire::type_issue(
+                "object",
+                params.get(field),
+                &["params", field],
+            ));
+        }
+    }
+    if let Some(client) = params.get("clientInfo").and_then(Value::as_object) {
+        for field in ["name", "title", "version", "websiteUrl", "description"] {
+            let required = matches!(field, "name" | "version");
+            if (required || client.contains_key(field))
+                && !client.get(field).is_some_and(Value::is_string)
+            {
+                issues.push(wire::type_issue(
+                    "string",
+                    client.get(field),
+                    &["params", "clientInfo", field],
+                ));
+            }
+        }
+    }
+    if !issues.is_empty() {
+        return Err(wire::invalid_params(issues));
+    }
+    let version = params["protocolVersion"]
+        .as_str()
+        .expect("checked protocol version");
+    let version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        version
     } else {
-        Bytes::copy_from_slice(bytes)
-    }
-}
-
-fn is_initialize_message(message: &Value) -> bool {
-    message
-        .get("method")
-        .and_then(Value::as_str)
-        .is_some_and(|method| method == "initialize")
-}
-
-fn normalize_meta_version(message: &mut Value) -> bool {
-    let Some(message) = message.as_object_mut() else {
-        return false;
+        SUPPORTED_PROTOCOL_VERSIONS[0]
     };
-    let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) else {
-        return false;
-    };
-    if meta.get(VERSION_META_KEY).and_then(Value::as_str) != Some(LEGACY_PROTOCOL_VERSION) {
-        return false;
-    }
-    meta.insert(
-        VERSION_META_KEY.to_owned(),
-        Value::String(RMCP_COMPAT_PROTOCOL_VERSION.to_owned()),
-    );
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    use std::borrow::Cow;
-
-    use bytes::Bytes;
-    use http::{Request, Response, header};
-    use http_body_util::{BodyExt, Full, combinators::BoxBody};
-    use rmcp::{
-        ServerHandler,
-        model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig},
-        transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
-        },
-    };
-    use serde_json::{Value, json};
-    use tower::ServiceExt;
-
-    use super::{
-        DEFAULT_HTTP_BODY_LIMIT, LEGACY_PROTOCOL_VERSION, normalize_legacy_protocol_request,
-    };
-
-    type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
-
-    #[derive(Clone)]
-    struct ProtocolProbe;
-
-    impl ServerHandler for ProtocolProbe {
-        fn get_info(&self) -> ServerConfig {
-            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-                .with_server_info(Implementation::new("t3-code-mcp", "0.1.0"))
-                .with_protocol_version(protocol_version(LEGACY_PROTOCOL_VERSION))
-                .with_instructions("compatibility probe")
-        }
-
-        fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-            Cow::Owned(vec![protocol_version(LEGACY_PROTOCOL_VERSION)])
-        }
-    }
-
-    fn protocol_version(value: &str) -> ProtocolVersion {
-        serde_json::from_value(Value::String(value.to_owned())).expect("version is a string")
-    }
-
-    fn service() -> StreamableHttpService<ProtocolProbe, NeverSessionManager> {
-        let mut config = StreamableHttpServerConfig::default();
-        config.legacy_session_mode = false;
-        config.json_response = true;
-        config.allowed_hosts = vec!["localhost".to_owned()];
-        StreamableHttpService::new(
-            || Ok(ProtocolProbe),
-            std::sync::Arc::new(NeverSessionManager::default()),
-            config,
-        )
-    }
-
-    async fn post(
-        service: &StreamableHttpService<ProtocolProbe, NeverSessionManager>,
-        body: Value,
-        version: Option<&str>,
-    ) -> Response<ResponseBody> {
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("http://localhost/mcp")
-            .header(header::HOST, "localhost")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::ACCEPT, "application/json, text/event-stream");
-        if let Some(version) = version {
-            request = request.header("MCP-Protocol-Version", version);
-        }
-        let request = request
-            .body(Full::new(Bytes::from(body.to_string())))
-            .expect("request");
-        let request = normalize_legacy_protocol_request(request, DEFAULT_HTTP_BODY_LIMIT)
-            .await
-            .expect("small request body");
-        service
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("HTTP service is infallible")
-    }
-
-    #[tokio::test]
-    async fn legacy_http_version_adapter_preserves_initialize_and_follow_up_requests() {
-        let service = service();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": LEGACY_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "compat-test", "version": "1"}
-            }
-        });
-        let initialized = post(&service, initialize, None).await;
-        assert_eq!(initialized.status(), http::StatusCode::OK);
-        let body = initialized
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let body: Value = serde_json::from_slice(&body).expect("JSON response");
-        assert_eq!(body["result"]["protocolVersion"], LEGACY_PROTOCOL_VERSION);
-
-        let notification = post(
-            &service,
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-            Some(LEGACY_PROTOCOL_VERSION),
-        )
-        .await;
-        assert_eq!(notification.status(), http::StatusCode::ACCEPTED);
-
-        let tools = post(
-            &service,
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
-            Some(LEGACY_PROTOCOL_VERSION),
-        )
-        .await;
-        assert_eq!(tools.status(), http::StatusCode::OK);
-        assert!(tools.headers().get("Mcp-Session-Id").is_none());
-        assert!(tools.headers().get("MCP-Protocol-Version").is_none());
-    }
+    Ok(json!({
+        "protocolVersion": version,
+        "capabilities": {"tools": {"listChanged": true}},
+        "serverInfo": {"name": "t3-code-mcp", "version": crate::contract::GATEWAY_VERSION},
+        "instructions": INSTRUCTIONS
+    }))
 }

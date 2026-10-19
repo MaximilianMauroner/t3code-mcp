@@ -96,8 +96,6 @@ export type NativeCalledToolName = (typeof NATIVE_CALLED_TOOL_NAMES)[number];
 /** Every tool a fully connected gateway advertises. */
 export const TOOL_NAMES = [...GATEWAY_TOOL_NAMES, ...NATIVE_TOOL_NAMES] as const;
 
-export type ToolName = (typeof TOOL_NAMES)[number];
-
 const NATIVE_TOOLS = new Set<string>(NATIVE_TOOL_NAMES);
 const NATIVE_MUTATING_TOOLS = new Set<string>(NATIVE_MUTATING_TOOL_NAMES);
 
@@ -121,8 +119,4 @@ export function toolSchemaFingerprint(): string {
     tools: [...TOOL_NAMES].sort(),
   });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-}
-
-export function buildId(): string {
-  return `${GATEWAY_VERSION}+${GATEWAY_COMMIT}`;
 }
