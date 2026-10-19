@@ -44,28 +44,57 @@ pub struct ToolDefinition {
 pub fn gateway_tools() -> &'static [ToolDefinition] {
     static TOOLS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
     TOOLS.get_or_init(|| {
-        serde_json::from_str(include_str!("contract-tools.json"))
-            .expect("embedded gateway tool contract must be valid")
+        let tools: Vec<ToolDefinition> = serde_json::from_str(include_str!("contract-tools.json"))
+            .expect("embedded gateway tool contract must be valid");
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            names.len() == tools.len()
+                && tools.len() == GATEWAY_TOOL_NAMES.len()
+                && GATEWAY_TOOL_NAMES.iter().all(|name| names.contains(name)),
+            "embedded gateway tools must map one-to-one to the executable routes"
+        );
+        tools
     })
 }
 
-pub const GATEWAY_TOOL_NAMES: &[&str] = &[
-    "t3_connection_status",
-    "t3_audit_log",
-    "t3_git_status",
-    "t3_git_diff",
-    "t3_git_compare",
-    "t3_threads_list",
-    "t3_threads_overview",
-    "t3_pending_actions_list",
-    "t3_pending_action_respond",
-    "t3_attachment_upload",
-    "t3_task_start",
-    "t3_task_get",
-    "t3_tasks_list",
-    "t3_task_cancel",
-    "t3_result_get",
-];
+macro_rules! gateway_routes {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum GatewayTool { $($variant),+ }
+
+        impl GatewayTool {
+            pub fn parse(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        pub const GATEWAY_TOOL_NAMES: &[&str] = &[$($name),+];
+    };
+}
+
+gateway_routes! {
+    ConnectionStatus => "t3_connection_status",
+    AuditLog => "t3_audit_log",
+    GitStatus => "t3_git_status",
+    GitDiff => "t3_git_diff",
+    GitCompare => "t3_git_compare",
+    ThreadsList => "t3_threads_list",
+    ThreadsOverview => "t3_threads_overview",
+    PendingActionsList => "t3_pending_actions_list",
+    PendingActionRespond => "t3_pending_action_respond",
+    AttachmentUpload => "t3_attachment_upload",
+    TaskStart => "t3_task_start",
+    TaskGet => "t3_task_get",
+    TasksList => "t3_tasks_list",
+    TaskCancel => "t3_task_cancel",
+    ResultGet => "t3_result_get",
+}
 
 pub const NATIVE_READ_TOOL_NAMES: &[&str] = &[
     "t3_project_list",

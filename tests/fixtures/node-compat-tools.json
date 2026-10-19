@@ -352,7 +352,11 @@
                   "timestamp": {
                     "type": "string"
                   },
-                  "processId": "<PID>",
+                  "processId": {
+                    "type": "integer",
+                    "minimum": -9007199254740991,
+                    "maximum": 9007199254740991
+                  },
                   "source": {
                     "type": "string",
                     "enum": [

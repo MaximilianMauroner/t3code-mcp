@@ -72,8 +72,8 @@ function normalize(value: unknown, paths: ReadonlyArray<readonly [string, string
   if (typeof value !== "object" || value === null) return value;
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined).map(([key, entry]) => {
     if (["durationMs", "latencyMs", "meanMs", "minMs", "maxMs", "medianUpperBoundMs", "p95UpperBoundMs", "bytes"].includes(key) && typeof entry === "number") return [key, "<NUMBER>"];
-    if (key === "processId") return [key, "<PID>"];
-    if (key === "payloadHash") return [key, "<HASH>"];
+    if (key === "processId" && typeof entry === "number") return [key, "<PID>"];
+    if (key === "payloadHash" && typeof entry === "string") return [key, "<HASH>"];
     if (key === "port" && typeof entry === "number" && entry !== 8787 && entry !== 8080) return [key, "<PORT_NUMBER>"];
     if (["observedAt", "createdAt", "updatedAt", "requestedAt", "startedAt", "completedAt", "expiresAt", "fetchedAt"].includes(key) && typeof entry === "string") {
       return [key, "<ISO_TIME>"];
