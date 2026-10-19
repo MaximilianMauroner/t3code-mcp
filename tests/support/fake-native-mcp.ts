@@ -12,8 +12,8 @@ export interface NativeToolCall {
 }
 
 export interface FakeNativeMcpOptions {
-  readonly outputSchemaCount?: number;
-  readonly paginateWithEmptyCursor?: boolean;
+  /** Serves tools/list as two pages joined by an empty-string cursor, with this many extra tools that declare output schemas. */
+  readonly pagedOutputSchemaTools?: number;
 }
 
 /**
@@ -58,15 +58,8 @@ export class FakeNativeMcp {
   private readonly heldToolLists: Array<() => void> = [];
   private readonly heldToolCalls: Array<() => void> = [];
   private readonly authorizations = new Map<string, { readonly challenge: string; readonly clientId: string; readonly scope: string }>();
-  private readonly outputSchemaTools: ReadonlyArray<Tool>;
 
-  constructor(private readonly options: FakeNativeMcpOptions = {}) {
-    this.outputSchemaTools = Array.from({ length: options.outputSchemaCount ?? 0 }, (_, index) => ({
-      name: `output-schema-${index}`,
-      inputSchema: { type: "object", properties: {} },
-      outputSchema: { type: "object", properties: { value: { type: "string", description: `output schema ${index}` } }, required: ["value"] },
-    }));
-  }
+  constructor(private readonly options: FakeNativeMcpOptions = {}) {}
 
   get baseUrl(): string {
     const address = this.server?.address() as AddressInfo | null | undefined;
@@ -324,15 +317,21 @@ export class FakeNativeMcp {
         return { content: [{ type: "text", text: "unexpected" }], isError: true };
       },
     );
-    if (this.options.paginateWithEmptyCursor) {
-      const split = Math.ceil(this.outputSchemaTools.length / 2);
+    const outputSchemaCount = this.options.pagedOutputSchemaTools;
+    if (outputSchemaCount !== undefined) {
+      const outputSchemaTools: Tool[] = Array.from({ length: outputSchemaCount }, (_, index) => ({
+        name: `output-schema-${index}`,
+        inputSchema: { type: "object", properties: {} },
+        outputSchema: { type: "object", properties: { value: { type: "string", description: `output schema ${index}` } }, required: ["value"] },
+      }));
+      const split = Math.ceil(outputSchemaTools.length / 2);
       const firstPage: Tool[] = [
         { name: "t3_thread_list", inputSchema: { type: "object", properties: { projectId: { type: "string" } }, required: ["projectId"] } },
-        ...this.outputSchemaTools.slice(0, split),
+        ...outputSchemaTools.slice(0, split),
       ];
       const secondPage: Tool[] = [
         { name: "t3_thread_send", inputSchema: { type: "object", properties: { threadId: { type: "string" }, message: { type: "string" } }, required: ["threadId", "message"] } },
-        ...this.outputSchemaTools.slice(split),
+        ...outputSchemaTools.slice(split),
       ];
       server.server.removeRequestHandler("tools/list");
       server.server.setRequestHandler(ListToolsRequestSchema, (request) => {

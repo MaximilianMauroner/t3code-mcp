@@ -129,14 +129,13 @@ describe("native T3 login", () => {
 
 describe("native T3 tool proxy", () => {
   it("refreshes every catalog page without retaining output-schema validators", async () => {
-    const native = await startNative({ outputSchemaCount: 75, paginateWithEmptyCursor: true });
+    const native = await startNative({ pagedOutputSchemaTools: 75 });
     const { store, directory } = await nativeGateway(native);
     await login(native, store);
     const client = new NativeMcpClient(native.mcpUrl, store, new AuditLog(join(directory, "audit.jsonl")));
     cleanups.push(() => client.close());
 
     const initial = await client.snapshot();
-    // Ajv keeps these compiled validators in the cache reported by issue 19.
     const sdkClient = (client as unknown as { readonly connection: { readonly client: {
       readonly _jsonSchemaValidator: { readonly _ajv: { readonly _cache: Map<unknown, unknown> } };
     } } }).connection.client;
