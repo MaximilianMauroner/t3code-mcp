@@ -320,10 +320,7 @@ impl GitRunner {
         S: Send + 'static,
         F: FnMut(&mut S, &[u8]) -> Result<(), GitError> + Send + 'static,
     {
-        let correlation_id = format!(
-            "git_{}",
-            rmcp::transport::common::server_side_http::session_id()
-        );
+        let correlation_id = format!("git_{}", uuid::Uuid::new_v4());
         let operation = format!(
             "git {}",
             args.first().map(String::as_str).unwrap_or("unknown")
