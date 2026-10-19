@@ -270,19 +270,19 @@ impl T3Gateway {
             "catalogFetchedAt": snapshot.fetched_at,
             "availableTools": snapshot.tools.len(),
             "missingTools": snapshot.missing,
+            "errorCode": snapshot.error.as_ref().map(|value| &value.code),
             "error": snapshot.error.map(|value| value.message).or(error),
         })
     }
 
     fn partition_operations(&self, native: &Value, has_operate: bool) -> (Vec<String>, Vec<Value>) {
-        let native_credential = native["credential"] == "valid";
+        let native_credential =
+            native["credential"] == "valid" && native["errorCode"] != "native_credential_rejected";
+        let native_usable = native_credential && native["error"].is_null();
         let native_operate = native_credential
             && native["scopes"]
                 .as_array()
                 .is_some_and(|scopes| scopes.iter().any(|scope| scope == "orchestration:operate"));
-        let available = native_tool_names()
-            .filter(|name| native_credential && native_tool_available(native, name))
-            .collect::<std::collections::HashSet<_>>();
         let mut callable = Vec::new();
         let mut disabled = Vec::new();
         for operation in GATEWAY_TOOL_NAMES
@@ -290,17 +290,23 @@ impl T3Gateway {
             .chain(native_tool_names().collect::<Vec<_>>().iter())
         {
             let blocker = if is_native_tool_name(operation) {
-                (!available.contains(operation)).then(|| native_block_reason(native, operation))
-            } else if operation == &"t3_attachment_upload"
-                && !available.contains("t3_attachment_prepare_upload")
-            {
-                Some(format!(
-                    "Native T3 does not offer t3_attachment_prepare_upload, which {operation} needs."
-                ))
-            } else if operation == &"t3_task_cancel" && !available.contains("t3_thread_interrupt") {
-                Some(format!(
-                    "Native T3 does not offer t3_thread_interrupt, which {operation} needs."
-                ))
+                (!native_credential || !native_tool_available(native, operation))
+                    .then(|| native_block_reason(native))
+            } else if let Some(required) = match *operation {
+                "t3_attachment_upload" => Some("t3_attachment_prepare_upload"),
+                "t3_task_cancel" => Some("t3_thread_interrupt"),
+                _ => None,
+            } {
+                if !native_usable {
+                    Some(native_block_reason(native))
+                } else {
+                    native["missingTools"]
+                        .as_array()
+                        .is_some_and(|missing| missing.iter().any(|name| name == required))
+                        .then(|| {
+                            format!("Native T3 does not offer {required}, which {operation} needs.")
+                        })
+                }
             } else {
                 None
             };
@@ -1911,11 +1917,11 @@ fn native_audit_summary(name: &str, result: &Map<String, Value>) -> Value {
     summary
 }
 
-fn native_block_reason(native: &Value, name: &str) -> String {
+fn native_block_reason(native: &Value) -> String {
     native["error"]
         .as_str()
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("Native T3 does not offer {name}."))
+        .unwrap_or_else(|| "Native T3 does not offer this tool.".into())
 }
 
 fn freshness(last: Option<&str>, stale_after_ms: u64) -> &'static str {

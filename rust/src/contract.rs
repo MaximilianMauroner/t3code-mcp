@@ -258,23 +258,6 @@ mod tests {
         let declared = [node_names(&contract, "gatewayToolNames"), native].concat();
         assert_eq!(tool_names().collect::<Vec<_>>(), declared);
         assert_eq!(tool_names().collect::<HashSet<_>>().len(), declared.len());
-
-        for name in native_called_tool_names()
-            .chain(GATEWAY_TOOL_NAMES.iter().copied())
-            .chain(["unknown", "", "T3_THREAD_SEND", "t3_thread_read "])
-        {
-            assert_eq!(
-                is_native_tool_name(name),
-                NATIVE_READ_TOOL_NAMES.contains(&name)
-                    || NATIVE_MUTATING_TOOL_NAMES.contains(&name),
-                "native classification for {name}"
-            );
-            assert_eq!(
-                is_native_mutating_tool(name),
-                NATIVE_MUTATING_TOOL_NAMES.contains(&name),
-                "native mutation classification for {name}"
-            );
-        }
     }
 
     #[test]

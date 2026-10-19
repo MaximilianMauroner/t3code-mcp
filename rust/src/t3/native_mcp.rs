@@ -682,42 +682,70 @@ impl NativeMcpClient {
                 "Native T3 returned an upload URL outside its own origin.",
             ));
         }
-        let response = self
-            .0
-            .upload
-            .post(target)
-            .header("content-type", mime_type)
-            .body(bytes)
-            .timeout(self.0.timeout)
-            .send()
-            .await
-            .map_err(|e| {
-                NativeError::new(
-                    "native_upload_failed",
-                    format!("Attachment upload failed: {e}"),
-                )
-            })?;
-        if response.status().is_redirection() {
-            return Err(NativeError::new(
-                "native_upload_failed",
-                "Attachment upload failed: fetch failed",
-            ));
-        }
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let detail = response
-                .text()
+        let id = format!("native_{}", uuid::Uuid::new_v4());
+        let started = now();
+        record(
+            self.0.audit.as_deref(),
+            &id,
+            "attachment.upload",
+            "started",
+            None,
+            Some(json!({"sizeBytes":bytes.len(),"mimeType":mime_type})),
+        );
+        let mut status = None;
+        let result = async {
+            let response = self
+                .0
+                .upload
+                .post(target)
+                .header("content-type", mime_type)
+                .body(bytes)
+                .timeout(self.0.timeout)
+                .send()
                 .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect::<String>();
-            return Err(NativeError::new(
-                "native_upload_failed",
-                format!("Native T3 refused the upload (HTTP {status}): {detail}"),
-            ));
+                .map_err(|error| {
+                    NativeError::new(
+                        "native_upload_failed",
+                        format!("Attachment upload failed: {}", error.without_url()),
+                    )
+                })?;
+            status = Some(response.status().as_u16());
+            if response.status().is_redirection() {
+                return Err(NativeError::new(
+                    "native_upload_failed",
+                    "Attachment upload failed: fetch failed",
+                ));
+            }
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let detail = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                return Err(NativeError::new(
+                    "native_upload_failed",
+                    format!("Native T3 refused the upload (HTTP {status}): {detail}"),
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        record(
+            self.0.audit.as_deref(),
+            &id,
+            "attachment.upload",
+            if status.is_some_and(|status| status < 300) {
+                "completed"
+            } else {
+                "error"
+            },
+            Some(now() - started),
+            Some(json!({"status":status})),
+        );
+        result
     }
     pub fn close(&self) {
         let mut state = self.0.state.lock().unwrap();

@@ -234,6 +234,6 @@ The command reads a fixed byte snapshot without altering the log or contacting T
 
 New downstream audit events include `parentCorrelationId` and `parentOperation` from an async-local MCP context, keeping concurrent callers isolated. Historical events without parents remain explicitly unattributed. Median and p95 latencies are fixed-histogram upper bounds; means/minima/maxima are exact. Operation groups and tracked thread comparisons have fixed caps; thread-state evictions are reported. The audit tool streams filtering/pagination while preserving append order, filtered offsets, total matches and invalid-line counts. A query still scans the snapshot to compute totals but does not retain the full history. Appends are visible on the next query. Rotation/deletion is not performed.
 
-Run `pnpm build` then `pnpm benchmark:audit` for a disposable large-file benchmark under a 32 MB JavaScript heap. The benchmark never reads live history or dispatches tasks.
+Run `pnpm benchmark:audit` for a disposable Rust audit benchmark. On Linux, the scan child enforces a 32 MiB `RLIMIT_DATA` limit on process data, not RSS. Other platforms report that the limit is not enforced. The benchmark never reads live history or dispatches tasks.
 
 See [task briefs and evaluation](task-briefs.md) for launch and continuation prompt examples.
