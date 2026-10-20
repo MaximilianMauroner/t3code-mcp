@@ -184,7 +184,7 @@ impl T3Gateway {
         let telemetry = self.client.telemetry();
         let last_observed_at = telemetry.last_snapshot_at.or(telemetry.last_successful_at);
         let observed_at = now_iso();
-        let native = self.native_status().await;
+        let (native, native_rejected) = self.native_status().await;
         let has_operate =
             failure.is_none() && scopes.iter().any(|scope| scope == "orchestration:operate");
         let access = if self.config.read_only || !has_operate {
@@ -197,7 +197,7 @@ impl T3Gateway {
             .filter(|name| !self.config.read_only || !MUTATING_OPERATIONS.contains(name))
             .copied()
             .collect::<Vec<_>>();
-        let (callable, disabled) = self.partition_operations(&native, has_operate);
+        let (callable, disabled) = self.partition_operations(&native, native_rejected, has_operate);
         let environment = descriptor.as_ref().map(|value| {
             json!({
                 "environmentId": value.environment_id,
@@ -239,7 +239,7 @@ impl T3Gateway {
         result
     }
 
-    async fn native_status(&self) -> Value {
+    async fn native_status(&self) -> (Value, bool) {
         let state = self.native.credential_state();
         let snapshot = self.native.snapshot().await;
         let (credential, access, scopes, expires_at, error) = match state {
@@ -261,7 +261,11 @@ impl T3Gateway {
                 None,
             ),
         };
-        json!({
+        let rejected = snapshot
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "native_credential_rejected");
+        let status = json!({
             "url": self.config.endpoint.t3_native_mcp_url,
             "credential": credential,
             "access": access,
@@ -270,14 +274,18 @@ impl T3Gateway {
             "catalogFetchedAt": snapshot.fetched_at,
             "availableTools": snapshot.tools.len(),
             "missingTools": snapshot.missing,
-            "errorCode": snapshot.error.as_ref().map(|value| &value.code),
             "error": snapshot.error.map(|value| value.message).or(error),
-        })
+        });
+        (status, rejected)
     }
 
-    fn partition_operations(&self, native: &Value, has_operate: bool) -> (Vec<String>, Vec<Value>) {
-        let native_credential =
-            native["credential"] == "valid" && native["errorCode"] != "native_credential_rejected";
+    fn partition_operations(
+        &self,
+        native: &Value,
+        native_rejected: bool,
+        has_operate: bool,
+    ) -> (Vec<String>, Vec<Value>) {
+        let native_credential = native["credential"] == "valid" && !native_rejected;
         let native_usable = native_credential && native["error"].is_null();
         let native_operate = native_credential
             && native["scopes"]
