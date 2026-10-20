@@ -629,11 +629,15 @@ impl NativeMcpClient {
                         return Err(NativeError {
                             code: "native_rejected".into(),
                             message: format!("Native T3 rejected {name}: {}", error.message),
-                            protocol_error: error.protocol_error.filter(|_| {
-                                invocation
-                                    .as_ref()
-                                    .is_some_and(crate::mcp::Invocation::is_cancelled)
-                            }),
+                            protocol_error: invocation
+                                .as_ref()
+                                .filter(|invocation| invocation.is_cancelled())
+                                .map(|_| {
+                                    Box::new(crate::mcp::RpcError::new(
+                                        -32800,
+                                        "Request cancelled.",
+                                    ))
+                                }),
                         });
                     }
                     if failure == "unauthorized" {

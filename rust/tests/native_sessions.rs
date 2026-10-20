@@ -82,6 +82,12 @@ impl Fixture {
                     let slot = request.body["params"]["arguments"]["slot"].as_u64().unwrap() as usize;
                     events.send(request.clone()).unwrap();
                     gates[slot].release.notified().await;
+                    if request.body["params"]["arguments"]["reject"] == true {
+                        return Reply::json(json!({"jsonrpc":"2.0","id":request.body["id"],"error":{
+                            "code":-32602,"message":"upstream rejection",
+                            "data":{"private":"cancelled-rejection-marker"},
+                        }}));
+                    }
                     let mut reply = Reply::json(json!({"jsonrpc":"2.0","id":request.body["id"],"result":{
                         "content":[],"structuredContent":{"params":request.body["params"]}
                     }}));
@@ -566,6 +572,36 @@ async fn cancelled_reads_do_not_retry_a_lost_response() {
         body(&response)["result"]["structuredContent"]["error"]["code"],
         "native_unavailable"
     );
+    assert_eq!(fixture.calls(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_native_rejections_do_not_forward_upstream_data() {
+    let fixture = Fixture::new().await;
+    let session = fixture.session().await;
+    let mut value = call(json!(1), 0, false);
+    value["params"]["arguments"]["reject"] = json!(true);
+    let server = fixture.server.clone();
+    let gateway = fixture.gateway.clone();
+    let request = request("POST", Some(&session), value);
+    let pending = tokio::spawn(async move {
+        server
+            .handle_http(request, &options(), gateway.as_ref())
+            .await
+    });
+    let wire = fixture.event().await;
+    fixture.send(Some(&session), cancel(json!(1))).await;
+    let cancellation = fixture.event().await;
+    assert_eq!(cancellation.body["params"]["requestId"], wire.body["id"]);
+    fixture.gates[0].release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = body(&response);
+    assert_eq!(result["error"]["code"], -32800, "{result}");
+    assert!(result["error"].get("data").is_none(), "{result}");
+    assert!(!result.to_string().contains("cancelled-rejection-marker"));
     assert_eq!(fixture.calls(), 1);
 }
 
