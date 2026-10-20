@@ -17,8 +17,6 @@ pub(super) fn parse(tool: &Value, value: Option<&Value>) -> Result<Map<String, V
     } else {
         SchemaUse::NativeInput
     };
-    let empty = Value::Object(Map::new());
-    let value = value.or((!gateway).then_some(&empty));
     let mut errors = Vec::new();
     let parsed = parse_value(&tool["inputSchema"], value, "", schema_use, &mut errors);
     if !errors.is_empty() {
@@ -238,7 +236,7 @@ fn parse_value(
             {
                 *text = text.trim_matches(js_whitespace).to_owned();
             }
-            let length = text.encode_utf16().count() as f64;
+            let length = text.chars().count() as f64;
             bounds(
                 schema,
                 length,
