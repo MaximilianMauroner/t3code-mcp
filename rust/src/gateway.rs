@@ -32,7 +32,7 @@ use crate::{
         },
         journal::{
             BeginOperationInput, BeginTaskInput, FailureEvidenceOrder, OperationJournal,
-            OperationPatch, OperationStatus, RecoveryState, TaskPatch, TaskStage,
+            OperationPatch, OperationStatus, RecoveryState, TaskPatch, TaskStage, TerminalRecovery,
             WritableOperationKind, hash_payload,
         },
     },
@@ -602,20 +602,7 @@ impl T3Gateway {
             .await
             .map_err(ToolFailure::from)?;
         self.assert_environment(&descriptor)?;
-        let failures = shell
-            .threads
-            .iter()
-            .map(|thread| {
-                self.observe_summary_failure(
-                    thread,
-                    None,
-                    shell.snapshot_sequence,
-                    read_started_at,
-                    None,
-                )
-                .map(|observed| (thread.id.as_str(), observed))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+        self.observe_shell_recoveries(&shell.threads, shell.snapshot_sequence, read_started_at)?;
         let now = Utc::now().timestamp_millis();
         let projects = project_titles(&shell);
         let open_queue = input.status.is_none()
@@ -672,6 +659,19 @@ impl T3Gateway {
             })
             .collect::<Vec<_>>();
         sort_threads(&mut filtered, &input.sort, now);
+        let failures = filtered
+            .iter()
+            .map(|thread| {
+                self.observe_summary_failure(
+                    thread,
+                    None,
+                    shell.snapshot_sequence,
+                    read_started_at,
+                    None,
+                )
+                .map(|observed| (thread.id.as_str(), observed))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         let mut summaries = filtered
             .iter()
             .map(|thread| {
@@ -719,20 +719,7 @@ impl T3Gateway {
             .await
             .map_err(ToolFailure::from)?;
         self.assert_environment(&descriptor)?;
-        let failures = shell
-            .threads
-            .iter()
-            .map(|thread| {
-                self.observe_summary_failure(
-                    thread,
-                    None,
-                    shell.snapshot_sequence,
-                    read_started_at,
-                    None,
-                )
-                .map(|observed| (thread.id.as_str(), observed))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+        self.observe_shell_recoveries(&shell.threads, shell.snapshot_sequence, read_started_at)?;
         let observed_at = Utc::now();
         let now = observed_at.timestamp_millis();
         let projects = project_titles(&shell);
@@ -749,6 +736,19 @@ impl T3Gateway {
                         || thread.archived_at.as_deref().is_none_or(str::is_empty))
             })
             .collect::<Vec<_>>();
+        let failures = filtered
+            .iter()
+            .map(|thread| {
+                self.observe_summary_failure(
+                    thread,
+                    None,
+                    shell.snapshot_sequence,
+                    read_started_at,
+                    None,
+                )
+                .map(|observed| (thread.id.as_str(), observed))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         let mut counts = json!({"open":0,"snoozed":0,"settled":0,"archived":0});
         let mut execution_counts = json!({"running":0,"starting":0,"awaiting_approval":0,"awaiting_input":0,"failed":0,"idle":0});
         let mut running = Vec::new();
@@ -1202,6 +1202,38 @@ impl T3Gateway {
         }
     }
 
+    fn observe_shell_recoveries(
+        &self,
+        threads: &[ThreadShell],
+        sequence: u64,
+        read_started_at: u64,
+    ) -> Result<(), ToolFailure> {
+        let recoveries = threads
+            .iter()
+            .filter_map(|thread| {
+                let turn = thread.latest_turn.as_ref()?;
+                let state = match turn.state {
+                    TurnState::Completed => RecoveryState::Completed,
+                    TurnState::Interrupted => RecoveryState::Interrupted,
+                    _ => return None,
+                };
+                Some(
+                    task::shell_failure_order(thread, sequence, read_started_at).map(|order| {
+                        TerminalRecovery {
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.turn_id.clone(),
+                            state,
+                            order: Some(order),
+                        }
+                    }),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.journal
+            .clear_terminal_failures(&recoveries)
+            .map_err(journal_failure)
+    }
+
     fn observe_summary_failure(
         &self,
         selected: &ThreadShell,
@@ -1263,25 +1295,28 @@ impl T3Gateway {
                     && order.compare(shell_order).is_lt()
             });
             if !stale_full {
-                if let Some(recovery) = recovery {
-                    self.journal
+                match (recovery, failure) {
+                    (Some(recovery), _) if full.is_some() => self
+                        .journal
                         .clear_terminal_failure(
                             &selected.id,
                             turn_id,
                             recovery,
                             Some(order.clone()),
                         )
-                        .map_err(journal_failure)?;
-                } else if let Some(failure) = failure {
-                    self.journal
-                        .retain_terminal_failure(
-                            &selected.id,
-                            turn_id,
-                            serde_json::to_value(failure).expect("serializable failure"),
-                            None,
-                            Some(order.clone()),
-                        )
-                        .map_err(journal_failure)?;
+                        .map_err(journal_failure)?,
+                    (None, Some(failure)) => {
+                        self.journal
+                            .retain_terminal_failure(
+                                &selected.id,
+                                turn_id,
+                                serde_json::to_value(failure).expect("serializable failure"),
+                                None,
+                                Some(order.clone()),
+                            )
+                            .map_err(journal_failure)?;
+                    }
+                    _ => {}
                 }
             }
         }

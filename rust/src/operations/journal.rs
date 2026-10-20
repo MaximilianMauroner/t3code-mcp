@@ -638,13 +638,12 @@ impl OperationJournal {
         order: Option<FailureEvidenceOrder>,
     ) -> Result<Option<Value>> {
         let mut locked = self.state()?;
-        let mut state = locked.clone();
         if !valid_failure(&candidate) || candidate["turnId"] != turn {
             return Err(invalid("A terminal failure must match its turn."));
         }
         let key = failure_key(thread, turn);
         let operation = operation_id
-            .and_then(|id| state.entries.values().find(|row| row["operationId"] == id))
+            .and_then(|id| locked.entries.values().find(|row| row["operationId"] == id))
             .cloned();
         if operation.as_ref().is_some_and(|row| {
             row["threadId"] != thread || row.get("turnId").is_some_and(|id| id != turn)
@@ -653,17 +652,7 @@ impl OperationJournal {
                 "A terminal failure does not match the run operation.",
             ));
         }
-        let legacy = state
-            .entries
-            .values()
-            .find(|row| {
-                row["kind"] == "thread.turn.start"
-                    && row["threadId"] == thread
-                    && row["turnId"] == turn
-                    && row["terminalFailure"]["turnId"] == turn
-            })
-            .and_then(|row| row.get("terminalFailure"));
-        let retained = state.thread_failures.get(&key);
+        let retained = locked.thread_failures.get(&key);
         let retained_order = retained.and_then(|row| row.get("order"));
         let order = order.map(|order| order_with_era(order.0, retained_order));
         let comparison = order
@@ -682,7 +671,18 @@ impl OperationJournal {
                     .as_ref()
                     .and_then(|row| row.get("terminalFailure"))
             })
-            .or(legacy);
+            .or_else(|| {
+                locked
+                    .entries
+                    .values()
+                    .find(|row| {
+                        row["kind"] == "thread.turn.start"
+                            && row["threadId"] == thread
+                            && row["turnId"] == turn
+                            && row["terminalFailure"]["turnId"] == turn
+                    })
+                    .and_then(|row| row.get("terminalFailure"))
+            });
         let stale =
             retained_order.is_some() && (order.is_none() || comparison == Some(Ordering::Less));
         let same_reason = order
@@ -821,8 +821,9 @@ impl OperationJournal {
         if let Some(order) = next_order {
             row["order"] = order;
         }
-        state.thread_failures.insert(key, row);
         if failure_changed || order_changed || operation_changed {
+            let mut state = locked.clone();
+            state.thread_failures.insert(key, row);
             if let Some(mut operation) = operation {
                 operation.0["turnId"] = json!(turn);
                 operation.0["terminalRunStatus"] = json!("failed");
@@ -833,8 +834,10 @@ impl OperationJournal {
                     .insert(text(&operation, "idempotencyKey").into(), operation);
             }
             self.persist(&state)?;
+            *locked = state;
+        } else {
+            locked.thread_failures.insert(key, row);
         }
-        *locked = state;
         Ok(Some(merged))
     }
     pub fn clear_terminal_failure(
@@ -853,11 +856,13 @@ impl OperationJournal {
     }
     pub fn clear_terminal_failures(&self, recoveries: &[TerminalRecovery]) -> Result<()> {
         let mut locked = self.state()?;
-        let mut state = locked.clone();
+        let mut pending = IndexMap::<String, Value>::new();
         let mut cleared = std::collections::HashSet::new();
         for recovery in recoveries {
             let key = failure_key(&recovery.thread_id, &recovery.turn_id);
-            let retained = state.thread_failures.get(&key);
+            let retained = pending
+                .get(&key)
+                .or_else(|| locked.thread_failures.get(&key));
             let old_order = retained.and_then(|o| o.get("order"));
             let mut order = recovery
                 .order
@@ -886,15 +891,17 @@ impl OperationJournal {
                     && o["recoveredState"] == tombstone["recoveredState"]
                     && same_persisted_order(old_order, order.as_ref())
             });
-            state.thread_failures.insert(key.clone(), tombstone);
+            pending.insert(key.clone(), tombstone);
             if !unchanged {
                 cleared.insert(key);
             }
         }
         if cleared.is_empty() {
-            *locked = state;
+            locked.thread_failures.extend(pending);
             return Ok(());
         }
+        let mut state = locked.clone();
+        state.thread_failures.extend(pending);
         for entry in state.entries.values_mut() {
             if entry["kind"] != "thread.turn.start"
                 || !cleared.contains(&failure_key(text(entry, "threadId"), text(entry, "turnId")))
