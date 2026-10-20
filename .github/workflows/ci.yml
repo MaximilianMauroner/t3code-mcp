@@ -30,3 +30,17 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm typecheck:test
       - run: pnpm exec vitest run --no-file-parallelism --maxWorkers=1 --testTimeout=30000 --hookTimeout=30000
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatin/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo fmt --manifest-path rust/Cargo.toml --check
+      - run: cargo build --manifest-path rust/Cargo.toml --locked --release
+      - run: cargo test --manifest-path rust/Cargo.toml --locked
+      - run: cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets -- -D warnings
