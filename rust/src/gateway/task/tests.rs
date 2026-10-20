@@ -835,6 +835,7 @@ async fn local_task_results_have_the_node_mcp_envelope_and_audit_shape() {
         )
         .await
         .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     let result = &response["result"];
     assert!(result.get("isError").is_none(), "{response}");
     assert_eq!(result["structuredContent"]["task"]["stage"], "run_accepted");
@@ -876,7 +877,7 @@ async fn native_results_pass_through_once_and_audit_only_the_result_shape() {
         .await
         .unwrap();
     assert_eq!(
-        Value::Object(result),
+        serde_json::to_value(result).unwrap(),
         json!({"content":[],"structuredContent":{"status":"interrupt_requested"}})
     );
     let events = std::fs::read_to_string(fixture.directory.join("audit.jsonl"))

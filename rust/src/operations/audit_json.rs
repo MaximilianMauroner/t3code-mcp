@@ -79,6 +79,15 @@ pub enum AuditValue {
 }
 
 impl AuditValue {
+    pub fn object<const N: usize>(entries: [(&str, Self); N]) -> Self {
+        Self::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+        )
+    }
+
     pub fn from_utf16(units: Vec<u16>) -> Self {
         match String::from_utf16(&units) {
             Ok(text) => Self::String(text),
@@ -175,6 +184,30 @@ impl AuditValue {
             }
             _ => (),
         }
+    }
+}
+
+impl From<&Value> for AuditValue {
+    fn from(value: &Value) -> Self {
+        value.clone().into()
+    }
+}
+
+impl From<&AuditValue> for AuditValue {
+    fn from(value: &AuditValue) -> Self {
+        value.clone()
+    }
+}
+
+impl From<&str> for AuditValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.into())
+    }
+}
+
+impl From<String> for AuditValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
     }
 }
 

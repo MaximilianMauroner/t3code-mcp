@@ -585,3 +585,72 @@ mod retirement_overview_tests {
 mod retirement_settings_tests {
     include!("retirement_settings_tests.rs");
 }
+
+#[tokio::test]
+async fn split_request_previews_preserve_http_and_websocket_dispatch() {
+    use crate::operations::audit_log::{AuditLog, AuditQueryInput};
+    for version in [1, 2] {
+        let server = Server::start(move |request| {
+            async move {
+                if request.path == "/.well-known/t3/environment" {
+                    Reply::json(descriptor(version))
+                } else {
+                    Reply::json(json!({"sequence":7}))
+                }
+            }
+            .boxed()
+        })
+        .await;
+        let directory =
+            std::env::temp_dir().join(format!("t3-audit-request-{}", uuid::Uuid::new_v4()));
+        let audit = Arc::new(AuditLog::new(directory.join("audit.jsonl")));
+        let client = T3HttpClient::new(
+            &server.url,
+            "fixture-token",
+            Duration::from_secs(2),
+            Some(audit.clone()),
+        );
+        let long = format!("{}😀", "a".repeat(511));
+        let mut value = serde_json::to_value(command()).unwrap();
+        value["threadId"] = json!(long);
+        let command = serde_json::from_value(value).unwrap();
+        assert_eq!(client.dispatch(&command, None).await.unwrap().sequence, 7);
+        assert_eq!(client.dispatch(&command, None).await.unwrap().sequence, 7);
+        let requests = server.requests.lock().unwrap();
+        let dispatches = requests
+            .iter()
+            .filter(|request| {
+                request.path == "/api/orchestration/dispatch" || request.path.starts_with("/ws")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dispatches.len(), 2);
+        for request in dispatches {
+            let payload = if version == 1 {
+                &request.body
+            } else {
+                &request.body["payload"]
+            };
+            assert_eq!(payload["threadId"], long);
+        }
+        assert!(audit.diagnostic_error().is_none());
+        let page = audit.query(&AuditQueryInput::default()).unwrap();
+        assert_eq!(page.invalid_lines, 0);
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|row| row.event == "upstream.response"
+                    && row
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| operation == "POST /api/orchestration/dispatch"
+                            || operation == "orchestration.dispatchCommand")
+                    && row
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome == "completed"))
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

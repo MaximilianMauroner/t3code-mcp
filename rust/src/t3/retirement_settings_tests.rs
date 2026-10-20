@@ -112,6 +112,7 @@ impl SettingsFixture {
             IncomingMessage::parse(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}})).unwrap(),
             self.gateway.as_ref().unwrap(),
         ).await.unwrap();
+    let response = serde_json::to_value(response).unwrap();
         assert!(response.get("error").is_none(), "{response}");
         let result = &response["result"];
         assert_ne!(result["isError"], true, "{result}");

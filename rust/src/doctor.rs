@@ -177,6 +177,7 @@ pub async fn run_doctor(
         )
         .await
         .expect("request response");
+    let response = serde_json::to_value(response).unwrap();
     let mut discovered = response["result"]["tools"]
         .as_array()
         .into_iter()

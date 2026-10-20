@@ -91,6 +91,7 @@ async fn call(fixture: &Fixture, name: &str, arguments: Value) -> Value {
         )
         .await
         .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     let result = &response["result"];
     let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(text, result["structuredContent"], "{response}");

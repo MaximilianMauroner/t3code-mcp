@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +45,7 @@ impl Delivery {
         (delivery, output)
     }
 
-    pub(crate) fn send(&self, message: &Value) -> bool {
+    pub(crate) fn send(&self, message: &impl Serialize) -> bool {
         self.send_bytes(Bytes::from(
             serde_json::to_vec(message).expect("JSON output"),
         ))

@@ -1,4 +1,4 @@
-use super::audit_log::{AuditEventInput, AuditLog, AuditSource, summarize_for_audit};
+use super::audit_log::{AuditEventInput, AuditLog, AuditSource, AuditValue, summarize_for_audit};
 use super::{audit_json::normalize_json, parse_timestamp};
 use crate::settings::{RuntimeMode, SettingsReceipt};
 use chrono::{SecondsFormat, Utc};
@@ -433,7 +433,17 @@ impl OperationJournal {
         *entry = record.clone();
         self.persist(&state)?;
         *locked = state;
-        self.audit("operation.update", Some(operation_id), record["kind"].as_str(), text(&record, "status"), json!({"operationId":operation_id, "status":record["status"], "patch":summarize_for_audit(&patch)}));
+        self.audit(
+            "operation.update",
+            Some(operation_id),
+            record["kind"].as_str(),
+            text(&record, "status"),
+            AuditValue::object([
+                ("operationId", operation_id.into()),
+                ("status", (&record["status"]).into()),
+                ("patch", summarize_for_audit(&patch)),
+            ]),
+        );
         Ok(record)
     }
     pub fn update_task(&self, task_ref: &str, patch: TaskPatch) -> Result<TaskRecord> {
@@ -454,7 +464,11 @@ impl OperationJournal {
             Some(task_ref),
             Some("task.start"),
             "completed",
-            json!({"taskRef":task_ref,"stage":record["stage"],"patch":summarize_for_audit(&patch)}),
+            AuditValue::object([
+                ("taskRef", task_ref.into()),
+                ("stage", (&record["stage"]).into()),
+                ("patch", summarize_for_audit(&patch)),
+            ]),
         );
         Ok(record)
     }
@@ -933,14 +947,14 @@ impl OperationJournal {
         correlation: Option<&str>,
         operation: Option<&str>,
         outcome: &str,
-        details: Value,
+        details: impl Into<AuditValue>,
     ) {
         if let Some(log) = &self.audit_log {
             let mut input = AuditEventInput::new(AuditSource::Journal, event);
             input.correlation_id = correlation.map(str::to_owned);
             input.operation = operation.map(str::to_owned);
             input.outcome = Some(outcome.into());
-            input.details = Some(details);
+            input.details = Some(details.into());
             log.record(input);
         }
     }

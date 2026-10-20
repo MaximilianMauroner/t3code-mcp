@@ -380,7 +380,7 @@ mod expiry_tests {
                 &self,
                 _: ToolCall,
                 _: Option<Invocation>,
-            ) -> Result<Map<String, Value>, ToolFailure> {
+            ) -> Result<crate::mcp::ToolResult, ToolFailure> {
                 unreachable!("expiry does not invoke a tool")
             }
         }

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::{io, sync::Arc, time::Duration};
 
 use super::{
-    AdmittedMessage, Delivery, IncomingMessage, McpServer, Output, Peer, RpcError,
+    AdmittedMessage, Delivery, IncomingMessage, McpServer, Output, Peer, RpcError, RpcResponse,
     SUPPORTED_PROTOCOL_VERSIONS, ToolHandler,
 };
 
@@ -152,8 +152,10 @@ impl McpServer {
                     ));
                 }
                 if let Some(Ok(bytes)) = &first {
-                    let value: Value = serde_json::from_slice(bytes).expect("JSON output");
-                    if value.get("method").is_some() {
+                    let fields = serde_json::from_slice::<
+                        std::collections::HashMap<String, Box<serde_json::value::RawValue>>,
+                    >(bytes);
+                    if fields.is_ok_and(|fields| fields.contains_key("method")) {
                         return sse_response(sse_body(
                             output,
                             first,
@@ -184,6 +186,7 @@ impl McpServer {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+        let valid_initialize = matches!(responses.as_slice(), [RpcResponse::Success { .. }]);
         let mut response = match responses.len() {
             0 => empty(202),
             1 => json_response(
@@ -191,13 +194,10 @@ impl McpServer {
                 responses.into_iter().next().expect("one response"),
                 "application/json",
             ),
-            _ => json_response(200, Value::Array(responses), "application/json"),
+            _ => json_response(200, responses, "application/json"),
         };
         if let Some(id) = issued {
-            let valid = serde_json::from_slice::<Value>(response.body())
-                .ok()
-                .is_some_and(|body| body.get("result").is_some());
-            if valid {
+            if valid_initialize {
                 response
                     .headers_mut()
                     .insert("mcp-session-id", id.parse().expect("opaque session ID"));
@@ -465,7 +465,7 @@ pub(crate) fn body_too_large() -> Response<Bytes> {
     gateway_json(400, json!({"error":"Request body is too large."}))
 }
 
-fn json_response(status: u16, body: Value, content_type: &str) -> Response<Bytes> {
+fn json_response(status: u16, body: impl serde::Serialize, content_type: &str) -> Response<Bytes> {
     Response::builder()
         .status(status)
         .header("content-type", content_type)

@@ -1,6 +1,7 @@
 use serde_json::{Map, Value};
 
-use super::wire::value_type;
+use super::ToolResult;
+use crate::operations::audit_log::{AuditValue, JsString};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SchemaUse {
@@ -18,21 +19,31 @@ pub(super) fn parse(tool: &Value, value: Option<&Value>) -> Result<Map<String, V
         SchemaUse::NativeInput
     };
     let mut errors = Vec::new();
-    let parsed = parse_value(&tool["inputSchema"], value, "", schema_use, &mut errors);
+    let value = value.map(AuditValue::from);
+    let parsed = parse_value(
+        &tool["inputSchema"],
+        value.as_ref(),
+        "",
+        schema_use,
+        &mut errors,
+    );
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
     Ok(parsed
+        .map(|value| serde_json::to_value(value).expect("UTF-8 tool arguments"))
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default())
 }
 
-pub(super) fn output_error(tool: &Value, result: &Map<String, Value>) -> Option<String> {
+pub(super) fn output_error(tool: &Value, result: &ToolResult) -> Option<String> {
     let name = tool["name"].as_str().unwrap_or_default();
-    if !crate::contract::GATEWAY_TOOL_NAMES.contains(&name)
-        || !result.contains_key("content")
-        || result.get("isError") == Some(&Value::Bool(true))
-    {
+    if !crate::contract::GATEWAY_TOOL_NAMES.contains(&name) {
+        return None;
+    }
+    let result: AuditValue =
+        serde_json::from_str(result.as_raw().get()).expect("serialized tool result");
+    if result.get("content").is_none() || result.get("isError") == Some(&AuditValue::Bool(true)) {
         return None;
     }
     let schema = tool.get("outputSchema")?;
@@ -60,26 +71,28 @@ pub(super) fn output_error(tool: &Value, result: &Map<String, Value>) -> Option<
     })
 }
 
-fn js_truthy(value: &Value) -> bool {
+fn js_truthy(value: &AuditValue) -> bool {
     match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
+        AuditValue::Null => false,
+        AuditValue::Bool(value) => *value,
+        AuditValue::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        AuditValue::String(value) => !value.is_empty(),
+        AuditValue::Utf16String(value) => !value.is_empty(),
+        AuditValue::Array(_) | AuditValue::Object(_) => true,
     }
 }
 
 fn parse_value(
     schema: &Value,
-    input: Option<&Value>,
+    input: Option<&AuditValue>,
     path: &str,
     schema_use: SchemaUse,
     errors: &mut Vec<String>,
-) -> Option<Value> {
-    let input = input.or_else(|| schema.get("default"));
+) -> Option<AuditValue> {
+    let default = schema.get("default").map(AuditValue::from);
+    let input = input.or(default.as_ref());
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        if !input.is_some_and(|v| allowed.contains(v)) {
+        if !input.is_some_and(|v| allowed.iter().any(|allowed| v == allowed)) {
             let choices = allowed
                 .iter()
                 .map(|v| serde_json::to_string(v).expect("JSON enum"))
@@ -110,7 +123,7 @@ fn parse_value(
         return input.cloned();
     }
     if let Some(expected) = schema.get("const")
-        && input != Some(expected)
+        && input.is_none_or(|input| input != expected)
     {
         issue(
             errors,
@@ -146,12 +159,15 @@ fn parse_value(
         || expected_types.iter().any(|expected| {
             matches!(
                 (*expected, input),
-                ("object", Some(Value::Object(_)))
-                    | ("array", Some(Value::Array(_)))
-                    | ("string", Some(Value::String(_)))
-                    | ("number" | "integer", Some(Value::Number(_)))
-                    | ("boolean", Some(Value::Bool(_)))
-                    | ("null", Some(Value::Null))
+                ("object", Some(AuditValue::Object(_)))
+                    | ("array", Some(AuditValue::Array(_)))
+                    | (
+                        "string",
+                        Some(AuditValue::String(_) | AuditValue::Utf16String(_))
+                    )
+                    | ("number" | "integer", Some(AuditValue::Number(_)))
+                    | ("boolean", Some(AuditValue::Bool(_)))
+                    | ("null", Some(AuditValue::Null))
             )
         });
     if !matches {
@@ -172,23 +188,36 @@ fn parse_value(
     }
     let mut value = input.cloned()?;
     match &mut value {
-        Value::Object(object) => {
+        AuditValue::Object(object) => {
             let properties = schema.get("properties").and_then(Value::as_object);
             let required = schema.get("required").and_then(Value::as_array);
             let additional = schema.get("additionalProperties");
             let strip = schema_use == SchemaUse::GatewayInput
                 && (additional.is_none() || additional == Some(&Value::Bool(false)));
-            let mut parsed = if strip { Map::new() } else { object.clone() };
+            let mut parsed = if strip {
+                indexmap::IndexMap::new()
+            } else {
+                object.clone()
+            };
             if schema_use == SchemaUse::NativeInput && additional == Some(&Value::Bool(false)) {
                 for key in object.keys() {
-                    if !properties.is_some_and(|properties| properties.contains_key(key)) {
-                        issue(errors, path, format!("Unrecognized key: \"{key}\""));
+                    if !properties.is_some_and(|properties| {
+                        key.as_str().is_some_and(|key| properties.contains_key(key))
+                    }) {
+                        issue(
+                            errors,
+                            path,
+                            format!(
+                                "Unrecognized key: \"{}\"",
+                                key.as_str().expect("UTF-8 input key")
+                            ),
+                        );
                     }
                 }
             }
             if let Some(properties) = properties {
                 for (key, field_schema) in properties {
-                    let field = object.get(key);
+                    let field = object.get(&JsString::from(key.as_str()));
                     let required =
                         required.is_some_and(|r| r.iter().any(|v| v.as_str() == Some(key)));
                     if field.is_none() && !required && field_schema.get("default").is_none() {
@@ -202,13 +231,13 @@ fn parse_value(
                     if let Some(v) =
                         parse_value(field_schema, field, &field_path, schema_use, errors)
                     {
-                        parsed.insert(key.clone(), v);
+                        parsed.insert(key.clone().into(), v);
                     }
                 }
             }
             *object = parsed;
         }
-        Value::String(text) => {
+        AuditValue::String(text) => {
             if schema_use == SchemaUse::GatewayInput
                 && matches!(
                     path,
@@ -257,7 +286,34 @@ fn parse_value(
                 );
             }
         }
-        Value::Number(number) => {
+        AuditValue::Utf16String(units) => {
+            bounds(
+                schema,
+                char::decode_utf16(units.iter().copied()).count() as f64,
+                "minLength",
+                "maxLength",
+                "string",
+                path,
+                errors,
+            );
+            if let Some(pattern) = schema.get("pattern").and_then(Value::as_str)
+                && regex::RegexBuilder::new(pattern)
+                    .unicode(false)
+                    .build()
+                    .is_ok()
+                && let Ok(regex) = regex::bytes::RegexBuilder::new(pattern)
+                    .unicode(false)
+                    .build()
+                && !regex.is_match(&wtf8(units))
+            {
+                issue(
+                    errors,
+                    path,
+                    format!("Invalid string: must match pattern /{pattern}/"),
+                );
+            }
+        }
+        AuditValue::Number(number) => {
             if let Some(n) = number.as_f64().filter(|value| value.is_finite()) {
                 if expected_types.contains(&"integer")
                     && (n.fract() != 0.0 || n.abs() > 9_007_199_254_740_991.0)
@@ -285,7 +341,7 @@ fn parse_value(
                 );
             }
         }
-        Value::Array(items) => {
+        AuditValue::Array(items) => {
             bounds(
                 schema,
                 items.len() as f64,
@@ -361,4 +417,34 @@ fn issue(errors: &mut Vec<String>, path: &str, message: String) {
 
 fn js_whitespace(c: char) -> bool {
     matches!(c, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+fn value_type(value: Option<&AuditValue>) -> &'static str {
+    match value {
+        None => "undefined",
+        Some(AuditValue::Null) => "null",
+        Some(AuditValue::Bool(_)) => "boolean",
+        Some(AuditValue::Number(_)) => "number",
+        Some(AuditValue::String(_) | AuditValue::Utf16String(_)) => "string",
+        Some(AuditValue::Array(_)) => "array",
+        Some(AuditValue::Object(_)) => "object",
+    }
+}
+
+fn wtf8(units: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for character in char::decode_utf16(units.iter().copied()) {
+        match character {
+            Ok(character) => bytes.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes()),
+            Err(error) => {
+                let unit = error.unpaired_surrogate();
+                bytes.extend_from_slice(&[
+                    0xe0 | (unit >> 12) as u8,
+                    0x80 | ((unit >> 6) & 0x3f) as u8,
+                    0x80 | (unit & 0x3f) as u8,
+                ]);
+            }
+        }
+    }
+    bytes
 }

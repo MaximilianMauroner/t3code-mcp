@@ -135,6 +135,7 @@ async fn downstream_tools_list_preserves_allowed_native_definitions() {
             )
             .await
             .unwrap();
+        let result = serde_json::to_value(result).unwrap();
         let mut expected = ToolsListPage::gateway().tools().to_vec();
         expected.extend(raw_tools());
         assert_eq!(result["result"], json!({"tools":expected}));
@@ -157,6 +158,7 @@ async fn native_hints_do_not_control_mutation_access() {
             )
             .await
             .unwrap();
+        let denied = serde_json::to_value(denied).unwrap();
         assert_eq!(denied["result"]["isError"], true);
         assert_eq!(
             denied["result"]["structuredContent"]["error"]["code"],
@@ -173,6 +175,7 @@ async fn native_hints_do_not_control_mutation_access() {
             )
             .await
             .unwrap();
+        let allowed = serde_json::to_value(allowed).unwrap();
         assert_eq!(allowed["result"], json!({"content":[]}));
         let calls = upstream
             .requests

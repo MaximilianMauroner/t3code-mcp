@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use http::Request;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use t3_code_mcp::mcp::{HttpOptions, McpServer, ToolCall, ToolFailure, ToolHandler, ToolsListPage};
 
 #[derive(Default)]
@@ -13,11 +13,11 @@ impl ToolHandler for Handler {
         &self,
         call: ToolCall,
         _invocation: Option<t3_code_mcp::mcp::Invocation>,
-    ) -> Result<Map<String, Value>, ToolFailure> {
+    ) -> Result<t3_code_mcp::mcp::ToolResult, ToolFailure> {
         assert_eq!(call.name, "fixture.echo");
         assert!(call.arguments.is_empty());
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({"content":[]}).as_object().unwrap().clone())
+        Ok(t3_code_mcp::mcp::ToolResult::new(&json!({"content":[]})).unwrap())
     }
 }
 

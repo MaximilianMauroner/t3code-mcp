@@ -13,6 +13,7 @@ async fn mcp_result(gateway: &T3Gateway, name: &str, arguments: Value) -> Value 
         )
         .await
         .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     assert!(response.get("error").is_none(), "{response}");
     response["result"].clone()
 }

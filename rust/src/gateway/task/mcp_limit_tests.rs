@@ -14,6 +14,7 @@ async fn call(fixture: &Fixture, name: &str, arguments: &str) -> Value {
         .handle_message(IncomingMessage::parse(request).unwrap(), &fixture.gateway)
         .await
         .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     let result = &response["result"];
     assert_ne!(result["isError"], true, "{response}");
     let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();

@@ -1,5 +1,7 @@
 use super::{commands::T3Command, iso, now, rpc_client::request_t3_rpc, types::*, v2};
-use crate::operations::audit_log::{AuditEventInput, AuditLog, AuditSource, summarize_for_audit};
+use crate::operations::audit_log::{
+    AuditEventInput, AuditLog, AuditSource, AuditValue, summarize_for_audit,
+};
 use futures_util::{
     FutureExt,
     future::{BoxFuture, Shared},
@@ -365,7 +367,10 @@ impl T3HttpClient {
             method,
             "started",
             None,
-            Some(json!({"body":summarize_for_audit(&payload),"transport":"websocket"})),
+            Some(AuditValue::object([
+                ("body", summarize_for_audit(&payload)),
+                ("transport", "websocket".into()),
+            ])),
         );
         let result = request_t3_rpc(
             &self.0.url,
@@ -388,7 +393,7 @@ impl T3HttpClient {
                     method,
                     "error",
                     Some(now() - started),
-                    Some(json!({"error":e.message})),
+                    Some(json!({"error":e.message}).into()),
                 );
             }
         }
@@ -406,7 +411,23 @@ impl T3HttpClient {
         let id = format!("t3_{}", uuid::Uuid::new_v4());
         let started = now();
         let operation = format!("{method} {path}");
-        self.audit(&id,&operation,"started",None,Some(json!({"method":method,"path":path,"authenticated":authenticated,"body":body.as_ref().map(summarize_for_audit)})));
+        self.audit(
+            &id,
+            &operation,
+            "started",
+            None,
+            Some(AuditValue::object([
+                ("method", method.into()),
+                ("path", path.into()),
+                ("authenticated", AuditValue::Bool(authenticated)),
+                (
+                    "body",
+                    body.as_ref()
+                        .map(summarize_for_audit)
+                        .unwrap_or(AuditValue::Null),
+                ),
+            ])),
+        );
         let execute = async {
             let mut request = self
                 .0
@@ -455,7 +476,7 @@ impl T3HttpClient {
                     &operation,
                     "completed",
                     Some(now() - started),
-                    Some(json!({"status":status})),
+                    Some(json!({"status":status}).into()),
                 );
                 Ok(value)
             }
@@ -466,7 +487,7 @@ impl T3HttpClient {
                     &operation,
                     "error",
                     Some(now() - started),
-                    Some(json!({"status":e.status,"code":e.code,"error":e.message})),
+                    Some(json!({"status":e.status,"code":e.code,"error":e.message}).into()),
                 );
                 Err(e)
             }
@@ -494,7 +515,7 @@ impl T3HttpClient {
         operation: &str,
         outcome: &str,
         duration: Option<i64>,
-        details: Option<Value>,
+        details: Option<AuditValue>,
     ) {
         record(
             self.0.audit.as_deref(),
@@ -512,7 +533,7 @@ pub(crate) fn record(
     operation: &str,
     outcome: &str,
     duration: Option<i64>,
-    details: Option<Value>,
+    details: Option<AuditValue>,
 ) {
     if let Some(audit) = audit {
         let mut input = AuditEventInput::new(

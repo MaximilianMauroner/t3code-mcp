@@ -14,8 +14,7 @@ fn persisted_records_redact_content_and_keep_node_field_order() {
     input.outcome = Some("started".into());
     input.duration_ms = Some(12.5);
     input.details = Some(
-        json!({"arguments":{"threadId":"thread-1", "message":"private prompt", "authorization":"Bearer hidden-secret"}}),
-    );
+        json!({"arguments":{"threadId":"thread-1", "message":"private prompt", "authorization":"Bearer hidden-secret"}}).into());
     audit.record(input);
     let raw = fs::read_to_string(&log_file.path).unwrap();
     assert!(!raw.contains("private prompt"));
@@ -63,7 +62,7 @@ fn absent_details_are_omitted_and_null_details_are_wrapped() {
     let audit = AuditLog::new(&file.path);
     audit.record(AuditEventInput::new(AuditSource::System, "no-details"));
     let mut input = AuditEventInput::new(AuditSource::System, "null-details");
-    input.details = Some(Value::Null);
+    input.details = Some(Value::Null.into());
     audit.record(input);
     let rows: Vec<Value> = fs::read_to_string(&file.path)
         .unwrap()
@@ -223,7 +222,7 @@ fn scan_preserves_node_fixture_rows_and_key_order() {
 
 #[test]
 fn redaction_matches_node_container_rules_and_utf16_lengths() {
-    let result = summarize_for_audit(&json!({
+    let result = summarize_for_audit(json!({
         "api_key":"hidden", "body":{"threadId":"keep", "text":"hidden"},
         "answers":{"question":"hidden"}, "payload":42, "options":null,
         "content":["hidden"], "message":{"id":"keep"}, "prompt":["hidden"],
@@ -269,15 +268,15 @@ fn redaction_bounds_arrays_keys_and_depth_and_sorts_like_javascript() {
     for i in 0..60 {
         keys.insert(format!("k{i:02}"), json!(i));
     }
-    let result = summarize_for_audit(&json!(keys));
+    let result = summarize_for_audit(json!(keys));
     assert_eq!(result["_truncatedKeys"], 10);
     assert!(result.get("k50").is_none());
-    let result = summarize_for_audit(&json!({"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}));
+    let result = summarize_for_audit(json!({"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}));
     assert_eq!(
         result["a"]["b"]["c"]["d"]["e"]["f"],
         json!({"type":"object","truncated":true})
     );
-    let result = summarize_for_audit(&json!({"10":1, "2":2, "z":3, "😀":4, "\u{e000}":5}));
+    let result = summarize_for_audit(json!({"10":1, "2":2, "z":3, "😀":4, "\u{e000}":5}));
     assert_eq!(
         result.to_string(),
         "{\"2\":2,\"10\":1,\"z\":3,\"😀\":4,\"\u{e000}\":5}"
@@ -511,7 +510,7 @@ fn persisted_numbers_and_duration_rounding_match_javascript() {
         2
     );
     assert_eq!(
-        summarize_for_audit(&json!([1.0, -0.0, 1e-6, 1e-7, 1e20, 1e21])).to_string(),
+        summarize_for_audit(json!([1.0, -0.0, 1e-6, 1e-7, 1e20, 1e21])).to_string(),
         "[1,0,0.000001,1e-7,100000000000000000000,1e+21]"
     );
 }
@@ -519,7 +518,7 @@ fn persisted_numbers_and_duration_rounding_match_javascript() {
 #[test]
 fn object_assignment_and_secret_patterns_match_javascript_edge_cases() {
     let summary = summarize_for_audit(
-        &serde_json::from_str::<Value>(r#"{"__proto__":{"hidden":"value"},"safe":1}"#).unwrap(),
+        serde_json::from_str::<Value>(r#"{"__proto__":{"hidden":"value"},"safe":1}"#).unwrap(),
     );
     assert_eq!(summary, json!({"safe":1}));
     assert_eq!(

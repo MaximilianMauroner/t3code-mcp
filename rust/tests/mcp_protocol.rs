@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use http::{Request, Response};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use t3_code_mcp::mcp::{
     HttpOptions, IncomingMessage, McpServer, RequestId, SUPPORTED_PROTOCOL_VERSIONS, StdioCodec,
@@ -11,14 +11,14 @@ use t3_code_mcp::mcp::{
 
 struct Handler {
     calls: Mutex<Vec<ToolCall>>,
-    result: Result<Map<String, Value>, ToolFailure>,
+    result: Result<t3_code_mcp::mcp::ToolResult, ToolFailure>,
 }
 
 impl Handler {
     fn returning(value: Value) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
-            result: Ok(value.as_object().unwrap().clone()),
+            result: Ok(t3_code_mcp::mcp::ToolResult::new(&value).unwrap()),
         }
     }
 }
@@ -28,7 +28,7 @@ impl ToolHandler for Handler {
         &self,
         call: ToolCall,
         _invocation: Option<t3_code_mcp::mcp::Invocation>,
-    ) -> Result<Map<String, Value>, ToolFailure> {
+    ) -> Result<t3_code_mcp::mcp::ToolResult, ToolFailure> {
         self.calls.lock().unwrap().push(call);
         self.result.clone()
     }
@@ -70,10 +70,11 @@ fn initialize(version: &str) -> Value {
 }
 
 async fn send(server: &McpServer, handler: &Handler, value: Value) -> Value {
-    server
+    let response = server
         .handle_message(IncomingMessage::parse(value).unwrap(), handler)
         .await
-        .unwrap()
+        .unwrap();
+    serde_json::to_value(response).unwrap()
 }
 
 #[tokio::test]
@@ -110,6 +111,7 @@ async fn initialize_matches_node_http_and_stdio_fixtures() {
         .handle_message(codec.read_message().unwrap().unwrap(), &handler)
         .await
         .unwrap();
+    let result = serde_json::to_value(result).unwrap();
     assert_eq!(result, baseline()["mcp"]["stdio"]["initialize"]);
     let encoded = StdioCodec::encode(&result);
     assert_eq!(encoded.last(), Some(&b'\n'));
@@ -904,4 +906,53 @@ async fn unsupported_task_creation_is_a_parameter_error() {
     assert_eq!(response["error"]["code"], -32602, "{response}");
     assert!(response.get("result").is_none());
     assert!(handler.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn lossless_audit_results_still_enforce_the_output_schema() {
+    use t3_code_mcp::mcp::ToolResult;
+    use t3_code_mcp::operations::audit_log::AuditValue;
+    let row: AuditValue = serde_json::from_str(r#"{"version":1,"eventId":"event-\ud800","timestamp":"2026-10-18T00:00:00.000Z","processId":1,"source":"mcp","event":"stored"}"#).unwrap();
+    let server = McpServer::gateway();
+    for (process_id, valid) in [(json!(7), true), (json!(7.5), false)] {
+        let mut row = row.clone();
+        row.as_object_mut()
+            .unwrap()
+            .insert("processId".into(), process_id.into());
+        let page = AuditValue::object([
+            ("items", AuditValue::Array(vec![row.clone()])),
+            ("total", json!(1).into()),
+            ("invalidLines", json!(0).into()),
+            ("nextCursor", AuditValue::Null),
+            ("hasMore", AuditValue::Bool(false)),
+        ]);
+        let structured = AuditValue::object([
+            ("environmentId", "fixture".into()),
+            ("observedAt", "2026-10-18T00:00:00.000Z".into()),
+            ("auditError", AuditValue::Null),
+            ("page", page),
+        ]);
+        let handler = Handler {
+            calls: Mutex::new(Vec::new()),
+            result: Ok(ToolResult::structured(&structured).unwrap()),
+        };
+        let response = server.handle_http(request("POST", "/mcp", json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t3_audit_log","arguments":{}}
+        }).to_string()), &options(), &handler).await;
+        let response: AuditValue = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(response["result"]["isError"] == true, !valid, "{response}");
+        if valid {
+            assert_eq!(
+                response["result"]["structuredContent"]["page"]["items"][0],
+                row
+            );
+        } else {
+            assert!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("processId")
+            );
+        }
+    }
 }

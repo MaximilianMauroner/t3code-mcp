@@ -160,10 +160,36 @@ impl RpcError {
         }
     }
 
-    pub fn response(&self, id: Option<&RequestId>) -> Value {
-        match id {
-            Some(id) => json!({"jsonrpc": "2.0", "id": id, "error": self}),
-            None => json!({"jsonrpc": "2.0", "error": self, "id": null}),
+    pub fn response(&self, id: Option<&RequestId>) -> RpcResponse {
+        RpcResponse::Failure {
+            jsonrpc: "2.0",
+            error: self.clone(),
+            id: id.cloned(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum RpcResponse {
+    Success {
+        result: Box<serde_json::value::RawValue>,
+        jsonrpc: &'static str,
+        id: RequestId,
+    },
+    Failure {
+        jsonrpc: &'static str,
+        error: RpcError,
+        id: Option<RequestId>,
+    },
+}
+
+impl RpcResponse {
+    pub(super) fn success(id: RequestId, result: Box<serde_json::value::RawValue>) -> Self {
+        Self::Success {
+            result,
+            jsonrpc: "2.0",
+            id,
         }
     }
 }

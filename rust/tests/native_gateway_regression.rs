@@ -153,7 +153,7 @@ fn disabled<'a>(status: &'a Value, operation: &str) -> &'a Value {
 }
 
 async fn upload(gateway: &T3Gateway) -> Value {
-    McpServer::gateway()
+    let response = McpServer::gateway()
         .handle_message(
             IncomingMessage::parse(json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
@@ -166,7 +166,8 @@ async fn upload(gateway: &T3Gateway) -> Value {
             gateway,
         )
         .await
-        .unwrap()
+        .unwrap();
+    serde_json::to_value(response).unwrap()
 }
 
 #[tokio::test]

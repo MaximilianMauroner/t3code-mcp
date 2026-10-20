@@ -81,6 +81,7 @@ async fn assert_forwarded(arguments: Value) {
         )
         .await
         .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     assert_eq!(
         response["result"],
         json!({"content":[],"structuredContent":{"arguments":expected}}),
@@ -136,6 +137,7 @@ async fn native_converted_schema_rejects_invalid_or_missing_arguments() {
             )
             .await
             .unwrap();
+        let response = serde_json::to_value(response).unwrap();
         assert_eq!(response["result"]["isError"], true, "{response}");
     }
     assert!(
@@ -165,6 +167,7 @@ async fn native_arguments_still_require_an_object_envelope() {
             )
             .await
             .unwrap();
+        let response = serde_json::to_value(response).unwrap();
         assert_eq!(response["error"]["code"], -32602, "{response}");
     }
     assert!(
@@ -176,4 +179,54 @@ async fn native_arguments_still_require_an_object_envelope() {
             .iter()
             .all(|request| request.body["method"] != "tools/call")
     );
+}
+
+#[tokio::test]
+async fn split_native_argument_preview_keeps_forwarding_and_auditing() {
+    use crate::operations::audit_log::AuditValue;
+    let fixture = native_fixture().await;
+    let server = McpServer::gateway();
+    let long = format!("{}😀", "a".repeat(511));
+    for id in [1, 2] {
+        let reply = server
+            .handle_message(
+                IncomingMessage::parse(json!({
+                    "jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                        "name":"t3_thread_list","arguments":{"query":long}
+                    }
+                }))
+                .unwrap(),
+                &fixture.gateway,
+            )
+            .await
+            .unwrap();
+        let reply = serde_json::to_value(reply).unwrap();
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+    }
+    let requests = fixture.server.requests.lock().unwrap();
+    let calls = requests
+        .iter()
+        .filter(|request| request.body["method"] == "tools/call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|request| request.body["params"]["arguments"]["query"] == long)
+    );
+    let rows: Vec<AuditValue> = std::fs::read_to_string(fixture.directory.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|row| serde_json::from_str(row).unwrap())
+        .collect();
+    let preview = "a"
+        .repeat(511)
+        .encode_utf16()
+        .chain([0xd83d])
+        .collect::<Vec<_>>();
+    for source in ["mcp", "t3"] {
+        assert!(rows.iter().any(|row| row["source"] == source
+            && row["details"]["arguments"]["query"]["preview"].as_utf16()
+                == Some(preview.clone())));
+    }
 }

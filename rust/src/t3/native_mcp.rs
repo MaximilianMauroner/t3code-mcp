@@ -9,7 +9,7 @@ use crate::{
         NativeCredential, NativeCredentialState, NativeCredentialStore, token_identity,
     },
     operations::audit_log::{
-        AuditLog, current_audit_context, summarize_for_audit, with_audit_context,
+        AuditLog, AuditValue, current_audit_context, summarize_for_audit, with_audit_context,
     },
 };
 use futures_util::{
@@ -567,9 +567,13 @@ impl NativeMcpClient {
                 &operation,
                 "started",
                 None,
-                Some(
-                    json!({"attempt":attempt,"arguments":summarize_for_audit(&Value::Object(args.clone()))}),
-                ),
+                Some(AuditValue::object([
+                    ("attempt", json!(attempt).into()),
+                    (
+                        "arguments",
+                        summarize_for_audit(Value::Object(args.clone())),
+                    ),
+                ])),
             );
             let mut connection = None;
             let result = async {
@@ -598,7 +602,9 @@ impl NativeMcpClient {
                             "completed"
                         },
                         Some(now() - started),
-                        Some(json!({"attempt":attempt,"isError":result.is_error==Some(true)})),
+                        Some(
+                            json!({"attempt":attempt,"isError":result.is_error==Some(true)}).into(),
+                        ),
                     );
                     return Ok(result);
                 }
@@ -622,7 +628,10 @@ impl NativeMcpClient {
                         &operation,
                         "error",
                         Some(now() - started),
-                        Some(json!({"attempt":attempt,"failure":failure,"error":error.message})),
+                        Some(
+                            json!({"attempt":attempt,"failure":failure,"error":error.message})
+                                .into(),
+                        ),
                     );
                     let dropped = self.drop_if_invalid(connection.as_ref(), &error);
                     if failure == "rejected" {
@@ -702,7 +711,7 @@ impl NativeMcpClient {
             "attachment.upload",
             "started",
             None,
-            Some(json!({"sizeBytes":bytes.len(),"mimeType":mime_type})),
+            Some(json!({"sizeBytes":bytes.len(),"mimeType":mime_type}).into()),
         );
         let mut status = None;
         let result = async {
@@ -755,7 +764,7 @@ impl NativeMcpClient {
                 "error"
             },
             Some(now() - started),
-            Some(json!({"status":status})),
+            Some(json!({"status":status}).into()),
         );
         result
     }

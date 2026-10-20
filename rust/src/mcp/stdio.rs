@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde_json::Value;
+use serde::Serialize;
 
 use super::IncomingMessage;
 
@@ -70,7 +70,7 @@ impl StdioCodec {
             .map_err(|_| StdioError::InvalidMessage)
     }
 
-    pub fn encode(message: &Value) -> Vec<u8> {
+    pub fn encode(message: &impl Serialize) -> Vec<u8> {
         let mut bytes = serde_json::to_vec(message).expect("JSON message");
         bytes.push(b'\n');
         bytes

@@ -745,3 +745,6 @@ async fn http_shutdown_drains_an_accepted_native_mutation_and_records_its_result
     assert!(events.iter().any(|event| event["event"] == "http.response"
         && event["details"]["rpc"]["toolName"] == "t3_thread_send"));
 }
+
+#[path = "runtime_cli/audit_boundary.rs"]
+mod audit_boundary;

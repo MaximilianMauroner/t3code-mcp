@@ -3,6 +3,7 @@ mod catalog;
 mod http;
 mod output;
 mod peer;
+mod result;
 mod stdio;
 mod wire;
 
@@ -19,9 +20,10 @@ pub(crate) use http::body_too_large;
 pub use http::{DEFAULT_HTTP_BODY_LIMIT, HttpBody, HttpOptions};
 pub(crate) use output::{Delivery, Output};
 pub use peer::{Invocation, Peer};
+pub use result::ToolResult;
 pub(crate) use stdio::FrameWriter;
 pub use stdio::{DEFAULT_STDIO_BUFFER_LIMIT, StdioCodec, StdioError};
-pub use wire::{IncomingMessage, MessageError, RequestId, RpcError, RpcRequest};
+pub use wire::{IncomingMessage, MessageError, RequestId, RpcError, RpcRequest, RpcResponse};
 
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2025-11-25",
@@ -79,7 +81,7 @@ pub trait ToolHandler: Sync {
         &self,
         call: ToolCall,
         invocation: Option<Invocation>,
-    ) -> impl Future<Output = Result<Map<String, Value>, ToolFailure>> + Send;
+    ) -> impl Future<Output = Result<ToolResult, ToolFailure>> + Send;
 }
 
 #[derive(Clone)]
@@ -153,7 +155,7 @@ impl McpServer {
         &'a self,
         message: IncomingMessage,
         handler: &'a impl ToolHandler,
-    ) -> impl Future<Output = Option<Value>> + Send + 'a {
+    ) -> impl Future<Output = Option<RpcResponse>> + Send + 'a {
         self.handle_peer_message(message, self.peer.clone(), handler)
     }
 
@@ -162,7 +164,7 @@ impl McpServer {
         message: IncomingMessage,
         peer: Peer,
         handler: &'a impl ToolHandler,
-    ) -> impl Future<Output = Option<Value>> + Send + 'a {
+    ) -> impl Future<Output = Option<RpcResponse>> + Send + 'a {
         let admitted = self.admit(message, peer);
         self.execute_message(admitted, handler)
     }
@@ -205,7 +207,7 @@ impl McpServer {
         &'a self,
         admitted: AdmittedMessage,
         handler: &'a impl ToolHandler,
-    ) -> impl Future<Output = Option<Value>> + Send + 'a {
+    ) -> impl Future<Output = Option<RpcResponse>> + Send + 'a {
         let AdmittedMessage {
             message,
             peer,
@@ -278,7 +280,7 @@ impl McpServer {
             }
             .await;
             Some(match result {
-                Ok(result) => json!({"result": result, "jsonrpc": "2.0", "id": request.id}),
+                Ok(result) => RpcResponse::success(request.id, result),
                 Err(error) => error.response(Some(&request.id)),
             })
         }
@@ -289,7 +291,7 @@ impl McpServer {
         request: &RpcRequest,
         handler: &impl ToolHandler,
         invocation: &Invocation,
-    ) -> Result<Value, RpcError> {
+    ) -> Result<Box<serde_json::value::RawValue>, RpcError> {
         if matches!(
             request.method.as_str(),
             "initialize" | "ping" | "tools/list" | "tools/call"
@@ -313,8 +315,9 @@ impl McpServer {
             ));
         }
         match request.method.as_str() {
-            "initialize" => initialize(request.params.as_ref()),
-            "ping" => Ok(json!({})),
+            "initialize" => initialize(request.params.as_ref())
+                .map(|value| serde_json::value::to_raw_value(&value).expect("initialize result")),
+            "ping" => Ok(serde_json::value::to_raw_value(&json!({})).expect("ping result")),
             "tools/list" => {
                 if let Some(cursor) = request.params.as_ref().and_then(|p| p.get("cursor"))
                     && !cursor.is_string()
@@ -325,7 +328,7 @@ impl McpServer {
                         &["params", "cursor"],
                     ));
                 }
-                Ok(self.catalog.as_value().clone())
+                Ok(serde_json::value::to_raw_value(self.catalog.as_value()).expect("tool catalog"))
             }
             "tools/call" => self.call_tool(request, handler, invocation).await,
             _ => Err(RpcError::new(-32601, "Method not found")),
@@ -337,7 +340,7 @@ impl McpServer {
         request: &RpcRequest,
         handler: &impl ToolHandler,
         invocation: &Invocation,
-    ) -> Result<Value, RpcError> {
+    ) -> Result<Box<serde_json::value::RawValue>, RpcError> {
         let params = request
             .params
             .as_ref()
@@ -407,30 +410,31 @@ impl McpServer {
             params,
         };
         let result = match handler.call_tool(call, Some(invocation.clone())).await {
-            Ok(result) => Value::Object(result),
+            Ok(result) => result,
             Err(failure) => {
                 if let Some(error) = failure.protocol_error {
                     return Err(*error);
                 }
                 let error = json!({"error": {"code": failure.code, "message": failure.message}});
-                json!({
+                ToolResult::new(&json!({
                     "isError": true,
                     "content": [{"type": "text", "text": serde_json::to_string_pretty(&error).expect("JSON value")}],
                     "structuredContent": error
-                })
+                })).expect("tool failure")
             }
         };
-        if let Value::Object(result) = &result
-            && let Some(message) = arguments::output_error(tool, result)
-        {
+        if let Some(message) = arguments::output_error(tool, &result) {
             return Ok(tool_error(message));
         }
-        Ok(result)
+        Ok(result.into_raw())
     }
 }
 
-fn tool_error(message: String) -> Value {
-    json!({"content": [{"type": "text", "text": message}], "isError": true})
+fn tool_error(message: String) -> Box<serde_json::value::RawValue> {
+    serde_json::value::to_raw_value(
+        &json!({"content": [{"type": "text", "text": message}], "isError": true}),
+    )
+    .expect("tool error")
 }
 
 fn initialize(params: Option<&Map<String, Value>>) -> Result<Value, RpcError> {

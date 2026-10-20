@@ -10,7 +10,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use chrono::{SecondsFormat, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -23,12 +23,12 @@ use crate::{
         GitDiffMode, GitInspectionError, GitInspector, GitWorkspaceSelection, GitWorkspaceSource,
         GitWorktreeManager, ManagedWorktreeRequest,
     },
-    mcp::{Invocation, ToolCall, ToolFailure, ToolHandler, ToolsListPage},
+    mcp::{Invocation, ToolCall, ToolFailure, ToolHandler, ToolResult, ToolsListPage},
     native_credential::{NativeCredentialState, NativeCredentialStore},
     operations::{
         audit_log::{
-            AuditEventInput, AuditLog, AuditQueryInput, AuditSource, summarize_for_audit,
-            with_audit_context,
+            AuditEventInput, AuditLog, AuditQueryInput, AuditSource, AuditValue,
+            summarize_for_audit, with_audit_context,
         },
         journal::{
             BeginOperationInput, BeginTaskInput, FailureEvidenceOrder, OperationJournal,
@@ -359,7 +359,7 @@ impl T3Gateway {
         &self,
         call: &ToolCall,
         invocation: Option<&Invocation>,
-    ) -> Result<Map<String, Value>, ToolFailure> {
+    ) -> Result<ToolResult, ToolFailure> {
         if is_native_tool_name(&call.name) {
             if is_native_mutating_tool(&call.name) {
                 authorize_native_mutation(self.config.read_only, &self.native.credential_state())?;
@@ -375,13 +375,8 @@ impl T3Gateway {
                 )
                 .await
                 .map_err(native_failure)?;
-            return serde_json::to_value(result)
-                .map_err(|error| ToolFailure::new("gateway_error", error.to_string()))?
-                .as_object()
-                .cloned()
-                .ok_or_else(|| {
-                    ToolFailure::new("gateway_error", "Native result was not an object.")
-                });
+            return ToolResult::new(&result)
+                .map_err(|error| ToolFailure::new("gateway_error", error.to_string()));
         }
         let tool = GatewayTool::parse(&call.name).ok_or_else(|| {
             ToolFailure::new(
@@ -391,7 +386,7 @@ impl T3Gateway {
         })?;
         let value = match tool {
             GatewayTool::ConnectionStatus => self.connection_status().await,
-            GatewayTool::AuditLog => self.audit_query(&call.arguments)?,
+            GatewayTool::AuditLog => return self.audit_query(&call.arguments),
             GatewayTool::GitStatus => self.git_status(&call.arguments).await?,
             GatewayTool::GitDiff => self.git_diff(&call.arguments).await?,
             GatewayTool::GitCompare => self.git_compare(&call.arguments).await?,
@@ -408,16 +403,11 @@ impl T3Gateway {
             GatewayTool::TaskCancel => self.task_cancel(&call.arguments).await?,
             GatewayTool::ResultGet => self.result_get(&call.arguments).await?,
         };
-        Ok(Map::from_iter([
-            (
-                "content".into(),
-                json!([{"type":"text", "text":serde_json::to_string_pretty(&value).expect("serializable result")}]),
-            ),
-            ("structuredContent".into(), value),
-        ]))
+        ToolResult::structured(&value)
+            .map_err(|error| ToolFailure::new("gateway_error", error.to_string()))
     }
 
-    fn audit_query(&self, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    fn audit_query(&self, args: &Map<String, Value>) -> Result<ToolResult, ToolFailure> {
         let input = AuditQueryInput {
             since: optional_string(args, "since")?,
             until: optional_string(args, "until")?,
@@ -438,12 +428,26 @@ impl T3Gateway {
             .audit
             .query(&input)
             .map_err(|error| ToolFailure::new("invalid_audit_filter", error.to_string()))?;
-        Ok(json!({
-            "environmentId": self.client.cached_descriptor().map(|value| value.environment_id).or_else(|| self.config.environment_id.clone()).unwrap_or_else(|| "unknown".into()),
-            "observedAt": now_iso(),
-            "auditError": self.audit.diagnostic_error(),
-            "page": page,
-        }))
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AuditResult {
+            environment_id: String,
+            observed_at: String,
+            audit_error: Option<String>,
+            page: crate::operations::audit_log::AuditLogPage,
+        }
+        ToolResult::structured(&AuditResult {
+            environment_id: self
+                .client
+                .cached_descriptor()
+                .map(|value| value.environment_id)
+                .or_else(|| self.config.environment_id.clone())
+                .unwrap_or_else(|| "unknown".into()),
+            observed_at: now_iso(),
+            audit_error: self.audit.diagnostic_error(),
+            page,
+        })
+        .map_err(|error| ToolFailure::new("gateway_error", error.to_string()))
     }
 
     async fn git_status(&self, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
@@ -1402,7 +1406,7 @@ impl ToolHandler for T3Gateway {
         &self,
         call: ToolCall,
         invocation: Option<Invocation>,
-    ) -> Result<Map<String, Value>, ToolFailure> {
+    ) -> Result<ToolResult, ToolFailure> {
         let name = call.name.clone();
         let correlation_id = format!("mcp_{}", uuid::Uuid::new_v4());
         with_audit_context(correlation_id.clone(), name.clone(), async move {
@@ -1410,22 +1414,31 @@ impl ToolHandler for T3Gateway {
             started.correlation_id = Some(correlation_id.clone());
             started.operation = Some(name.clone());
             started.outcome = Some("started".into());
-            started.details = Some(
-                json!({"arguments": summarize_for_audit(&Value::Object(call.arguments.clone()))}),
-            );
+            started.details = Some(AuditValue::object([(
+                "arguments",
+                summarize_for_audit(Value::Object(call.arguments.clone())),
+            )]));
             let native = is_native_tool_name(&name);
             if native {
-                started.details.as_mut().expect("call details")["native"] = json!(true);
+                started
+                    .details
+                    .as_mut()
+                    .expect("call details")
+                    .as_object_mut()
+                    .expect("details object")
+                    .insert("native".into(), AuditValue::Bool(true));
             }
             self.audit.record(started);
             let then = std::time::Instant::now();
             match Box::pin(self.route(&call, invocation.as_ref())).await {
                 Ok(result) => {
+                    let audit_result: AuditValue = serde_json::from_str(result.as_raw().get())
+                        .expect("serialized tool result");
                     let mut event = AuditEventInput::new(AuditSource::Mcp, "tool.result");
                     event.correlation_id = Some(correlation_id);
                     event.operation = Some(name);
                     event.outcome = Some(
-                        if result.get("isError") == Some(&json!(true)) {
+                        if audit_result.get("isError") == Some(&AuditValue::Bool(true)) {
                             "error"
                         } else {
                             "completed"
@@ -1434,14 +1447,17 @@ impl ToolHandler for T3Gateway {
                     );
                     event.duration_ms = Some(then.elapsed().as_secs_f64() * 1000.0);
                     let summary = if native {
-                        native_audit_summary(&call.name, &result)
+                        native_audit_summary(&call.name, &audit_result)
                     } else {
-                        result
+                        audit_result
                             .get("structuredContent")
                             .cloned()
-                            .unwrap_or(Value::Null)
+                            .unwrap_or(AuditValue::Null)
                     };
-                    event.details = Some(json!({"result": summarize_for_audit(&summary)}));
+                    event.details = Some(AuditValue::object([(
+                        "result",
+                        summarize_for_audit(summary),
+                    )]));
                     self.audit.record(event);
                     Ok(result)
                 }
@@ -1452,7 +1468,7 @@ impl ToolHandler for T3Gateway {
                     event.outcome = Some("error".into());
                     event.duration_ms = Some(then.elapsed().as_secs_f64() * 1000.0);
                     event.details =
-                        Some(json!({"errorCode":error.code,"errorMessage":error.message}));
+                        Some(json!({"errorCode":error.code,"errorMessage":error.message}).into());
                     self.audit.record(event);
                     Err(error)
                 }
@@ -1896,37 +1912,66 @@ fn native_tool_available(native: &Value, name: &str) -> bool {
             .is_some_and(|missing| missing.iter().any(|item| item == name))
 }
 
-fn native_audit_summary(name: &str, result: &Map<String, Value>) -> Value {
-    let structured = result.get("structuredContent").and_then(Value::as_object);
-    let mut summary = json!({
-        "isError": result.get("isError") == Some(&json!(true)),
-        "keys": structured.map(|value| value.keys().collect::<Vec<_>>()).unwrap_or_default(),
-    });
+fn native_audit_summary(name: &str, result: &AuditValue) -> AuditValue {
+    let structured = result
+        .get("structuredContent")
+        .and_then(AuditValue::as_object);
+    let mut summary = AuditValue::object([
+        (
+            "isError",
+            AuditValue::Bool(result.get("isError") == Some(&AuditValue::Bool(true))),
+        ),
+        (
+            "keys",
+            AuditValue::Array(
+                structured
+                    .map(|value| {
+                        value
+                            .keys()
+                            .map(|key| AuditValue::from_utf16(key.as_units().to_vec()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+        ),
+    ]);
     if name == "t3_thread_wait"
         && let Some(value) = structured
     {
-        if let Some(timed_out) = value.get("timedOut").filter(|value| value.is_boolean()) {
-            summary["timedOut"] = timed_out.clone();
+        if let Some(timed_out) = value
+            .get(&crate::operations::audit_log::JsString::from("timedOut"))
+            .filter(|value| matches!(value, AuditValue::Bool(_)))
+        {
+            summary
+                .as_object_mut()
+                .unwrap()
+                .insert("timedOut".into(), timed_out.clone());
         }
-        if let Some(status) = value.get("status").filter(|value| {
-            matches!(
-                value.as_str(),
-                Some(
-                    "idle"
-                        | "preparing"
-                        | "queued"
-                        | "starting"
-                        | "running"
-                        | "waiting"
-                        | "completed"
-                        | "interrupted"
-                        | "failed"
-                        | "cancelled"
-                        | "rolled_back"
+        if let Some(status) = value
+            .get(&crate::operations::audit_log::JsString::from("status"))
+            .filter(|value| {
+                matches!(
+                    value.as_str(),
+                    Some(
+                        "idle"
+                            | "preparing"
+                            | "queued"
+                            | "starting"
+                            | "running"
+                            | "waiting"
+                            | "completed"
+                            | "interrupted"
+                            | "failed"
+                            | "cancelled"
+                            | "rolled_back"
+                    )
                 )
-            )
-        }) {
-            summary["status"] = status.clone();
+            })
+        {
+            summary
+                .as_object_mut()
+                .unwrap()
+                .insert("status".into(), status.clone());
         }
     }
     summary

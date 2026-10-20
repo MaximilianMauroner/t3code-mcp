@@ -15,7 +15,7 @@ use tokio::{
 use crate::{
     gateway::T3Gateway,
     mcp::{HttpOptions, IncomingMessage, McpServer, StdioCodec},
-    operations::audit_log::{AuditEventInput, AuditSource, summarize_for_audit},
+    operations::audit_log::{AuditEventInput, AuditSource, AuditValue, summarize_for_audit},
 };
 use serde_json::{Value, json};
 
@@ -27,14 +27,14 @@ pub async fn run_stdio(handler: Arc<T3Gateway>) -> io::Result<()> {
     let mut event = AuditEventInput::new(AuditSource::Transport, "stdio.session");
     event.correlation_id = Some(correlation_id.clone());
     event.outcome = Some("started".into());
-    event.details = Some(json!({"transport":"stdio"}));
+    event.details = Some(json!({"transport":"stdio"}).into());
     handler.audit_log().record(event);
     let result = stdio_messages(Arc::clone(&handler), &correlation_id).await;
     let mut event = AuditEventInput::new(AuditSource::Transport, "stdio.session");
     event.correlation_id = Some(correlation_id);
     event.outcome = Some("completed".into());
     event.duration_ms = Some(started_at.elapsed().as_secs_f64() * 1000.0);
-    event.details = Some(json!({"transport":"stdio"}));
+    event.details = Some(json!({"transport":"stdio"}).into());
     handler.audit_log().record(event);
     result
 }
@@ -129,7 +129,7 @@ async fn stdio_messages(handler: Arc<T3Gateway>, correlation_id: &str) -> io::Re
     let mut event = AuditEventInput::new(AuditSource::Transport, "stdio.session");
     event.correlation_id = Some(correlation_id.to_owned());
     event.outcome = Some("draining".into());
-    event.details = Some(json!({"transport":"stdio"}));
+    event.details = Some(json!({"transport":"stdio"}).into());
     handler.audit_log().record(event);
     while let Some(result) = requests.join_next().await {
         let result = result.map_err(io::Error::other).and_then(|result| result);
@@ -167,7 +167,7 @@ fn stdio_error(handler: &T3Gateway, correlation_id: &str, message: &str) {
     event.correlation_id = Some(correlation_id.to_owned());
     event.operation = Some("stdio".into());
     event.outcome = Some("error".into());
-    event.details = Some(json!({"error":message}));
+    event.details = Some(json!({"error":message}).into());
     handler.audit_log().record(event);
 }
 
@@ -191,7 +191,7 @@ where
     let mut event = AuditEventInput::new(AuditSource::System, "http.listen");
     event.operation = Some("http".into());
     event.outcome = Some("started".into());
-    event.details = Some(json!({"host":host,"port":listener.local_addr()?.port()}));
+    event.details = Some(json!({"host":host,"port":listener.local_addr()?.port()}).into());
     handler.audit_log().record(event);
     eprintln!("t3-code-mcp listening on http://{host}:{port}/mcp");
     let server = McpServer::gateway();
@@ -280,7 +280,7 @@ async fn handle_request(
         "contentLength":request.headers().get("content-length").and_then(|value|value.to_str().ok()),
         "remoteAddress":peer.ip().to_string(),
         "userAgent":request.headers().get("user-agent").and_then(|value|value.to_str().ok()),
-    }));
+    }).into());
     handler.audit_log().record(event);
     let parsed_path = url::Url::parse("http://localhost")
         .expect("static URL")
@@ -306,7 +306,7 @@ async fn handle_request(
     } else {
         Ok(Bytes::new())
     };
-    let mut rpc = Value::Null;
+    let mut rpc = AuditValue::Null;
     let response = match body {
         Ok(body) => {
             if is_mcp && authorized {
@@ -334,14 +334,18 @@ async fn handle_request(
         .into(),
     );
     event.duration_ms = Some(started_at.elapsed().as_secs_f64() * 1000.0);
-    event.details = Some(
-        json!({"method":method,"path":path,"status":response.status().as_u16(),"authOutcome":auth_outcome,"rpc":rpc}),
-    );
+    event.details = Some(AuditValue::object([
+        ("method", method.into()),
+        ("path", path.into()),
+        ("status", json!(response.status().as_u16()).into()),
+        ("authOutcome", auth_outcome.into()),
+        ("rpc", rpc),
+    ]));
     handler.audit_log().record(event);
     response
 }
 
-fn incoming_details(message: &IncomingMessage) -> Value {
+fn incoming_details(message: &IncomingMessage) -> AuditValue {
     match message {
         IncomingMessage::Request(request) => rpc_details(Some(
             &json!({"method":request.method,"id":request.id,"params":request.params}),
@@ -353,24 +357,45 @@ fn incoming_details(message: &IncomingMessage) -> Value {
     }
 }
 
-fn rpc_details(body: Option<&Value>) -> Value {
+fn rpc_details(body: Option<&Value>) -> AuditValue {
     let Some(body) = body else {
-        return json!({"batch":false,"validRequestShape":false});
+        return json!({"batch":false,"validRequestShape":false}).into();
     };
     if let Some(batch) = body.as_array() {
-        return json!({"batch":true,"batchLength":batch.len()});
+        return json!({"batch":true,"batchLength":batch.len()}).into();
     }
     if !body.is_object() {
-        return json!({"batch":false,"validRequestShape":false});
+        return json!({"batch":false,"validRequestShape":false}).into();
     }
     let params = &body["params"];
-    json!({
-        "batch":false,"jsonRpcMethod":body["method"].as_str(),
-        "requestId":body.get("id").filter(|value|value.is_string() || value.is_number()),
-        "toolName":params["name"].as_str(),
-        "arguments":params.get("arguments").map(summarize_for_audit),
-        "clientInfo":params.get("clientInfo").filter(|value|value.is_object() || value.is_array()).map(summarize_for_audit),
-    })
+    AuditValue::object([
+        ("batch", AuditValue::Bool(false)),
+        ("jsonRpcMethod", json!(body["method"].as_str()).into()),
+        (
+            "requestId",
+            body.get("id")
+                .filter(|value| value.is_string() || value.is_number())
+                .cloned()
+                .unwrap_or(Value::Null)
+                .into(),
+        ),
+        ("toolName", json!(params["name"].as_str()).into()),
+        (
+            "arguments",
+            params
+                .get("arguments")
+                .map(summarize_for_audit)
+                .unwrap_or(AuditValue::Null),
+        ),
+        (
+            "clientInfo",
+            params
+                .get("clientInfo")
+                .filter(|value| value.is_object() || value.is_array())
+                .map(summarize_for_audit)
+                .unwrap_or(AuditValue::Null),
+        ),
+    ])
 }
 
 async fn read_body(body: Incoming, max_bytes: usize) -> Result<Bytes, ()> {

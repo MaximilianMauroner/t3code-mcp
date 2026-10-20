@@ -142,7 +142,7 @@ pub struct AuditEventInput {
     pub operation: Option<String>,
     pub outcome: Option<String>,
     pub duration_ms: Option<f64>,
-    pub details: Option<Value>,
+    pub details: Option<AuditValue>,
 }
 
 impl AuditEventInput {
@@ -331,7 +331,7 @@ impl AuditLog {
             }
             let mut event = AuditValue::from(Value::Object(event));
             if let Some(details) = input.details {
-                let summary = summarize_for_audit(&details);
+                let summary = summarize_for_audit(details);
                 event.as_object_mut().unwrap().insert(
                     "details".into(),
                     if summary.is_object() {
@@ -502,76 +502,70 @@ pub fn hash_audit_content(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-pub fn summarize_for_audit(value: &Value) -> AuditValue {
-    summarize_value(value, None, 0)
+pub fn summarize_for_audit(value: impl Into<AuditValue>) -> AuditValue {
+    summarize_value(&value.into(), None, 0)
 }
 
-fn summarize_value(value: &Value, key: Option<&str>, depth: usize) -> AuditValue {
+fn summarize_value(value: &AuditValue, key: Option<&str>, depth: usize) -> AuditValue {
     let sensitive = key.is_some_and(is_sensitive_key);
     let normalized = key.map(normalize_key);
     if sensitive
         && (matches!(
             normalized.as_deref(),
             Some("answers" | "answer" | "options" | "payload" | "content")
-        ) || !(value.is_object() || value.is_array()))
+        ) || !(value.is_object() || value.as_array().is_some()))
     {
-        return redacted_value(value).into();
+        return redacted_value(value);
     }
     match value {
-        Value::Null | Value::Bool(_) => value.clone().into(),
-        Value::Number(number) => number_value(number.as_f64().unwrap_or(f64::NAN)).into(),
-        Value::String(value) => {
+        AuditValue::Null | AuditValue::Bool(_) => value.clone(),
+        AuditValue::Number(number) => number_value(number.as_f64().unwrap_or(f64::NAN)).into(),
+        AuditValue::String(_) | AuditValue::Utf16String(_) => {
             if sensitive {
-                return redacted_string(value).into();
+                return redacted_value(value);
             }
-            let sanitized = sanitize_error(value);
-            if sanitized.encode_utf16().count() > 512 {
-                let mut result = AuditValue::from(
-                    json!({"type":"string", "length":value.encode_utf16().count(), "sha256":hash_audit_content(value)}),
-                );
-                let fields = result.as_object_mut().unwrap();
-                fields.insert(
-                    "preview".into(),
-                    AuditValue::from_utf16(sanitized.encode_utf16().take(512).collect()),
-                );
-                fields.insert("truncated".into(), AuditValue::Bool(true));
-                result
+            let units = value.as_utf16().unwrap();
+            let sanitized = match value.as_str() {
+                Some(text) => sanitize_error(text).encode_utf16().collect(),
+                None => sanitize_utf16(&units),
+            };
+            if sanitized.len() > 512 {
+                AuditValue::object([
+                    ("type", "string".into()),
+                    ("length", json!(units.len()).into()),
+                    ("sha256", hash_utf16(&units).into()),
+                    ("preview", AuditValue::from_utf16(sanitized.into_iter().take(512).collect())),
+                    ("truncated", AuditValue::Bool(true)),
+                ])
             } else {
-                json!(sanitized).into()
+                AuditValue::from_utf16(sanitized)
             }
         }
-        Value::Array(_) | Value::Object(_) if depth >= 6 => {
-            json!({"type": if value.is_array() { "array" } else { "object" }, "truncated":true})
-                .into()
+        AuditValue::Array(_) | AuditValue::Object(_) if depth >= 6 => {
+            json!({"type": if value.as_array().is_some() { "array" } else { "object" }, "truncated":true}).into()
         }
-        Value::Array(values) => {
-            let items: Vec<_> = values
-                .iter()
-                .take(25)
-                .map(|v| summarize_value(v, key, depth + 1))
-                .collect();
+        AuditValue::Array(values) => {
+            let items = values.iter().take(25).map(|v| summarize_value(v, key, depth + 1)).collect();
             if values.len() <= 25 {
                 AuditValue::Array(items)
             } else {
-                AuditValue::Object(indexmap::IndexMap::from_iter([
-                    ("items".into(), AuditValue::Array(items)),
-                    ("length".into(), json!(values.len()).into()),
-                    ("truncated".into(), AuditValue::Bool(true)),
-                ]))
+                AuditValue::object([
+                    ("items", AuditValue::Array(items)),
+                    ("length", json!(values.len()).into()),
+                    ("truncated", AuditValue::Bool(true)),
+                ])
             }
         }
-        Value::Object(values) => {
+        AuditValue::Object(values) => {
             let mut keys: Vec<_> = values.keys().collect();
-            keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+            keys.sort_by(|a, b| a.as_units().cmp(b.as_units()));
             let mut output = indexmap::IndexMap::new();
             for key in keys.iter().take(50) {
-                if key.as_str() == "__proto__" {
+                if key.as_str() == Some("__proto__") {
                     continue;
                 }
-                output.insert(
-                    (*key).clone().into(),
-                    summarize_value(&values[*key], Some(key), depth + 1),
-                );
+                let key_name = key.as_units().iter().filter_map(|&unit| u8::try_from(unit).ok()).filter(u8::is_ascii_alphanumeric).map(char::from).collect::<String>();
+                output.insert((*key).clone(), summarize_value(&values[*key], Some(&key_name), depth + 1));
             }
             if keys.len() > 50 {
                 output.insert("_truncatedKeys".into(), json!(keys.len() - 50).into());
@@ -628,19 +622,125 @@ fn is_sensitive_key(key: &str) -> bool {
         .contains(&key.as_str())
 }
 
-fn redacted_string(value: &str) -> Value {
-    json!({"redacted":true, "type":"string", "length":value.encode_utf16().count(), "sha256":hash_audit_content(value)})
+fn hash_utf16(units: &[u16]) -> String {
+    let mut digest = Sha256::new();
+    for character in char::decode_utf16(units.iter().copied()) {
+        // Node hashes strings after UTF-8 encoding, which replaces unmatched surrogates.
+        digest.update(
+            character
+                .unwrap_or(char::REPLACEMENT_CHARACTER)
+                .encode_utf8(&mut [0; 4])
+                .as_bytes(),
+        );
+    }
+    format!("{digest:x}", digest = digest.finalize())
 }
 
-fn redacted_value(value: &Value) -> Value {
+fn redacted_value(value: &AuditValue) -> AuditValue {
     match value {
-        Value::String(value) => redacted_string(value),
-        Value::Array(values) => json!({"redacted":true, "type":"array", "length":values.len()}),
-        Value::Object(values) => json!({"redacted":true, "type":"object", "keyCount":values.len()}),
-        _ => {
-            json!({"redacted":true, "type":match value { Value::Bool(_) => "boolean", Value::Number(_) => "number", _ => "object" }})
+        AuditValue::String(_) | AuditValue::Utf16String(_) => {
+            let units = value.as_utf16().unwrap();
+            json!({"redacted":true, "type":"string", "length":units.len(), "sha256":hash_utf16(&units)}).into()
         }
+        AuditValue::Array(values) => json!({"redacted":true, "type":"array", "length":values.len()}).into(),
+        AuditValue::Object(values) => json!({"redacted":true, "type":"object", "keyCount":values.len()}).into(),
+        _ => json!({"redacted":true, "type":match value { AuditValue::Bool(_) => "boolean", AuditValue::Number(_) => "number", _ => "object" }}).into(),
     }
+}
+
+fn sanitize_utf16(units: &[u16]) -> Vec<u16> {
+    fn ascii_word(unit: u16) -> bool {
+        u8::try_from(unit).is_ok_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+    fn matches(units: &[u16], text: &str) -> bool {
+        units.len() >= text.len()
+            && units.iter().zip(text.bytes()).all(|(&unit, byte)| {
+                u8::try_from(unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(&byte))
+            })
+    }
+    fn space(unit: u16) -> bool {
+        char::from_u32(u32::from(unit)).is_some_and(|c| js_trim(&c.to_string()).is_empty())
+    }
+    let mut value = units.to_vec();
+    for pass in 0..3 {
+        let mut output = Vec::new();
+        let mut start = 0;
+        while start < value.len() {
+            let mut end = start;
+            let mut replacement = None;
+            let boundary = start == 0 || !ascii_word(value[start - 1]);
+            if pass == 0 && matches(&value[start..], "Bearer") {
+                end = start + 6;
+                let spaces = end;
+                while end < value.len() && space(value[end]) {
+                    end += 1;
+                }
+                if end > spaces {
+                    replacement = Some("Bearer [REDACTED]".encode_utf16().collect::<Vec<_>>());
+                }
+            } else if pass == 1 && boundary && value[start..].starts_with(&[115, 107, 45]) {
+                end = start + 3;
+                while end < value.len() && (ascii_word(value[end]) || value[end] == 45) {
+                    end += 1;
+                }
+                while end > start + 3 && !ascii_word(value[end - 1]) {
+                    end -= 1;
+                }
+                if end >= start + 15 {
+                    output.extend("[REDACTED]".encode_utf16());
+                    start = end;
+                    continue;
+                }
+            } else if pass == 2 && boundary {
+                for key in [
+                    "apikey",
+                    "api_key",
+                    "api-key",
+                    "accesstoken",
+                    "access_token",
+                    "access-token",
+                    "authorization",
+                    "password",
+                    "secret",
+                ] {
+                    if !matches(&value[start..], key) {
+                        continue;
+                    }
+                    end = start + key.len();
+                    let key_end = end;
+                    while end < value.len() && space(value[end]) {
+                        end += 1;
+                    }
+                    if end == value.len() || ![58, 61].contains(&value[end]) {
+                        continue;
+                    }
+                    end += 1;
+                    while end < value.len() && space(value[end]) {
+                        end += 1;
+                    }
+                    let mut text = value[start..key_end].to_vec();
+                    text.extend("=[REDACTED]".encode_utf16());
+                    replacement = Some(text);
+                    break;
+                }
+            }
+            if let Some(replacement) = replacement {
+                let token_start = end;
+                while end < value.len() && !space(value[end]) && ![44, 59].contains(&value[end]) {
+                    end += 1;
+                }
+                if end > token_start {
+                    output.extend(replacement);
+                    start = end;
+                    continue;
+                }
+            }
+            output.push(value[start]);
+            start += 1;
+        }
+        value = output;
+    }
+    value
 }
 
 const JS_SPACE: &str = r"[\t\n\v\f\r \x{00a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]";

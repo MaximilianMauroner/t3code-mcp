@@ -17,6 +17,7 @@ async fn call(gateway: &T3Gateway, name: &str, arguments: Value) -> Value {
         )
         .await
         .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     assert!(response.get("error").is_none(), "{response}");
     let result = response["result"].clone();
     let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();

@@ -1437,3 +1437,83 @@ fn task_workflow_matches_the_captured_node_journal_including_field_order() {
             < keys.iter().position(|k| *k == "baselineRevision").unwrap()
     );
 }
+
+#[test]
+fn split_patch_previews_do_not_interrupt_persistence_or_poison_the_journal() {
+    let file = Fixture::new();
+    let audit = Arc::new(AuditLog::new(file.directory.join("audit.jsonl")));
+    let journal = OperationJournal::new(&file.path, Some(audit.clone()));
+    let op = journal.begin(input("split-operation")).unwrap().record;
+    let task = journal.begin_task(task_input("split-task")).unwrap().record;
+    let error = format!("{}😀", "a".repeat(511));
+    let operation_id = text(&op, "operationId");
+    let task_ref = text(&task, "taskRef");
+    assert_eq!(
+        journal
+            .update(
+                operation_id,
+                OperationPatch {
+                    status: Some(OperationStatus::Rejected),
+                    last_error: Some(error.clone()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()["lastError"],
+        error
+    );
+    assert_eq!(
+        journal
+            .update_task(
+                task_ref,
+                TaskPatch {
+                    stage: Some(TaskStage::Rejected),
+                    last_error: Some(Some(error.clone())),
+                    ..Default::default()
+                }
+            )
+            .unwrap()["lastError"],
+        error
+    );
+    assert_eq!(
+        journal.get_by_operation_id(operation_id).unwrap().unwrap()["lastError"],
+        error
+    );
+    assert_eq!(
+        journal.get_task_by_ref(task_ref).unwrap().unwrap()["lastError"],
+        error
+    );
+    let reopened = file.journal();
+    assert_eq!(
+        reopened.get_by_operation_id(operation_id).unwrap().unwrap()["lastError"],
+        error
+    );
+    assert_eq!(
+        reopened.get_task_by_ref(task_ref).unwrap().unwrap()["lastError"],
+        error
+    );
+    journal
+        .update(
+            operation_id,
+            OperationPatch {
+                last_error: Some("later".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    journal
+        .update_task(
+            task_ref,
+            TaskPatch {
+                last_error: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let page = audit
+        .query(&crate::operations::audit_log::AuditQueryInput::default())
+        .unwrap();
+    assert_eq!(page.invalid_lines, 0);
+    assert!(page.items.iter().any(|row| row.event == "operation.update"));
+    assert!(page.items.iter().any(|row| row.event == "task.update"));
+    assert!(audit.diagnostic_error().is_none());
+}

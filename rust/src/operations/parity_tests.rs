@@ -95,7 +95,7 @@ fn surrogate_boundary_preview_survives_jsonl_query_and_usage() {
     let audit = AuditLog::new(&file.path);
     let mut input = AuditEventInput::new(AuditSource::Mcp, "tool.call");
     input.operation = Some("preview-test".into());
-    input.details = Some(details);
+    input.details = Some(details.into());
     audit.record(input);
     let line = fs::read_to_string(&file.path).unwrap();
     assert!(line.contains(r"\ud83d"));
@@ -189,4 +189,46 @@ fn lone_surrogates_in_audit_metadata_and_object_keys_round_trip() {
             .unwrap(),
         "value-".encode_utf16().chain([0xd800]).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn reauditing_surrogates_preserves_text_and_redacts_secrets_across_code_units() {
+    let file = LogFile::new();
+    let audit = AuditLog::new(&file.path);
+    let details: AuditValue = serde_json::from_str(
+        r#"{
+        "plain":"visible-\ud800",
+        "bearer":"Bearer private-\ud800-tail, visible-\udc00",
+        "assignment":"API_key=private-\ud800-tail; visible-\udc00",
+        "key":"sk-abcdefghijklmnop visible-\ud800",
+        "token-\ud800":"private-\udfff",
+        "prompt":"private-\udfff"
+    }"#,
+    )
+    .unwrap();
+    let mut input = AuditEventInput::new(AuditSource::Mcp, "tool.result");
+    input.details = Some(details);
+    audit.record(input);
+    let raw = fs::read_to_string(&file.path).unwrap();
+    assert!(!raw.contains("private"));
+    assert!(!raw.contains("abcdefghijklmnop"));
+    assert!(!raw.contains('\u{fffd}'));
+    let page = audit.query(&AuditQueryInput::default()).unwrap();
+    assert_eq!((page.total, page.invalid_lines), (1, 0));
+    let details = page.items[0].details.as_ref().unwrap();
+    for (field, expected) in [
+        ("plain", r#""visible-\ud800""#),
+        ("bearer", r#""Bearer [REDACTED], visible-\udc00""#),
+        ("assignment", r#""API_key=[REDACTED]; visible-\udc00""#),
+        ("key", r#""[REDACTED] visible-\ud800""#),
+    ] {
+        assert_eq!(
+            details[field],
+            serde_json::from_str::<AuditValue>(expected).unwrap()
+        );
+    }
+    let token_key = "token-".encode_utf16().chain([0xd800]).collect::<Vec<_>>();
+    assert_eq!(details.get_utf16(&token_key).unwrap()["redacted"], true);
+    assert_eq!(details["prompt"]["redacted"], true);
+    assert_eq!(details["prompt"]["length"], 9);
 }

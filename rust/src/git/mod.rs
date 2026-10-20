@@ -191,7 +191,7 @@ pub fn audit_log_sink(log: Arc<AuditLog>) -> Arc<dyn GitAuditSink> {
                 operation: input.operation,
                 outcome: input.outcome,
                 duration_ms: input.duration_ms,
-                details: input.details,
+                details: input.details.map(Into::into),
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Some(context) = context {
