@@ -29,6 +29,7 @@ jobs:
       - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm typecheck:test
+      - run: node --test scripts/benchmark-gateway-memory.test.mjs
       - run: pnpm exec vitest run --no-file-parallelism --maxWorkers=1 --testTimeout=30000 --hookTimeout=30000
   rust:
     runs-on: ubuntu-latest

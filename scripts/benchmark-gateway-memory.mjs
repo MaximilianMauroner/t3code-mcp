@@ -8,29 +8,19 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { createCatalogFixture } from "./gateway-memory-catalog.mjs";
 
-const [typescriptCli, rustBinary, output, catalogFile] = process.argv.slice(2);
-assert(typescriptCli && rustBinary && output,
-  "Use node scripts/benchmark-gateway-memory.mjs <main/dist/cli.js> <release-binary> <output.json> [native-catalog.json].");
+const [typescriptCli, rustBinary, output] = process.argv.slice(2);
+assert(typescriptCli && rustBinary && output && process.argv.length === 5,
+  "Use node scripts/benchmark-gateway-memory.mjs <main/dist/cli.js> <release-binary> <output.json>.");
 assert.equal(process.platform, "linux", "RSS sampling requires Linux /proc.");
-const { NATIVE_TOOL_NAMES } = await import(pathToFileURL(join(dirname(resolve(typescriptCli)), "contract.js")));
-const schema = {
-  type: "object",
-  properties: {
-    cursor: { type: "integer", minimum: 0 },
-    limit: { type: "integer", minimum: 1, maximum: 100 },
-    projectId: { type: "string" },
-    filters: { type: "object", properties: {
-      statuses: { type: "array", items: { type: "string", enum: ["running", "completed", "waiting"] } },
-      archived: { type: "boolean", default: false },
-    } },
-  },
+const contract = await import(pathToFileURL(join(dirname(resolve(typescriptCli)), "contract.js")));
+const { tools, checkCatalog } = createCatalogFixture(contract);
+const childEnvironment = {
+  PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC",
+  NODE_ENV: "production", MCP_TRANSPORT: "http", MCP_HOST: "127.0.0.1",
+  MCP_BEARER_TOKEN: "isolated-benchmark", MCP_READ_ONLY: "true", T3_ACCESS_TOKEN: "isolated-benchmark",
 };
-const tools = catalogFile ? JSON.parse(await readFile(catalogFile, "utf8")) : NATIVE_TOOL_NAMES.map((name) => ({
-  name, description: `Isolated memory fixture for ${name}.`, inputSchema: schema,
-  outputSchema: { type: "object", properties: { marker: { type: "string" }, items: { type: "array", items: { type: "string" } } }, required: ["marker", "items"] },
-}));
-assert.deepEqual(new Set(tools.map((tool) => tool.name)), new Set(NATIVE_TOOL_NAMES));
 const catalogJson = JSON.stringify(tools);
 const payload = { marker: "memory-fixture-complete", items: Array.from({ length: 20 }, (_, i) => `item-${i}`) };
 const counts = { catalogs: 0, calls: 0, initializes: 0, descriptors: 0, sessions: 0, shells: 0, unexpected: 0, authFailures: 0 };
@@ -153,11 +143,9 @@ async function run(runtime, repetition) {
   const command = runtime === "typescript" ? process.execPath : resolve(rustBinary);
   const args = runtime === "typescript" ? [resolve(typescriptCli), "serve"] : ["serve"];
   let stderr = "";
-  child = spawn(command, args, { cwd: dataDir, stdio: ["ignore", "ignore", "pipe"], env: {
-    ...process.env, NODE_ENV: "production", MCP_TRANSPORT: "http", MCP_HOST: "127.0.0.1", MCP_PORT: String(port),
-    MCP_BEARER_TOKEN: "isolated-benchmark", MCP_READ_ONLY: "true", T3_HTTP_BASE_URL: upstreamUrl,
-    T3_NATIVE_MCP_URL: `${upstreamUrl}/mcp`, T3_ACCESS_TOKEN: "isolated-benchmark", T3_MCP_DATA_DIR: dataDir,
-  } });
+  const env = { ...childEnvironment, HOME: dataDir, TMPDIR: dataDir, MCP_PORT: String(port),
+    T3_HTTP_BASE_URL: upstreamUrl, T3_NATIVE_MCP_URL: `${upstreamUrl}/mcp`, T3_MCP_DATA_DIR: dataDir };
+  child = spawn(command, args, { cwd: dataDir, stdio: ["ignore", "ignore", "pipe"], env });
   child.stderr.on("data", (bytes) => { stderr = (stderr + bytes).slice(-8192); });
   child.on("error", (error) => { stderr += error.message; });
   const before = { ...counts };
@@ -180,7 +168,7 @@ async function run(runtime, repetition) {
     const startup = await sample(child.pid);
     await rpc(port, "initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "memory-benchmark", version: "1" } });
     const initialCatalog = await rpc(port, "tools/list", {});
-    assert(initialCatalog.tools.some((tool) => tool.name === "t3_thread_list"));
+    checkCatalog(initialCatalog, runtime);
     let checkedCalls = 0;
     let checkedGatewayCalls = 0;
     async function work(refreshes, offset) {
@@ -188,7 +176,7 @@ async function run(runtime, repetition) {
         const previous = counts.catalogs;
         await credential(offset + i);
         const listed = await rpc(port, "tools/list", {});
-        assert(listed.tools.some((tool) => tool.name === "t3_thread_list"));
+        checkCatalog(listed, runtime);
         for (let wait = 0; counts.catalogs === previous && wait < 150; wait++) await delay(20);
         assert.equal(counts.catalogs, previous + 1, "Exactly one upstream catalog refresh per renewal.");
         for (let call = 0; call < 10; call++) {
@@ -219,7 +207,7 @@ async function run(runtime, repetition) {
     assert.equal(upstreamCounts.unexpected, 0);
     assert.equal(upstreamCounts.authFailures, 0);
     assert(upstreamCounts.sessions > 0 && upstreamCounts.shells > 0 && upstreamCounts.descriptors > 0);
-    const result = { runtime, repetition, startup, warm, loaded, settled, samples, upstreamCounts, checkedCalls, checkedGatewayCalls,
+    const result = { runtime, repetition, environment: env, startup, warm, loaded, settled, samples, upstreamCounts, checkedCalls, checkedGatewayCalls,
       auditBytes: (await stat(join(dataDir, "audit.jsonl"))).size, stderr };
     runs.push(result);
     console.log(JSON.stringify({ runtime, repetition, warmKiB: warm.rssKiB, settledKiB: settled.rssKiB,
@@ -237,7 +225,7 @@ try {
   upstream.closeAllConnections();
   await new Promise((done) => upstream.close(done));
   await writeFile(output, JSON.stringify({ complete: runs.length === 10, node: process.version,
-    catalogSource: catalogFile ?? "synthetic allowlisted tool fixture", catalogBytes: Buffer.byteLength(catalogJson),
+    catalogSource: "synthetic allowlisted tool fixture", catalogBytes: Buffer.byteLength(catalogJson),
     catalogSha256: createHash("sha256").update(catalogJson).digest("hex"), toolCount: tools.length,
     method: "5 alternating pairs; 5 warmup renewals and 30 measured renewals with 10 native calls and status plus overview each; RSS sampled at 100ms; 2s final idle; native credential rotation forces catalog refresh", runs }, null, 2));
   await rm(directory, { recursive: true, force: true });
