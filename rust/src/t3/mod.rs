@@ -1,6 +1,5 @@
 pub mod commands;
 pub mod failure;
-pub mod failure_order;
 pub mod http_client;
 pub mod native_mcp;
 pub mod rpc_client;

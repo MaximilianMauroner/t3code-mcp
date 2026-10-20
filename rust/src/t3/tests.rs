@@ -306,32 +306,6 @@ fn captured_node_failure_fixtures_choose_the_same_provider_evidence() {
     }
 }
 #[test]
-fn failure_order_keeps_protocol_eras_and_authoritative_item_order() {
-    use failure_order::*;
-    use std::cmp::Ordering::*;
-    let old: FailureEvidenceOrder = serde_json::from_value(
-        json!({"protocolVersion":1,"scope":"full","snapshotSequence":100,"readStartedAt":1}),
-    )
-    .unwrap();
-    let new: FailureEvidenceOrder = serde_json::from_value(
-        json!({"protocolVersion":2,"scope":"shell","snapshotSequence":1,"readStartedAt":2}),
-    )
-    .unwrap();
-    let new = failure_order_with_era(new, Some(&old));
-    assert_eq!(new.protocol_started_at, Some(2));
-    assert_eq!(compare_failure_order(&old, &new), Less);
-    let mut back = old.clone();
-    back.read_started_at = Some(3);
-    back.snapshot_sequence = 1;
-    let back = failure_order_with_era(back, Some(&new));
-    assert_eq!(compare_failure_order(&old, &back), Less);
-    let mut same = back.clone();
-    same.read_started_at = Some(9);
-    assert!(same_persisted_failure_order(Some(&back), Some(&same)));
-    same.scope = EvidenceScope::Shell;
-    assert_eq!(compare_failure_order(&back, &same), Greater);
-}
-#[test]
 fn failure_redaction_keeps_ids_and_hashes_raw_reasons() {
     assert_eq!(
         failure::sanitize_failure_identifier("claude/token-provider:model\n"),

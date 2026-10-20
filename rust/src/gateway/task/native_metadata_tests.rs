@@ -110,7 +110,7 @@ fn native_calls(fixture: &Fixture) -> Vec<Value> {
         .collect()
 }
 
-async fn assert_forwarded(fixture: &Fixture, params: Value) {
+async fn assert_forwarded(fixture: &Fixture, mut params: Value) {
     let before = native_calls(fixture).len();
     let (status, response) = http_call(fixture, params.clone()).await;
     assert_eq!(status, 200, "{response}");
@@ -123,31 +123,35 @@ async fn assert_forwarded(fixture: &Fixture, params: Value) {
     );
     let calls = native_calls(fixture);
     assert_eq!(calls.len(), before + 1);
+    if params["arguments"].get("query").is_none() {
+        params["arguments"]["query"] = json!("native default");
+    }
     assert_eq!(calls[before], params);
 }
 
 #[tokio::test]
-async fn native_http_preserves_complete_params_and_leaves_inputs_to_t3() {
+async fn native_http_rejects_invalid_arguments_before_sending() {
     let fixture = native_fixture(false, true).await;
-    assert_forwarded(
-        &fixture,
-        json!({
-            "name":"t3_thread_list",
-            "arguments":{
-                "threadId":false, "query":"  keep this spacing  ", "count":0.125,
-                "unknown":{"nested":[null,true,{"value":"  unchanged  "}]},
-            },
-            "extension":{"nested":{"_meta":{"progressToken":null}}},
-            "_meta":{
-                "progressToken":"  progress token  ",
-                "opaque":{"nested":[1,null,{"retain":true}]},
-                "io.modelcontextprotocol/related-task":{
-                    "taskId":"  opaque task  ", "extension":{"retain":[false,{}]},
-                },
-            },
-        }),
-    )
-    .await;
+    for arguments in [
+        json!({"threadId":false}),
+        json!({"threadId":"thread-1","count":0.125}),
+        json!({"threadId":"thread-1","unknown":true}),
+        json!({"query":"missing thread"}),
+        json!({}),
+    ] {
+        let (status, response) = http_call(
+            &fixture,
+            json!({"name":"t3_thread_list","arguments":arguments}),
+        )
+        .await;
+        assert_eq!(status, 200, "{response}");
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            response["result"]["isError"], true,
+            "{arguments}: {response}"
+        );
+        assert!(native_calls(&fixture).is_empty());
+    }
 }
 
 #[tokio::test]
@@ -156,7 +160,7 @@ async fn authorized_native_mutation_preserves_the_same_parameter_object() {
     assert_forwarded(
         &fixture,
         json!({
-            "name":"t3_thread_send", "arguments":{"threadId":"thread-1","message":"  keep  "},
+            "name":"t3_thread_send", "arguments":{"threadId":"thread-1","query":"  keep  "},
             "extension":[null,{"preserve":true}],
             "_meta":{
                 "progressToken":0,
@@ -168,7 +172,7 @@ async fn authorized_native_mutation_preserves_the_same_parameter_object() {
 }
 
 #[tokio::test]
-async fn native_http_keeps_omitted_arguments_and_metadata_absent() {
+async fn native_http_rejects_missing_required_arguments() {
     let fixture = native_fixture(false, true).await;
     for params in [
         json!({"name":"t3_thread_list"}),
@@ -176,7 +180,9 @@ async fn native_http_keeps_omitted_arguments_and_metadata_absent() {
         json!({"name":"t3_thread_list","arguments":{}}),
         json!({"name":"t3_thread_list","_meta":{}}),
     ] {
-        assert_forwarded(&fixture, params).await;
+        let (_, response) = http_call(&fixture, params).await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(native_calls(&fixture).is_empty());
     }
 }
 
@@ -200,7 +206,7 @@ async fn native_http_preserves_fractional_zero_exponent_large_and_string_tokens(
         assert_forwarded(
             &fixture,
             json!({
-                "name":"t3_thread_list",
+                "name":"t3_thread_list","arguments":{"threadId":"thread-1"},
                 "_meta":{
                     "progressToken":token,
                     "io.modelcontextprotocol/related-task":{
