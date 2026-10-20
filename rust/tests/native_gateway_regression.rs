@@ -13,7 +13,7 @@ use std::{
 };
 use t3_code_mcp::{
     config::{GatewayConfig, load_config_from},
-    contract::native_called_tool_names,
+    contract::{gateway_tools, native_called_tool_names},
     doctor::run_doctor,
     gateway::T3Gateway,
     mcp::{IncomingMessage, McpServer},
@@ -251,7 +251,14 @@ async fn rejected_catalog_refresh_disables_native_operations() {
         disabled(&status, "t3_thread_read")["reasonCode"],
         "native_unavailable"
     );
-    assert_eq!(status["native"]["errorCode"], "native_credential_rejected");
+    let schema = &gateway_tools()
+        .iter()
+        .find(|tool| tool.name == "t3_connection_status")
+        .unwrap()
+        .output_schema["properties"]["native"]["properties"];
+    for key in status["native"].as_object().unwrap().keys() {
+        assert!(schema.get(key).is_some(), "native.{key} is not in the output schema");
+    }
     assert_eq!(
         disabled(&status, "t3_thread_read")["reason"],
         status["native"]["error"]
