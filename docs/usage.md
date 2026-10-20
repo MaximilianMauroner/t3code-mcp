@@ -38,7 +38,7 @@ A task can keep running in T3 after the client disconnects. Composite tasks star
 
 ## Native T3 tools
 
-T3 builds that serve MCP to outside clients at `/mcp` have their own orchestration tools. The gateway logs in to that endpoint once (see [native login](configuration.md#native-t3-login)) and forwards an allowlist of those tools under their native names and results. The gateway converts each tool's input schema before it advertises it, and T3 validates every call. The gateway does not reimplement the tools.
+T3 builds that serve MCP to outside clients at `/mcp` have their own orchestration tools. The gateway logs in to that endpoint once (see [native login](configuration.md#native-t3-login)) and forwards an allowlist of those tools under their native names and results. The gateway preserves native tool definitions, and T3 validates every call. The gateway does not reimplement the tools.
 
 | Group | Forwarded tools |
 | --- | --- |

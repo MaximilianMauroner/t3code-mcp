@@ -6,6 +6,8 @@ Run the commands below from the repository root.
 
 ```sh
 pnpm build
+cargo test --locked --manifest-path rust/Cargo.toml
+pnpm build:reference
 pnpm test
 pnpm typecheck:test
 ```
@@ -15,9 +17,12 @@ The default suite uses disposable local T3 fakes, disposable Git repositories/wo
 For a read-only connection diagnostic:
 
 ```sh
-node --env-file=.env dist/cli.js status
-node --env-file=.env dist/cli.js doctor
-node --env-file=.env dist/cli.js smoke
+set -a
+. ./.env
+set +a
+rust/target/release/t3-code-mcp status
+rust/target/release/t3-code-mcp doctor
+rust/target/release/t3-code-mcp smoke
 ```
 
 `doctor` checks config, journal writability, T3 identity/scopes/expiry, effective access, freshness, build fingerprint, a real local MCP `tools/list` exchange, a harmless overview call, and tunnel readiness without mutation. Its output includes a machine-readable capability manifest. To compare an actual host capture, set `MCP_HOST_TOOL_NAMES_JSON` to a JSON array of the tool names that host discovered before running `doctor`; missing and unexpected operations fail the `host_discovery` check. `smoke` calls status plus the bounded overview path MCP clients use and validates highlight/excerpt bounds. After every interface deployment, run `smoke`, restart gateway then tunnel, force fresh client discovery, compare the discovered `toolSchemaFingerprint` (it identifies the build's declared tool contract, not the native tools that T3 offers now), and invoke status plus overview from your MCP client ("What's running and does anything need me?").

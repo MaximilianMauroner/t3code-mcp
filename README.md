@@ -35,7 +35,7 @@ Start with `MCP_READ_ONLY=true`, connect only trusted clients, and review the [s
 
 ## Quick start
 
-Install Node.js 20.6 or newer and pnpm. The `spike`, `usage-summary`, and `benchmark:audit` package scripts also require Cargo and Rust 1.88 or newer.
+Install Cargo and Rust 1.88 or newer. The package commands and TypeScript reference checks also need Node.js 20 or newer and pnpm.
 
 Run from the repository root:
 
@@ -51,8 +51,13 @@ Edit `.env`: set `T3_ACCESS_TOKEN`, a separate random `MCP_BEARER_TOKEN`, and `M
 For HTTP, set `MCP_TRANSPORT=http` and start the gateway:
 
 ```sh
-node --env-file=.env dist/cli.js serve
+set -a
+. ./.env
+set +a
+pnpm start
 ```
+
+`pnpm build` produces `rust/target/release/t3-code-mcp`. `start` and `serve` run that release binary. `dev` builds and runs the Rust debug binary. The CLI reads exported environment variables. `pnpm build:reference` builds the TypeScript reference used by compatibility checks.
 
 Connect your MCP client to `http://127.0.0.1:8787/mcp` with `Authorization: Bearer <MCP_BEARER_TOKEN>`. This address is local to the gateway machine; remote clients need an authenticated tunnel or HTTPS proxy. For a local client that launches the process, use `MCP_TRANSPORT=stdio` instead.
 

@@ -8,10 +8,12 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "dev": "tsx src/cli.ts serve",
+    "build": "cargo build --locked --release --manifest-path rust/Cargo.toml --bin t3-code-mcp",
+    "build:reference": "tsc -p tsconfig.json",
+    "dev": "cargo run --quiet --locked --manifest-path rust/Cargo.toml --bin t3-code-mcp -- serve",
     "spike": "cargo run --quiet --locked --manifest-path rust/Cargo.toml --bin t3-code-mcp -- spike",
-    "start": "node dist/cli.js serve",
+    "start": "rust/target/release/t3-code-mcp serve",
+    "serve": "rust/target/release/t3-code-mcp serve",
     "test": "vitest run",
     "test:live": "T3_LIVE_TESTS=1 vitest run tests/live.integration.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
