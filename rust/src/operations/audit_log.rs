@@ -498,10 +498,6 @@ fn scan_line(line: &[u8], scan: &mut AuditScan, visit: &mut impl FnMut(AuditEven
     }
 }
 
-pub fn hash_audit_content(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
-}
-
 pub fn summarize_for_audit(value: impl Into<AuditValue>) -> AuditValue {
     summarize_value(&value.into(), None, 0)
 }

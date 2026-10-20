@@ -1,6 +1,7 @@
 mod arguments;
 mod catalog;
 mod http;
+mod native_input_schema;
 mod output;
 mod peer;
 mod result;

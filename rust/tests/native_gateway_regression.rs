@@ -285,7 +285,7 @@ async fn attachment_transport_errors_omit_signed_url_from_mcp_and_audit() {
 
 #[tokio::test]
 async fn attachment_upload_audits_every_transport_outcome() {
-    for status in [204, 400, 302, 0] {
+    for status in [204, 400, 302, 307, 0] {
         let fixture = Fixture::new(None).await;
         fixture.upload_status.store(status, Ordering::SeqCst);
         let gateway = T3Gateway::new(fixture.config());
@@ -316,7 +316,7 @@ async fn attachment_upload_audits_every_transport_outcome() {
         );
         assert_eq!(
             events[1]["details"]["status"],
-            if status == 0 {
+            if matches!(status, 0 | 302 | 307) {
                 Value::Null
             } else {
                 json!(status)

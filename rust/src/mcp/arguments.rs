@@ -20,8 +20,11 @@ pub(super) fn parse(tool: &Value, value: Option<&Value>) -> Result<Map<String, V
     };
     let mut errors = Vec::new();
     let value = value.map(AuditValue::from);
+    let fallback = (!gateway
+        && !super::native_input_schema::converts_to_object(&tool["inputSchema"]))
+    .then(|| serde_json::json!({"type":"object"}));
     let parsed = parse_value(
-        &tool["inputSchema"],
+        fallback.as_ref().unwrap_or(&tool["inputSchema"]),
         value.as_ref(),
         "",
         schema_use,
@@ -90,6 +93,9 @@ fn parse_value(
     errors: &mut Vec<String>,
 ) -> Option<AuditValue> {
     let default = schema.get("default").map(AuditValue::from);
+    if input.is_none() && schema_use == SchemaUse::NativeInput && default.is_some() {
+        return default;
+    }
     let input = input.or(default.as_ref());
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
         if !input.is_some_and(|v| allowed.iter().any(|allowed| v == allowed)) {

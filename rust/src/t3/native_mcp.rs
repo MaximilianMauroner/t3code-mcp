@@ -730,13 +730,13 @@ impl NativeMcpClient {
                         format!("Attachment upload failed: {}", error.without_url()),
                     )
                 })?;
-            status = Some(response.status().as_u16());
             if response.status().is_redirection() {
                 return Err(NativeError::new(
                     "native_upload_failed",
                     "Attachment upload failed: fetch failed",
                 ));
             }
+            status = Some(response.status().as_u16());
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let detail = response

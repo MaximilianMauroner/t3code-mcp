@@ -364,6 +364,9 @@ impl McpServer {
                 .is_some(),
             _ => false,
         });
+        if !scoped && !progress {
+            peer = Peer::borrowing_native();
+        }
         let messages = messages
             .into_iter()
             .map(|message| self.admit(message, peer.clone()))

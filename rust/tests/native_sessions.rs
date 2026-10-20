@@ -605,30 +605,8 @@ async fn cancelled_native_rejections_do_not_forward_upstream_data() {
     assert_eq!(fixture.calls(), 1);
 }
 
-#[tokio::test]
-async fn sessionless_native_calls_need_no_initialize_handshake() {
-    let fixture = Fixture::new().await;
-    let server = fixture.server.clone();
-    let gateway = fixture.gateway.clone();
-    let pending = tokio::spawn(async move {
-        server
-            .handle_http(
-                request("POST", None, call(json!(1), 0, false)),
-                &options(),
-                gateway.as_ref(),
-            )
-            .await
-    });
-    assert_eq!(fixture.event().await.body["method"], "tools/call");
-    fixture.gates[0].release.notify_one();
-    let response = pending.await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(response.headers().get("mcp-session-id").is_none());
-    assert_eq!(
-        body(&response)["result"]["structuredContent"]["params"],
-        call(json!(1), 0, false)["params"]
-    );
-}
+#[path = "native_sessions/stateless.rs"]
+mod stateless;
 
 #[cfg(unix)]
 struct Process(Option<std::process::Child>);
@@ -757,6 +735,12 @@ async fn stdio_eof_and_signal_drain_an_admitted_mutation() {
 #[cfg(unix)]
 #[tokio::test]
 async fn http_disconnect_and_shutdown_drain_the_complete_gateway_worker() {
+    assert_http_shutdown_drains(true).await;
+    assert_http_shutdown_drains(false).await;
+}
+
+#[cfg(unix)]
+async fn assert_http_shutdown_drains(progress: bool) {
     let fixture = Fixture::new().await;
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = reservation.local_addr().unwrap().port();
@@ -774,12 +758,19 @@ async fn http_disconnect_and_shutdown_drain_the_complete_gateway_worker() {
     })
     .await
     .unwrap();
+    let mut sent = call(json!(1), 0, false);
+    if !progress {
+        sent["params"]["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("progressToken");
+    }
     let pending = tokio::spawn(async move {
         client
             .post(format!("{url}/mcp"))
             .bearer_auth("gateway-secret")
             .header("accept", "application/json, text/event-stream")
-            .json(&call(json!(1), 0, false))
+            .json(&sent)
             .send()
             .await
             .unwrap()

@@ -8,8 +8,35 @@ use futures_util::FutureExt;
 use serde_json::{Value, json};
 
 async fn native_fixture() -> Fixture {
+    native_fixture_with_schema(json!({
+        "type":"object",
+        "properties":{
+            "optionalDefault":{"type":"string","default":"native-only"},
+            "defaultedOptions":{
+                "type":"object","default":{},
+                "properties":{"mode":{"type":"string","default":"fast"}},
+            },
+            "query":{"type":"string"},
+            "options":{
+                "type":"object",
+                "properties":{
+                    "known":{"type":"string"},
+                    "nestedDefault":{"type":"boolean","default":true},
+                },
+                "additionalProperties":true,
+            },
+            "largeInteger":{"type":"integer","minimum":0},
+            "character":{"type":"string","minLength":1,"maxLength":1},
+        },
+        "additionalProperties":true,
+    }))
+    .await
+}
+
+async fn native_fixture_with_schema(input_schema: Value) -> Fixture {
     let mut fixture = Fixture::new().await;
-    fixture.server = Server::start(|request| {
+    fixture.server = Server::start(move |request| {
+        let input_schema = input_schema.clone();
         async move {
             match request.path.as_str() {
                 "/mcp" if request.method == "GET" => Reply::status(405, Value::Null),
@@ -22,24 +49,8 @@ async fn native_fixture() -> Fixture {
                     "jsonrpc":"2.0", "id":request.body["id"],
                     "result":{"tools":[{
                         "name":"t3_thread_list",
-                        "inputSchema":{
-                            "type":"object",
-                            "properties":{
-                                "optionalDefault":{"type":"string","default":"native-only"},
-                                "query":{"type":"string"},
-                                "options":{
-                                    "type":"object",
-                                    "properties":{
-                                        "known":{"type":"string"},
-                                        "nestedDefault":{"type":"boolean","default":true},
-                                    },
-                                    "additionalProperties":true,
-                                },
-                                "largeInteger":{"type":"integer","minimum":0},
-                                "character":{"type":"string","minLength":1,"maxLength":1},
-                            },
-                            "additionalProperties":true,
-                        },
+                        "inputSchema":input_schema,
+                        "outputSchema":{"type":"object","properties":{"retained":{"type":"boolean"}}},
                     }]},
                 })),
                 "/mcp" if request.body["method"] == "tools/call" => Reply::json(json!({
@@ -66,6 +77,11 @@ async fn assert_forwarded(arguments: Value) {
     let params = json!({"name":"t3_thread_list","arguments":arguments});
     let mut expected = arguments;
     expected["optionalDefault"] = json!("native-only");
+    expected["defaultedOptions"] = if expected.get("defaultedOptions").is_some() {
+        json!({"mode":"fast"})
+    } else {
+        json!({})
+    };
     if expected.get("options").is_some() {
         expected["options"]["nestedDefault"] = json!(true);
     }
@@ -101,6 +117,7 @@ async fn assert_forwarded(arguments: Value) {
 #[tokio::test]
 async fn native_optional_defaults_are_inserted_before_sending() {
     assert_forwarded(json!({})).await;
+    assert_forwarded(json!({"defaultedOptions":{}})).await;
 }
 
 #[tokio::test]
@@ -179,6 +196,72 @@ async fn native_arguments_still_require_an_object_envelope() {
             .iter()
             .all(|request| request.body["method"] != "tools/call")
     );
+}
+
+#[tokio::test]
+async fn native_conversion_fallback_forwards_raw_arguments_and_keeps_advertisement() {
+    let cases: Vec<Value> = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/native-input-conversion.json"
+    ))
+    .unwrap();
+    for case in cases {
+        let fixture = native_fixture_with_schema(case["inputSchema"].clone()).await;
+        let server = McpServer::gateway();
+        let listed = server
+            .handle_message(
+                IncomingMessage::parse(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+                    .unwrap(),
+                &fixture.gateway,
+            )
+            .await
+            .unwrap();
+        let listed = serde_json::to_value(listed).unwrap();
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "t3_thread_list")
+            .unwrap();
+        assert_eq!(tool["inputSchema"], case["inputSchema"], "{}", case["name"]);
+        assert_eq!(
+            tool["outputSchema"],
+            json!({"type":"object","properties":{"retained":{"type":"boolean"}}})
+        );
+        let arguments = json!({"n":"delegated-to-upstream","extra":true});
+        let params = json!({"name":"t3_thread_list","arguments":arguments});
+        let response = server
+            .handle_message(
+                IncomingMessage::parse(json!({
+                    "jsonrpc":"2.0","id":2,"method":"tools/call","params":params,
+                }))
+                .unwrap(),
+                &fixture.gateway,
+            )
+            .await
+            .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        let requests = fixture.server.requests.lock().unwrap();
+        let calls = requests
+            .iter()
+            .filter(|request| request.body["method"] == "tools/call")
+            .collect::<Vec<_>>();
+        if case["fallback"] == true {
+            assert_eq!(
+                response["result"]["structuredContent"]["arguments"], arguments,
+                "{}: {response}",
+                case["name"]
+            );
+            assert_eq!(calls.len(), 1, "{}", case["name"]);
+            assert_eq!(calls[0].body["params"], params);
+        } else {
+            assert_eq!(
+                response["result"]["isError"], true,
+                "{}: {response}",
+                case["name"]
+            );
+            assert!(calls.is_empty(), "{}", case["name"]);
+        }
+    }
 }
 
 #[tokio::test]

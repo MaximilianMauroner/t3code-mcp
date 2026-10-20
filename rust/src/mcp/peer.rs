@@ -18,9 +18,14 @@ pub struct Peer(Arc<PeerState>);
 
 struct PeerState {
     admission: Mutex<Admission>,
-    native: OnceLock<NativeMcpClient>,
+    native: NativeState,
     drained: Notify,
     notifications: Mutex<Notifications>,
+}
+
+enum NativeState {
+    Borrowed,
+    Owned(OnceLock<NativeMcpClient>),
 }
 
 #[derive(Default)]
@@ -37,19 +42,27 @@ struct Admission {
 
 impl Default for Peer {
     fn default() -> Self {
+        Self::new(NativeState::Owned(OnceLock::new()))
+    }
+}
+
+impl Peer {
+    pub(crate) fn borrowing_native() -> Self {
+        Self::new(NativeState::Borrowed)
+    }
+
+    fn new(native: NativeState) -> Self {
         Self(Arc::new(PeerState {
             admission: Mutex::new(Admission {
                 closed: false,
                 active: HashMap::new(),
             }),
-            native: OnceLock::new(),
+            native,
             drained: Notify::new(),
             notifications: Mutex::new(Notifications::default()),
         }))
     }
-}
 
-impl Peer {
     pub(crate) fn reserve(&self, id: RequestId) -> Result<Invocation, RpcError> {
         let mut admission = self.0.admission.lock().unwrap();
         if admission.closed {
@@ -94,8 +107,11 @@ impl Peer {
         }
     }
 
-    pub fn native(&self, source: &NativeMcpClient) -> &NativeMcpClient {
-        self.0.native.get_or_init(|| {
+    pub fn native<'a>(&'a self, source: &'a NativeMcpClient) -> &'a NativeMcpClient {
+        let NativeState::Owned(native) = &self.0.native else {
+            return source;
+        };
+        native.get_or_init(|| {
             let client = source.fork();
             let peer = Arc::downgrade(&self.0);
             client.observe_notifications(Arc::new(move |notification| {
@@ -186,7 +202,8 @@ impl Peer {
                 .active
                 .values()
                 .all(|entry| entry.strong_count() == 0)
-            && let Some(native) = self.0.native.get()
+            && let NativeState::Owned(native) = &self.0.native
+            && let Some(native) = native.get()
         {
             native.close();
         }

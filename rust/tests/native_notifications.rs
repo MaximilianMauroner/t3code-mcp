@@ -177,6 +177,94 @@ async fn colliding_peer_tokens_route_post_progress_and_get_list_changes_separate
 }
 
 #[tokio::test]
+async fn stateless_progress_tokens_and_batches_keep_distinct_native_sessions() {
+    let mut fixture = Fixture::new().await;
+    let gateway = fixture.gateway(false);
+    let server = McpServer::gateway();
+    let progress_call = call(json!(7), json!(0.25), true);
+    let mut ordinary_call = call(json!(8), json!(0.25), true);
+    ordinary_call["params"]["_meta"]
+        .as_object_mut()
+        .unwrap()
+        .remove("progressToken");
+    let mut first_body = server
+        .handle_http_stream(
+            request("POST", None, progress_call.clone()),
+            &options(),
+            gateway.clone(),
+        )
+        .await
+        .into_body();
+    let first = receive(&mut fixture.native.calls).await;
+    let mut batch_body = server
+        .handle_http_stream(
+            request("POST", None, json!([progress_call, ordinary_call])),
+            &options(),
+            gateway.clone(),
+        )
+        .await
+        .into_body();
+    let second = receive(&mut fixture.native.calls).await;
+    let third = receive(&mut fixture.native.calls).await;
+    let (progress_call_wire, ordinary_call_wire) = if second.request.body["params"]["_meta"]
+        .get("progressToken")
+        .is_some()
+    {
+        (second, third)
+    } else {
+        (third, second)
+    };
+    assert_ne!(first.request.session, progress_call_wire.request.session);
+    assert_eq!(
+        progress_call_wire.request.session,
+        ordinary_call_wire.request.session
+    );
+    assert_eq!(first.request.body["params"], progress_call["params"]);
+    assert_eq!(
+        progress_call_wire.request.body["params"],
+        progress_call["params"]
+    );
+    assert_eq!(
+        ordinary_call_wire.request.body["params"],
+        ordinary_call["params"]
+    );
+    for _ in 0..2 {
+        receive(&mut fixture.native.opened).await;
+    }
+    let first_event = progress(json!(0.25), 1);
+    let batch_event = progress(json!(0.25), 2);
+    {
+        let listeners = fixture.native.listeners.lock().unwrap();
+        listeners[&first.request.session]
+            .send(first_event.clone())
+            .unwrap();
+        listeners[&progress_call_wire.request.session]
+            .send(batch_event.clone())
+            .unwrap();
+    }
+    assert_eq!(frame(&mut first_body).await, first_event);
+    assert_eq!(frame(&mut batch_body).await, batch_event);
+    let first_result = result(&first);
+    first.events.send(first_result.clone()).unwrap();
+    assert_eq!(
+        frame(&mut first_body).await,
+        json!({"jsonrpc":"2.0","id":7,"result":first_result["result"]})
+    );
+    for native in [&progress_call_wire, &ordinary_call_wire] {
+        native.events.send(result(native)).unwrap();
+    }
+    assert_eq!(
+        frame(&mut batch_body).await,
+        json!([
+            {"jsonrpc":"2.0","id":7,"result":result(&progress_call_wire)["result"]},
+            {"jsonrpc":"2.0","id":8,"result":result(&ordinary_call_wire)["result"]}
+        ])
+    );
+    server.close();
+    timeout(WAIT, server.drain()).await.unwrap();
+}
+
+#[tokio::test]
 async fn paginated_invalidation_during_refresh_repeats_and_failed_page_keeps_complete_snapshot() {
     let mut fixture = Fixture::new().await;
     let gateway = fixture.gateway(false);
