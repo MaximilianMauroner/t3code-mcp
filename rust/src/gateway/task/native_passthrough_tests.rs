@@ -60,14 +60,11 @@ async fn native_fixture() -> Fixture {
     fixture
 }
 
-async fn assert_forwarded(arguments: Option<Value>) {
+async fn assert_forwarded(arguments: Value) {
     let fixture = native_fixture().await;
     let server = McpServer::new(fixture.gateway.tool_catalog().await.unwrap());
-    let mut params = json!({"name":"t3_thread_list"});
-    if let Some(arguments) = &arguments {
-        params["arguments"] = arguments.clone();
-    }
-    let mut expected = arguments.unwrap_or(json!({}));
+    let params = json!({"name":"t3_thread_list","arguments":arguments});
+    let mut expected = arguments;
     expected["optionalDefault"] = json!("native-only");
     if expected.get("options").is_some() {
         expected["options"]["nestedDefault"] = json!(true);
@@ -102,33 +99,37 @@ async fn assert_forwarded(arguments: Option<Value>) {
 
 #[tokio::test]
 async fn native_optional_defaults_are_inserted_before_sending() {
-    assert_forwarded(Some(json!({}))).await;
-    assert_forwarded(None).await;
+    assert_forwarded(json!({})).await;
 }
 
 #[tokio::test]
 async fn native_nested_and_unknown_fields_are_preserved() {
-    assert_forwarded(Some(json!({
+    assert_forwarded(json!({
         "query":"  keep this spacing  ",
         "options":{"known":"  keep this too  ","unknown":{"items":[1,true,null]}},
         "unknown":{"nested":[{"value":"unchanged"}]},
-    })))
+    }))
     .await;
 }
 
 #[tokio::test]
-async fn native_converted_schema_rejects_unsafe_integers_and_long_utf16_strings() {
+async fn native_string_limits_count_code_points() {
+    assert_forwarded(json!({"character":"\u{1f600}"})).await;
+}
+
+#[tokio::test]
+async fn native_converted_schema_rejects_invalid_or_missing_arguments() {
     let fixture = native_fixture().await;
     let server = McpServer::new(fixture.gateway.tool_catalog().await.unwrap());
-    for arguments in [
-        json!({"largeInteger":9_007_199_254_740_992_u64}),
-        json!({"character":"\u{1f600}"}),
+    for params in [
+        json!({"name":"t3_thread_list","arguments":{"largeInteger":9_007_199_254_740_992_u64}}),
+        json!({"name":"t3_thread_list","arguments":{"character":"ab"}}),
+        json!({"name":"t3_thread_list"}),
     ] {
         let response = server
             .handle_message(
                 IncomingMessage::parse(json!({
-                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
-                    "params":{"name":"t3_thread_list","arguments":arguments},
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call", "params":params,
                 }))
                 .unwrap(),
                 &fixture.gateway,
