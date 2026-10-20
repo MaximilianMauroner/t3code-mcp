@@ -361,33 +361,42 @@ pub fn sanitize_failure_identifier(value: &str) -> String {
         200,
     )
 }
-fn replace(value: &str, pattern: &str, replacement: &str) -> String {
-    fancy_regex::Regex::new(pattern)
-        .expect("valid redaction expression")
-        .replace_all(value, replacement)
-        .into_owned()
-}
 fn sanitize_metadata(value: &str, max: usize) -> String {
-    let key = r"(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token)";
-    let mut v = replace(
-        value,
-        &format!(r#"(?i)(["'])({key})\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3"#),
-        "$1$2$1:$3[REDACTED]$3",
-    );
-    v = replace(
-        &v,
-        &format!(
-            r#"(?i)(^|[\s,{{(])({key})\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#
-        ),
-        "$1$2=[REDACTED]",
-    );
-    v = replace(&v, r"(?i)\b(Bearer|Basic)\s+[^\s,;]+", "$1 [REDACTED]");
-    v = replace(&v, r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]");
-    v = replace(
-        &v,
-        &format!(r#"(?i)\b({key})\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#),
-        "$1=[REDACTED]",
-    );
+    static PATTERNS: std::sync::LazyLock<[(fancy_regex::Regex, &str); 5]> =
+        std::sync::LazyLock::new(|| {
+            let key = r"(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token)";
+            [
+                (
+                    format!(r#"(?i)(["'])({key})\1\s*:\s*(["'])(?:\\.|(?!\3)[^\\])*\3"#),
+                    "$1$2$1:$3[REDACTED]$3",
+                ),
+                (
+                    format!(
+                        r#"(?i)(^|[\s,{{(])({key})\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#
+                    ),
+                    "$1$2=[REDACTED]",
+                ),
+                (
+                    r"(?i)\b(Bearer|Basic)\s+[^\s,;]+".into(),
+                    "$1 [REDACTED]",
+                ),
+                (r"\bsk-[A-Za-z0-9_-]{12,}\b".into(), "[REDACTED]"),
+                (
+                    format!(r#"(?i)\b({key})\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#),
+                    "$1=[REDACTED]",
+                ),
+            ]
+            .map(|(pattern, replacement)| {
+                (
+                    fancy_regex::Regex::new(&pattern).expect("valid redaction expression"),
+                    replacement,
+                )
+            })
+        });
+    let mut v = value.to_owned();
+    for (pattern, replacement) in PATTERNS.iter() {
+        v = pattern.replace_all(&v, *replacement).into_owned();
+    }
     truncate(
         &v.chars()
             .map(|c| {
@@ -402,26 +411,40 @@ fn sanitize_metadata(value: &str, max: usize) -> String {
     )
 }
 pub fn sanitize_failure_text(value: &str, max: usize) -> String {
-    let mut v = replace(value, r"\n\s+at\s[^\n]*", "");
-    for (pattern, replacement) in [
-        (r"(?i)(?:https?|file)://[^\s)]+", "[REDACTED URL]"),
-        (
-            r#"(["'])(?:/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1"#,
-            "$1[REDACTED PATH]$1",
-        ),
-        (
-            r#"(^|[^\p{L}\p{N}_\\/])(?:/[^\s"'<>\])}]+|[A-Za-z]:[\\/][^\s"'<>\])}]+|\\\\[^\s"'<>\])}]+)"#,
-            "$1[REDACTED PATH]",
-        ),
-        (r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b", "[REDACTED HOST]"),
-    ] {
-        v = replace(&v, pattern, replacement);
+    static BEFORE_IPV6: std::sync::LazyLock<[(fancy_regex::Regex, &str); 5]> =
+        std::sync::LazyLock::new(|| {
+            [
+                (r"\n\s+at\s[^\n]*", ""),
+                (r"(?i)(?:https?|file)://[^\s)]+", "[REDACTED URL]"),
+                (
+                    r#"(["'])(?:/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\1"#,
+                    "$1[REDACTED PATH]$1",
+                ),
+                (
+                    r#"(^|[^\p{L}\p{N}_\\/])(?:/[^\s"'<>\])}]+|[A-Za-z]:[\\/][^\s"'<>\])}]+|\\\\[^\s"'<>\])}]+)"#,
+                    "$1[REDACTED PATH]",
+                ),
+                (r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b", "[REDACTED HOST]"),
+            ]
+            .map(|(pattern, replacement)| {
+                (
+                    fancy_regex::Regex::new(pattern).expect("valid redaction expression"),
+                    replacement,
+                )
+            })
+        });
+    let mut v = value.to_owned();
+    for (pattern, replacement) in BEFORE_IPV6.iter() {
+        v = pattern.replace_all(&v, *replacement).into_owned();
     }
-    for pattern in [
-        r"(?i)\[([\da-f:.]+(?:%[\w.-]+)?)\](?::\d+)?",
-        r"(?i)(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f:.]+(?:%[\w.-]+)?(?![\w:])",
-    ] {
-        let re = fancy_regex::Regex::new(pattern).unwrap();
+    static IPV6: std::sync::LazyLock<[fancy_regex::Regex; 2]> = std::sync::LazyLock::new(|| {
+        [
+            r"(?i)\[([\da-f:.]+(?:%[\w.-]+)?)\](?::\d+)?",
+            r"(?i)(?<![\w:])(?:[\da-f]{0,4}:){2,}[\da-f:.]+(?:%[\w.-]+)?(?![\w:])",
+        ]
+        .map(|pattern| fancy_regex::Regex::new(pattern).unwrap())
+    });
+    for re in IPV6.iter() {
         v = re
             .replace_all(&v, |c: &fancy_regex::Captures<'_>| {
                 let host = c.get(1).or_else(|| c.get(0)).unwrap().as_str();
@@ -433,17 +456,31 @@ pub fn sanitize_failure_text(value: &str, max: usize) -> String {
             })
             .into_owned();
     }
-    v = replace(
-        &v,
-        r"(?i)\b(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z][a-z\d-]*(?::\d+)?\b",
-        "[REDACTED HOST]",
-    );
-    v = replace(&v, r"(?i)\b[a-z][a-z\d-]*:\d{1,5}\b", "[REDACTED HOST]");
-    let key = r"(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token)";
-    v = replace(
-        &v,
-        &format!(r#"(?i)\b({key})\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#),
-        "$1=[REDACTED]",
-    );
+    static AFTER_IPV6: std::sync::LazyLock<[(fancy_regex::Regex, &str); 3]> =
+        std::sync::LazyLock::new(|| {
+            let key = r"(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|id|session)[_-]?token|(?:secret|access|private)[_-]?key(?:[_-]?id)?|authorization|credentials?|password|secret|token)";
+            [
+                (
+                    r"(?i)\b(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z][a-z\d-]*(?::\d+)?\b".into(),
+                    "[REDACTED HOST]",
+                ),
+                (r"(?i)\b[a-z][a-z\d-]*:\d{1,5}\b".into(), "[REDACTED HOST]"),
+                (
+                    format!(
+                        r#"(?i)\b({key})\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#
+                    ),
+                    "$1=[REDACTED]",
+                ),
+            ]
+            .map(|(pattern, replacement)| {
+                (
+                    fancy_regex::Regex::new(&pattern).expect("valid redaction expression"),
+                    replacement,
+                )
+            })
+        });
+    for (pattern, replacement) in AFTER_IPV6.iter() {
+        v = pattern.replace_all(&v, *replacement).into_owned();
+    }
     sanitize_metadata(&v, max)
 }
