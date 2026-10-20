@@ -37,9 +37,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatin/rust-cache@v2
-        with:
-          workspaces: rust
       - run: cargo fmt --manifest-path rust/Cargo.toml --check
       - run: cargo build --manifest-path rust/Cargo.toml --locked --release
       - run: cargo test --manifest-path rust/Cargo.toml --locked
