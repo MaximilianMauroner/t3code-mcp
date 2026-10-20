@@ -253,9 +253,9 @@ async fn native_success_and_is_error_preserve_every_result_extension_over_http()
 }
 
 #[tokio::test]
-async fn native_protocol_errors_keep_code_message_data_and_caller_id_without_replay() {
+async fn native_protocol_errors_follow_gateway_error_and_retry_contract() {
     for name in ["t3_thread_list", "t3_thread_send"] {
-        for code in [-32602, -32000, -32001, 42] {
+        for code in [-32602, -32000, -32001, -32800, 42] {
             for id in [json!("caller-protocol"), json!(739)] {
                 let message = match code {
                     -32000 => "Connection closed",
@@ -268,8 +268,34 @@ async fn native_protocol_errors_keep_code_message_data_and_caller_id_without_rep
                 });
                 let fixture = NativeFixture::new(Reply::json(json!({"error":error}))).await;
                 let response = fixture.call(name, id.clone()).await;
-                assert_eq!(response, json!({"jsonrpc":"2.0","id":id,"error":error}));
-                assert_eq!(fixture.calls(), 1, "Explicit upstream error was replayed");
+                assert_eq!(response["id"], id);
+                let unknown = matches!(code, -32000 | -32001);
+                if code == -32800 {
+                    assert_eq!(response, json!({"jsonrpc":"2.0","id":id,"error":error}));
+                } else {
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(response["result"]["isError"], true, "{response}");
+                    assert_eq!(
+                        response["result"]["structuredContent"]["error"]["code"],
+                        if unknown {
+                            if name == "t3_thread_list" {
+                                "native_unavailable"
+                            } else {
+                                "native_outcome_unknown"
+                            }
+                        } else {
+                            "native_rejected"
+                        },
+                    );
+                }
+                assert_eq!(
+                    fixture.calls(),
+                    if unknown && name == "t3_thread_list" {
+                        2
+                    } else {
+                        1
+                    }
+                );
                 assert!(!fixture.audit().contains("private-native-error-data"));
                 let audit = fixture.audit();
                 let events: Vec<Value> = audit
@@ -280,7 +306,8 @@ async fn native_protocol_errors_keep_code_message_data_and_caller_id_without_rep
                     events
                         .iter()
                         .any(|event| event["operation"] == format!("mcp:{name}")
-                            && event["details"]["failure"] == "rejected")
+                            && event["details"]["failure"]
+                                == if unknown { "unknown" } else { "rejected" })
                 );
             }
         }
@@ -288,7 +315,7 @@ async fn native_protocol_errors_keep_code_message_data_and_caller_id_without_rep
 }
 
 #[tokio::test]
-async fn native_protocol_error_data_keeps_absence_null_and_other_json_values() {
+async fn native_rejections_do_not_expose_protocol_error_data() {
     for data in [
         None,
         Some(Value::Null),
@@ -300,9 +327,16 @@ async fn native_protocol_error_data_keeps_absence_null_and_other_json_values() {
             error["data"] = data;
         }
         let fixture = NativeFixture::new(Reply::json(json!({"error":error}))).await;
+        let response = fixture.call("t3_thread_list", json!(93)).await;
+        assert_eq!(response["id"], 93);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["isError"], true);
         assert_eq!(
-            fixture.call("t3_thread_list", json!(93)).await,
-            json!({"jsonrpc":"2.0","id":93,"error":error})
+            response["result"]["structuredContent"]["error"],
+            json!({
+                "code":"native_rejected",
+                "message":"Native T3 rejected t3_thread_list: MCP error -32603: Native error",
+            })
         );
         assert_eq!(fixture.calls(), 1);
     }

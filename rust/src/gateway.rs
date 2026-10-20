@@ -1339,7 +1339,14 @@ impl T3Gateway {
             None
         };
         summary["latestResponseExcerpt"] = latest
-            .map(|message| Value::String(truncate_excerpt(&message.text, 200)))
+            .map(|message| {
+                let text = if message.text.starts_with("API Error:") {
+                    crate::t3::failure::sanitize_failure_text(&message.text, 2000)
+                } else {
+                    message.text.clone()
+                };
+                Value::String(truncate_excerpt(&text, 200))
+            })
             .unwrap_or(Value::Null);
         Ok(summary)
     }

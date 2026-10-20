@@ -603,7 +603,11 @@ impl NativeMcpClient {
                     return Ok(result);
                 }
                 Err(error) => {
-                    let failure = if error.protocol_error.is_some() {
+                    let failure = if error
+                        .protocol_error
+                        .as_ref()
+                        .is_some_and(|error| !matches!(error.code, -32000 | -32001))
+                    {
                         "rejected"
                     } else if matches!(error.status, Some(401 | 403)) {
                         "unauthorized"
@@ -625,7 +629,9 @@ impl NativeMcpClient {
                         return Err(NativeError {
                             code: "native_rejected".into(),
                             message: format!("Native T3 rejected {name}: {}", error.message),
-                            protocol_error: error.protocol_error,
+                            protocol_error: error
+                                .protocol_error
+                                .filter(|error| error.code == -32800),
                         });
                     }
                     if failure == "unauthorized" {

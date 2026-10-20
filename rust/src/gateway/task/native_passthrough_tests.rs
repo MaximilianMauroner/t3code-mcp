@@ -67,8 +67,13 @@ async fn assert_forwarded(arguments: Option<Value>) {
     if let Some(arguments) = &arguments {
         params["arguments"] = arguments.clone();
     }
-    let expected_params = params.clone();
-    let expected = arguments.unwrap_or(Value::Null);
+    let mut expected = arguments.unwrap_or(json!({}));
+    expected["optionalDefault"] = json!("native-only");
+    if expected.get("options").is_some() {
+        expected["options"]["nestedDefault"] = json!(true);
+    }
+    let mut expected_params = params.clone();
+    expected_params["arguments"] = expected.clone();
     let response = server
         .handle_message(
             IncomingMessage::parse(json!({
@@ -93,12 +98,10 @@ async fn assert_forwarded(arguments: Option<Value>) {
     assert_eq!(calls[0].body["params"], expected_params);
     let upstream = &calls[0].body["params"]["arguments"];
     assert_eq!(upstream, &expected);
-    assert!(upstream.get("optionalDefault").is_none());
-    assert!(upstream["options"].get("nestedDefault").is_none());
 }
 
 #[tokio::test]
-async fn native_optional_defaults_are_not_inserted() {
+async fn native_optional_defaults_are_inserted_before_sending() {
     assert_forwarded(Some(json!({}))).await;
     assert_forwarded(None).await;
 }
@@ -114,13 +117,35 @@ async fn native_nested_and_unknown_fields_are_preserved() {
 }
 
 #[tokio::test]
-async fn native_schema_valid_large_integer_reaches_upstream() {
-    assert_forwarded(Some(json!({"largeInteger":9_007_199_254_740_992_u64}))).await;
-}
-
-#[tokio::test]
-async fn native_json_schema_character_length_reaches_upstream() {
-    assert_forwarded(Some(json!({"character":"\u{1f600}"}))).await;
+async fn native_converted_schema_rejects_unsafe_integers_and_long_utf16_strings() {
+    let fixture = native_fixture().await;
+    let server = McpServer::new(fixture.gateway.tool_catalog().await.unwrap());
+    for arguments in [
+        json!({"largeInteger":9_007_199_254_740_992_u64}),
+        json!({"character":"\u{1f600}"}),
+    ] {
+        let response = server
+            .handle_message(
+                IncomingMessage::parse(json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"t3_thread_list","arguments":arguments},
+                }))
+                .unwrap(),
+                &fixture.gateway,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+    }
+    assert!(
+        fixture
+            .server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.body["method"] != "tools/call")
+    );
 }
 
 #[tokio::test]

@@ -396,11 +396,15 @@ impl McpServer {
                 )));
             }
         };
+        let mut params = params.clone();
+        if crate::contract::is_native_tool_name(name) {
+            params.insert("arguments".into(), Value::Object(arguments.clone()));
+        }
         let call = ToolCall {
             request_id: request.id.clone(),
             name: name.to_owned(),
             arguments,
-            params: params.clone(),
+            params,
         };
         let result = match handler.call_tool(call, Some(invocation.clone())).await {
             Ok(result) => Value::Object(result),

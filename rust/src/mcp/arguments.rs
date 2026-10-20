@@ -5,19 +5,20 @@ use super::wire::value_type;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SchemaUse {
     GatewayInput,
+    NativeInput,
     GatewayOutput,
 }
 
 pub(super) fn parse(tool: &Value, value: Option<&Value>) -> Result<Map<String, Value>, String> {
     let gateway =
         crate::contract::GATEWAY_TOOL_NAMES.contains(&tool["name"].as_str().unwrap_or_default());
-    if !gateway {
-        return Ok(value
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default());
-    }
-    let schema_use = SchemaUse::GatewayInput;
+    let schema_use = if gateway {
+        SchemaUse::GatewayInput
+    } else {
+        SchemaUse::NativeInput
+    };
+    let empty = Value::Object(Map::new());
+    let value = value.or((!gateway).then_some(&empty));
     let mut errors = Vec::new();
     let parsed = parse_value(&tool["inputSchema"], value, "", schema_use, &mut errors);
     if !errors.is_empty() {
@@ -180,6 +181,13 @@ fn parse_value(
             let strip = schema_use == SchemaUse::GatewayInput
                 && (additional.is_none() || additional == Some(&Value::Bool(false)));
             let mut parsed = if strip { Map::new() } else { object.clone() };
+            if schema_use == SchemaUse::NativeInput && additional == Some(&Value::Bool(false)) {
+                for key in object.keys() {
+                    if !properties.is_some_and(|properties| properties.contains_key(key)) {
+                        issue(errors, path, format!("Unrecognized key: \"{key}\""));
+                    }
+                }
+            }
             if let Some(properties) = properties {
                 for (key, field_schema) in properties {
                     let field = object.get(key);

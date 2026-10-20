@@ -398,6 +398,54 @@ fn stored_journal(fixture: &Fixture) -> OperationJournal {
 }
 
 #[tokio::test]
+async fn list_and_overview_sanitize_provider_error_excerpts() {
+    for reader in [FailureReader::Full, FailureReader::Overview] {
+        for text in [
+            "API Error: failed https://private.example/request at /home/user/private token=secret",
+            "See https://public.example/help for details",
+        ] {
+            let fixture = Fixture::new().await;
+            let mut value = failed_thread("Provider failed");
+            value["messages"] = json!([{
+                "id":"response", "role":"assistant", "text":text, "turnId":TURN,
+            }]);
+            fixture.snapshot(value.clone(), 3);
+            *fixture.shell_threads.lock().unwrap() = vec![value];
+            let result = reader.read(&fixture.gateway).await;
+            let excerpt = reader.row(&result)["latestResponseExcerpt"]
+                .as_str()
+                .unwrap();
+            if text.starts_with("API Error:") {
+                assert!(excerpt.starts_with("API Error:"), "{excerpt}");
+                for secret in ["private.example", "/home/user/private", "secret"] {
+                    assert!(!excerpt.contains(secret), "{secret} leaked in {excerpt}");
+                }
+                assert!(excerpt.contains("[REDACTED URL]"), "{excerpt}");
+                assert!(excerpt.contains("[REDACTED]"), "{excerpt}");
+            } else {
+                assert_eq!(excerpt, text);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn task_get_accepts_a_latest_response_without_optional_metadata() {
+    let fixture = Fixture::new().await;
+    let mut value = thread();
+    let response = json!({
+        "id":"response", "role":"assistant", "text":"Answer", "turnId":TURN,
+    });
+    value["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(response.clone());
+    fixture.snapshot(value, 3);
+    let result = mcp_value(&fixture.gateway, "t3_task_get", json!({"taskRef":TASK})).await;
+    assert_eq!(result["task"]["run"]["latestResponse"], response);
+}
+
+#[tokio::test]
 async fn list_and_overview_retain_shell_failures_even_when_full_enrichment_is_unavailable() {
     for reader in [
         FailureReader::Summary,
