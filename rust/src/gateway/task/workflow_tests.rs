@@ -1,6 +1,10 @@
 use super::*;
 use crate::mcp::{IncomingMessage, McpServer};
 
+mod journal_discovery_tests {
+    include!("journal_discovery_tests.rs");
+}
+
 async fn mcp_result(gateway: &T3Gateway, name: &str, arguments: Value) -> Value {
     let response = McpServer::gateway()
         .handle_message(

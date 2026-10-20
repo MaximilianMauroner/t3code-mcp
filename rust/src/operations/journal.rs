@@ -207,6 +207,14 @@ pub struct Begun<T> {
     pub reused: bool,
 }
 #[derive(Debug)]
+pub struct TerminalFailure {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub failure: Value,
+    pub operation_id: Option<String>,
+    pub order: Option<FailureEvidenceOrder>,
+}
+#[derive(Debug)]
 pub struct TerminalRecovery {
     pub thread_id: String,
     pub turn_id: String,
@@ -637,205 +645,253 @@ impl OperationJournal {
         operation_id: Option<&str>,
         order: Option<FailureEvidenceOrder>,
     ) -> Result<Option<Value>> {
+        self.retain_terminal_failures(&[TerminalFailure {
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+            failure: candidate,
+            operation_id: operation_id.map(str::to_owned),
+            order,
+        }])
+        .map(|mut results| results.pop().flatten())
+    }
+    pub fn retain_terminal_failures(
+        &self,
+        failures: &[TerminalFailure],
+    ) -> Result<Vec<Option<Value>>> {
         let mut locked = self.state()?;
-        let mut state = locked.clone();
-        if !valid_failure(&candidate) || candidate["turnId"] != turn {
-            return Err(invalid("A terminal failure must match its turn."));
-        }
-        let key = failure_key(thread, turn);
-        let operation = operation_id
-            .and_then(|id| state.entries.values().find(|row| row["operationId"] == id))
-            .cloned();
-        if operation.as_ref().is_some_and(|row| {
-            row["threadId"] != thread || row.get("turnId").is_some_and(|id| id != turn)
-        }) {
-            return Err(invalid(
-                "A terminal failure does not match the run operation.",
-            ));
-        }
-        let legacy = state
-            .entries
-            .values()
-            .find(|row| {
-                row["kind"] == "thread.turn.start"
-                    && row["threadId"] == thread
-                    && row["turnId"] == turn
-                    && row["terminalFailure"]["turnId"] == turn
-            })
-            .and_then(|row| row.get("terminalFailure"));
-        let retained = state.thread_failures.get(&key);
-        let retained_order = retained.and_then(|row| row.get("order"));
-        let order = order.map(|order| order_with_era(order.0, retained_order));
-        let comparison = order
-            .as_ref()
-            .zip(retained_order)
-            .map(|(a, b)| compare_order(a, b));
-        if retained.is_some_and(|row| row.get("recoveredState").is_some())
-            && (order.is_none() || comparison.is_some_and(|cmp| cmp <= Ordering::Equal))
-        {
-            return Ok(None);
-        }
-        let existing = retained
-            .and_then(|row| non_null(row.get("failure")))
-            .or_else(|| {
-                operation
-                    .as_ref()
-                    .and_then(|row| row.get("terminalFailure"))
-            })
-            .or(legacy);
-        let stale =
-            retained_order.is_some() && (order.is_none() || comparison == Some(Ordering::Less));
-        let same_reason = order
-            .as_ref()
-            .and_then(|o| o.get("failureIdentity"))
-            .is_some_and(|id| Some(id) == retained_order.and_then(|o| o.get("failureIdentity")));
-        let newer_protocol = comparison == Some(Ordering::Greater)
-            && order.as_ref().map(|o| &o["protocolVersion"])
-                != retained_order.map(|o| &o["protocolVersion"]);
-        let source = text(&candidate, "source");
-        let later_v1 = comparison == Some(Ordering::Greater)
-            && existing.is_some_and(|old| old["source"] == candidate["source"])
-            && (matches!(source, "t3_activity" | "t3_message")
-                || (source == "t3_session"
-                    && (order.as_ref().is_some_and(|o| o["scope"] == "full")
-                        || !same_reason
-                        || existing.and_then(|o| o.get("class")) != candidate.get("class"))));
-        let v2 = order.as_ref().is_some_and(|o| o["protocolVersion"] == 2);
-        let shell = order.as_ref().is_some_and(|o| o["scope"] == "shell");
-        let matching_shell = shell
-            && existing.is_some_and(|old| {
-                (v2 || (source == "t3_session" && old["source"] == "t3_session"))
-                    && same_reason
-                    && same_fields(old, &candidate, &["message", "class"])
-            });
-        let unbound_shell = v2 && shell && source == "t3_turn" && existing.is_some();
-        let mut merged = if let Some(old) = existing.filter(|_| stale || unbound_shell) {
-            old.clone()
-        } else if matching_shell {
-            merge_metadata(existing.unwrap(), &candidate, &["resetAt", "retryAfter"])
-        } else if v2 || later_v1 || newer_protocol {
-            if comparison == Some(Ordering::Equal)
-                && same_reason
-                && existing.is_some_and(|old| same_fields(old, &candidate, &["message", "class"]))
-            {
-                merge_metadata(&candidate, existing.unwrap(), &["resetAt", "retryAfter"])
-            } else {
-                candidate.clone()
+        let mut pending_failures = IndexMap::<String, Value>::new();
+        let mut pending_operations = IndexMap::<String, OperationRecord>::new();
+        let mut changed = false;
+        let mut results = Vec::with_capacity(failures.len());
+        for observation in failures {
+            let thread = observation.thread_id.as_str();
+            let turn = observation.turn_id.as_str();
+            let candidate = &observation.failure;
+            if !valid_failure(candidate) || candidate["turnId"] != turn {
+                return Err(invalid("A terminal failure must match its turn."));
             }
-        } else {
-            merge_terminal_failure(existing, &candidate, same_reason)
-        };
-        let mut candidate_order = order.clone();
-        let chose_existing = (stale || unbound_shell) && existing.is_some()
-            || (!matching_shell
-                && !(v2 || later_v1 || newer_protocol)
-                && terminal_prefers_existing(existing, &candidate)
-                && !(same_reason
-                    && existing
-                        .is_some_and(|old| same_fields(old, &candidate, &["message", "class"]))));
-        if chose_existing && let Some(o) = &mut candidate_order {
-            if let Some(id) = retained_order.and_then(|old| old.get("failureIdentity")) {
-                o["failureIdentity"] = id.clone();
-            } else {
-                o.as_object_mut().unwrap().shift_remove("failureIdentity");
+            let key = failure_key(thread, turn);
+            let operation = observation
+                .operation_id
+                .as_deref()
+                .and_then(|id| {
+                    locked
+                        .entries
+                        .iter()
+                        .map(|(key, row)| pending_operations.get(key).unwrap_or(row))
+                        .find(|row| row["operationId"] == id)
+                })
+                .cloned();
+            if operation.as_ref().is_some_and(|row| {
+                row["threadId"] != thread || row.get("turnId").is_some_and(|id| id != turn)
+            }) {
+                return Err(invalid(
+                    "A terminal failure does not match the run operation.",
+                ));
             }
-        }
-        if !stale
-            && v2
-            && shell
-            && let Some(old) = existing
-        {
-            merged["provider"] = old["provider"].clone();
-            merged["model"] = old["model"].clone();
-        }
-        let reason_is_candidate = !stale
-            && (unbound_shell
-                || matching_shell
-                || same_fields(&merged, &candidate, &["source", "message", "category"]));
-        let mut next_order = if reason_is_candidate {
-            candidate_order.or_else(|| retained_order.cloned())
-        } else {
-            retained_order.cloned()
-        };
-        let run_identity = order
-            .as_ref()
-            .and_then(|o| o.get("runIdentity"))
-            .or_else(|| retained_order.and_then(|o| o.get("runIdentity")));
-        if let Some(identity) = run_identity {
-            if let Some(next) = &mut next_order {
-                next["runIdentity"] = identity.clone();
-            }
-            merged
-                .as_object_mut()
-                .unwrap()
-                .extend(identity.as_object().unwrap().clone());
-        }
-        if let Some(next) = &mut next_order
-            && let Some(old) = retained_order
-            && same_era(next, old)
-        {
-            let shell_admission = if matching_shell {
-                order
-                    .as_ref()
-                    .filter(|o| same_era(o, next))
-                    .map_or(0.0, |o| number(o, "readStartedAt"))
-            } else {
-                0.0
-            };
-            next["readStartedAt"] = json!(
-                number(next, "readStartedAt")
-                    .max(number(old, "readStartedAt"))
-                    .max(shell_admission)
-            );
-        }
-        if next_order
-            .as_ref()
-            .is_none_or(|o| o["protocolVersion"] != 2)
-            && merged["source"] != "t3_v2_turn_item"
-            && let Some(model) = operation
+            let retained = pending_failures
+                .get(&key)
+                .or_else(|| locked.thread_failures.get(&key));
+            let retained_order = retained.and_then(|row| row.get("order"));
+            let order = observation
+                .order
                 .as_ref()
-                .and_then(|o| o.pointer("/settings/resolved/modelSelection"))
-        {
-            merged["model"] = json!(sanitize_identifier(text(model, "model")));
-            let provider = model
-                .get("provider")
-                .or_else(|| model.get("instanceId"))
-                .or_else(|| non_null(merged.get("provider")))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let provider = sanitize_identifier(provider);
-            merged["provider"] = if provider.is_empty() {
-                Value::Null
-            } else {
-                json!(provider)
-            };
-        }
-        let failure_changed = existing.is_none_or(|old| !same_json(old, &merged));
-        let order_changed = !same_persisted_order(retained_order, next_order.as_ref());
-        let operation_changed = operation.as_ref().is_some_and(|o| {
-            o["terminalRunStatus"] != "failed"
-                || o["turnId"] != turn
-                || !same_json(&o["terminalFailure"], &merged)
-        });
-        let mut row = json!({"threadId":thread,"turnId":turn,"failure":merged});
-        if let Some(order) = next_order {
-            row["order"] = order;
-        }
-        state.thread_failures.insert(key, row);
-        if failure_changed || order_changed || operation_changed {
-            if let Some(mut operation) = operation {
-                operation.0["turnId"] = json!(turn);
-                operation.0["terminalRunStatus"] = json!("failed");
-                operation.0["terminalFailure"] = merged.clone();
-                operation.0["updatedAt"] = json!(timestamp());
-                state
-                    .entries
-                    .insert(text(&operation, "idempotencyKey").into(), operation);
+                .map(|order| order_with_era(order.0.clone(), retained_order));
+            let comparison = order
+                .as_ref()
+                .zip(retained_order)
+                .map(|(a, b)| compare_order(a, b));
+            if retained.is_some_and(|row| row.get("recoveredState").is_some())
+                && (order.is_none() || comparison.is_some_and(|cmp| cmp <= Ordering::Equal))
+            {
+                results.push(None);
+                continue;
             }
-            self.persist(&state)?;
+            let existing = retained
+                .and_then(|row| non_null(row.get("failure")))
+                .or_else(|| {
+                    operation
+                        .as_ref()
+                        .and_then(|row| row.get("terminalFailure"))
+                })
+                .or_else(|| {
+                    locked
+                        .entries
+                        .iter()
+                        .map(|(key, row)| pending_operations.get(key).unwrap_or(row))
+                        .find(|row| {
+                            row["kind"] == "thread.turn.start"
+                                && row["threadId"] == thread
+                                && row["turnId"] == turn
+                                && row["terminalFailure"]["turnId"] == turn
+                        })
+                        .and_then(|row| row.get("terminalFailure"))
+                });
+            let stale =
+                retained_order.is_some() && (order.is_none() || comparison == Some(Ordering::Less));
+            let same_reason = order
+                .as_ref()
+                .and_then(|o| o.get("failureIdentity"))
+                .is_some_and(|id| {
+                    Some(id) == retained_order.and_then(|o| o.get("failureIdentity"))
+                });
+            let newer_protocol = comparison == Some(Ordering::Greater)
+                && order.as_ref().map(|o| &o["protocolVersion"])
+                    != retained_order.map(|o| &o["protocolVersion"]);
+            let source = text(candidate, "source");
+            let later_v1 = comparison == Some(Ordering::Greater)
+                && existing.is_some_and(|old| old["source"] == candidate["source"])
+                && (matches!(source, "t3_activity" | "t3_message")
+                    || (source == "t3_session"
+                        && (order.as_ref().is_some_and(|o| o["scope"] == "full")
+                            || !same_reason
+                            || existing.and_then(|o| o.get("class")) != candidate.get("class"))));
+            let v2 = order.as_ref().is_some_and(|o| o["protocolVersion"] == 2);
+            let shell = order.as_ref().is_some_and(|o| o["scope"] == "shell");
+            let matching_shell = shell
+                && existing.is_some_and(|old| {
+                    (v2 || (source == "t3_session" && old["source"] == "t3_session"))
+                        && same_reason
+                        && same_fields(old, candidate, &["message", "class"])
+                });
+            let unbound_shell = v2 && shell && source == "t3_turn" && existing.is_some();
+            let mut merged = if let Some(old) = existing.filter(|_| stale || unbound_shell) {
+                old.clone()
+            } else if matching_shell {
+                merge_metadata(existing.unwrap(), candidate, &["resetAt", "retryAfter"])
+            } else if v2 || later_v1 || newer_protocol {
+                if comparison == Some(Ordering::Equal)
+                    && same_reason
+                    && existing
+                        .is_some_and(|old| same_fields(old, candidate, &["message", "class"]))
+                {
+                    merge_metadata(candidate, existing.unwrap(), &["resetAt", "retryAfter"])
+                } else {
+                    candidate.clone()
+                }
+            } else {
+                merge_terminal_failure(existing, candidate, same_reason)
+            };
+            let mut candidate_order = order.clone();
+            let chose_existing = (stale || unbound_shell) && existing.is_some()
+                || (!matching_shell
+                    && !(v2 || later_v1 || newer_protocol)
+                    && terminal_prefers_existing(existing, candidate)
+                    && !(same_reason
+                        && existing.is_some_and(|old| {
+                            same_fields(old, candidate, &["message", "class"])
+                        })));
+            if chose_existing && let Some(o) = &mut candidate_order {
+                if let Some(id) = retained_order.and_then(|old| old.get("failureIdentity")) {
+                    o["failureIdentity"] = id.clone();
+                } else {
+                    o.as_object_mut().unwrap().shift_remove("failureIdentity");
+                }
+            }
+            if !stale
+                && v2
+                && shell
+                && let Some(old) = existing
+            {
+                merged["provider"] = old["provider"].clone();
+                merged["model"] = old["model"].clone();
+            }
+            let reason_is_candidate = !stale
+                && (unbound_shell
+                    || matching_shell
+                    || same_fields(&merged, candidate, &["source", "message", "category"]));
+            let mut next_order = if reason_is_candidate {
+                candidate_order.or_else(|| retained_order.cloned())
+            } else {
+                retained_order.cloned()
+            };
+            let run_identity = order
+                .as_ref()
+                .and_then(|o| o.get("runIdentity"))
+                .or_else(|| retained_order.and_then(|o| o.get("runIdentity")));
+            if let Some(identity) = run_identity {
+                if let Some(next) = &mut next_order {
+                    next["runIdentity"] = identity.clone();
+                }
+                merged
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(identity.as_object().unwrap().clone());
+            }
+            if let Some(next) = &mut next_order
+                && let Some(old) = retained_order
+                && same_era(next, old)
+            {
+                let shell_admission = if matching_shell {
+                    order
+                        .as_ref()
+                        .filter(|o| same_era(o, next))
+                        .map_or(0.0, |o| number(o, "readStartedAt"))
+                } else {
+                    0.0
+                };
+                next["readStartedAt"] = json!(
+                    number(next, "readStartedAt")
+                        .max(number(old, "readStartedAt"))
+                        .max(shell_admission)
+                );
+            }
+            if next_order
+                .as_ref()
+                .is_none_or(|o| o["protocolVersion"] != 2)
+                && merged["source"] != "t3_v2_turn_item"
+                && let Some(model) = operation
+                    .as_ref()
+                    .and_then(|o| o.pointer("/settings/resolved/modelSelection"))
+            {
+                merged["model"] = json!(sanitize_identifier(text(model, "model")));
+                let provider = model
+                    .get("provider")
+                    .or_else(|| model.get("instanceId"))
+                    .or_else(|| non_null(merged.get("provider")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let provider = sanitize_identifier(provider);
+                merged["provider"] = if provider.is_empty() {
+                    Value::Null
+                } else {
+                    json!(provider)
+                };
+            }
+            let failure_changed = existing.is_none_or(|old| !same_json(old, &merged));
+            let order_changed = !same_persisted_order(retained_order, next_order.as_ref());
+            let operation_changed = operation.as_ref().is_some_and(|o| {
+                o["terminalRunStatus"] != "failed"
+                    || o["turnId"] != turn
+                    || !same_json(&o["terminalFailure"], &merged)
+            });
+            let mut row = json!({"threadId":thread,"turnId":turn,"failure":merged});
+            if let Some(order) = next_order {
+                row["order"] = order;
+            }
+            pending_failures.insert(key, row);
+            if failure_changed || order_changed || operation_changed {
+                changed = true;
+                if let Some(mut operation) = operation {
+                    operation.0["turnId"] = json!(turn);
+                    operation.0["terminalRunStatus"] = json!("failed");
+                    operation.0["terminalFailure"] = merged.clone();
+                    operation.0["updatedAt"] = json!(timestamp());
+                    pending_operations.insert(text(&operation, "idempotencyKey").into(), operation);
+                }
+            }
+            results.push(Some(merged));
         }
-        *locked = state;
-        Ok(Some(merged))
+        if changed {
+            let mut state = locked.clone();
+            state.thread_failures.extend(pending_failures);
+            state.entries.extend(pending_operations);
+            self.persist(&state)?;
+            *locked = state;
+        } else {
+            locked.thread_failures.extend(pending_failures);
+        }
+        Ok(results)
     }
     pub fn clear_terminal_failure(
         &self,
@@ -853,11 +909,13 @@ impl OperationJournal {
     }
     pub fn clear_terminal_failures(&self, recoveries: &[TerminalRecovery]) -> Result<()> {
         let mut locked = self.state()?;
-        let mut state = locked.clone();
+        let mut pending = IndexMap::<String, Value>::new();
         let mut cleared = std::collections::HashSet::new();
         for recovery in recoveries {
             let key = failure_key(&recovery.thread_id, &recovery.turn_id);
-            let retained = state.thread_failures.get(&key);
+            let retained = pending
+                .get(&key)
+                .or_else(|| locked.thread_failures.get(&key));
             let old_order = retained.and_then(|o| o.get("order"));
             let mut order = recovery
                 .order
@@ -886,15 +944,17 @@ impl OperationJournal {
                     && o["recoveredState"] == tombstone["recoveredState"]
                     && same_persisted_order(old_order, order.as_ref())
             });
-            state.thread_failures.insert(key.clone(), tombstone);
+            pending.insert(key.clone(), tombstone);
             if !unchanged {
                 cleared.insert(key);
             }
         }
         if cleared.is_empty() {
-            *locked = state;
+            locked.thread_failures.extend(pending);
             return Ok(());
         }
+        let mut state = locked.clone();
+        state.thread_failures.extend(pending);
         for entry in state.entries.values_mut() {
             if entry["kind"] != "thread.turn.start"
                 || !cleared.contains(&failure_key(text(entry, "threadId"), text(entry, "turnId")))

@@ -1,6 +1,13 @@
 use super::*;
 use std::sync::Barrier;
 
+#[path = "journal_failure_batch_tests.rs"]
+mod failure_batch;
+
+#[cfg(unix)]
+#[path = "journal_batch_tests.rs"]
+mod batch;
+
 struct Fixture {
     directory: PathBuf,
     path: PathBuf,

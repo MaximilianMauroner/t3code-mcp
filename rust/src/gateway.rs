@@ -32,8 +32,8 @@ use crate::{
         },
         journal::{
             BeginOperationInput, BeginTaskInput, FailureEvidenceOrder, OperationJournal,
-            OperationPatch, OperationStatus, RecoveryState, TaskPatch, TaskStage,
-            WritableOperationKind, hash_payload,
+            OperationPatch, OperationStatus, RecoveryState, TaskPatch, TaskStage, TerminalFailure,
+            TerminalRecovery, WritableOperationKind, hash_payload,
         },
     },
     t3::{
@@ -602,20 +602,7 @@ impl T3Gateway {
             .await
             .map_err(ToolFailure::from)?;
         self.assert_environment(&descriptor)?;
-        let failures = shell
-            .threads
-            .iter()
-            .map(|thread| {
-                self.observe_summary_failure(
-                    thread,
-                    None,
-                    shell.snapshot_sequence,
-                    read_started_at,
-                    None,
-                )
-                .map(|observed| (thread.id.as_str(), observed))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+        self.observe_shell_recoveries(&shell.threads, shell.snapshot_sequence, read_started_at)?;
         let now = Utc::now().timestamp_millis();
         let projects = project_titles(&shell);
         let open_queue = input.status.is_none()
@@ -672,6 +659,8 @@ impl T3Gateway {
             })
             .collect::<Vec<_>>();
         sort_threads(&mut filtered, &input.sort, now);
+        let failures =
+            self.observe_shell_failures(&filtered, shell.snapshot_sequence, read_started_at)?;
         let mut summaries = filtered
             .iter()
             .map(|thread| {
@@ -719,20 +708,7 @@ impl T3Gateway {
             .await
             .map_err(ToolFailure::from)?;
         self.assert_environment(&descriptor)?;
-        let failures = shell
-            .threads
-            .iter()
-            .map(|thread| {
-                self.observe_summary_failure(
-                    thread,
-                    None,
-                    shell.snapshot_sequence,
-                    read_started_at,
-                    None,
-                )
-                .map(|observed| (thread.id.as_str(), observed))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+        self.observe_shell_recoveries(&shell.threads, shell.snapshot_sequence, read_started_at)?;
         let observed_at = Utc::now();
         let now = observed_at.timestamp_millis();
         let projects = project_titles(&shell);
@@ -749,6 +725,8 @@ impl T3Gateway {
                         || thread.archived_at.as_deref().is_none_or(str::is_empty))
             })
             .collect::<Vec<_>>();
+        let failures =
+            self.observe_shell_failures(&filtered, shell.snapshot_sequence, read_started_at)?;
         let mut counts = json!({"open":0,"snoozed":0,"settled":0,"archived":0});
         let mut execution_counts = json!({"running":0,"starting":0,"awaiting_approval":0,"awaiting_input":0,"failed":0,"idle":0});
         let mut running = Vec::new();
@@ -1202,10 +1180,95 @@ impl T3Gateway {
         }
     }
 
+    fn observe_shell_recoveries(
+        &self,
+        threads: &[ThreadShell],
+        sequence: u64,
+        read_started_at: u64,
+    ) -> Result<(), ToolFailure> {
+        let recoveries = threads
+            .iter()
+            .filter_map(|thread| {
+                let turn = thread.latest_turn.as_ref()?;
+                let state = match turn.state {
+                    TurnState::Completed => RecoveryState::Completed,
+                    TurnState::Interrupted => RecoveryState::Interrupted,
+                    _ => return None,
+                };
+                Some(
+                    task::shell_failure_order(thread, sequence, read_started_at).map(|order| {
+                        TerminalRecovery {
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.turn_id.clone(),
+                            state,
+                            order: Some(order),
+                        }
+                    }),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.journal
+            .clear_terminal_failures(&recoveries)
+            .map_err(journal_failure)
+    }
+
+    fn observe_shell_failures<'a>(
+        &self,
+        threads: &[&'a ThreadShell],
+        sequence: u64,
+        read_started_at: u64,
+    ) -> Result<HashMap<&'a str, SummaryFailureObservation>, ToolFailure> {
+        let mut observations = Vec::with_capacity(threads.len());
+        let mut failures = Vec::new();
+        for thread in threads {
+            let failure = shell_failure_info(thread, None);
+            let turn_id = thread
+                .latest_turn
+                .as_ref()
+                .map(|turn| turn.turn_id.as_str())
+                .or_else(|| failure.as_ref().map(|failure| failure.turn_id.as_str()));
+            let order = task::shell_failure_order(thread, sequence, read_started_at)?;
+            let order = self
+                .journal
+                .order_failure_evidence(&thread.id, turn_id, order)
+                .map_err(journal_failure)?;
+            if let Some(turn_id) = turn_id
+                && !thread.latest_turn.as_ref().is_some_and(|turn| {
+                    matches!(turn.state, TurnState::Completed | TurnState::Interrupted)
+                })
+                && let Some(failure) = &failure
+            {
+                failures.push(TerminalFailure {
+                    thread_id: thread.id.clone(),
+                    turn_id: turn_id.into(),
+                    failure: serde_json::to_value(failure).expect("serializable failure"),
+                    operation_id: None,
+                    order: Some(order.clone()),
+                });
+            }
+            observations.push((thread.id.as_str(), turn_id.map(str::to_owned), order));
+        }
+        self.journal
+            .retain_terminal_failures(&failures)
+            .map_err(journal_failure)?;
+        observations
+            .into_iter()
+            .map(|(id, turn_id, order)| {
+                let failure = turn_id
+                    .as_deref()
+                    .map(|turn_id| self.journal.get_failure_by_turn_id(id, turn_id))
+                    .transpose()
+                    .map_err(journal_failure)?
+                    .flatten();
+                Ok((id, SummaryFailureObservation { failure, order }))
+            })
+            .collect()
+    }
+
     fn observe_summary_failure(
         &self,
         selected: &ThreadShell,
-        full: Option<&Thread>,
+        full: &Thread,
         sequence: u64,
         read_started_at: u64,
         shell_order: Option<&FailureEvidenceOrder>,
@@ -1220,15 +1283,10 @@ impl T3Gateway {
                     .as_ref()
                     .map(|failure| failure.turn_id.as_str())
             });
-        let source = full.map_or(selected, |thread| &thread.shell);
-        let failure = match full {
-            Some(thread) => turn_id.and_then(|turn| failure_info(thread, Some(turn))),
-            None => shell_failure.clone(),
-        };
-        let recovered = full.and_then(|thread| {
-            thread
-                .turn_recoveries
-                .as_ref()?
+        let source = &full.shell;
+        let failure = turn_id.and_then(|turn| failure_info(full, Some(turn)));
+        let recovered = full.turn_recoveries.as_ref().and_then(|recoveries| {
+            recoveries
                 .iter()
                 .find(|entry| Some(entry.turn_id.as_str()) == turn_id)
         });
@@ -1246,10 +1304,7 @@ impl T3Gateway {
                 TurnState::Interrupted => Some(RecoveryState::Interrupted),
                 _ => None,
             });
-        let order = match full {
-            Some(thread) => task::failure_order(thread, sequence, turn_id, read_started_at)?,
-            None => task::shell_failure_order(selected, sequence, read_started_at)?,
-        };
+        let order = task::failure_order(full, sequence, turn_id, read_started_at)?;
         let order = self
             .journal
             .order_failure_evidence(&selected.id, turn_id, order)
@@ -1263,25 +1318,28 @@ impl T3Gateway {
                     && order.compare(shell_order).is_lt()
             });
             if !stale_full {
-                if let Some(recovery) = recovery {
-                    self.journal
+                match (recovery, failure) {
+                    (Some(recovery), _) => self
+                        .journal
                         .clear_terminal_failure(
                             &selected.id,
                             turn_id,
                             recovery,
                             Some(order.clone()),
                         )
-                        .map_err(journal_failure)?;
-                } else if let Some(failure) = failure {
-                    self.journal
-                        .retain_terminal_failure(
-                            &selected.id,
-                            turn_id,
-                            serde_json::to_value(failure).expect("serializable failure"),
-                            None,
-                            Some(order.clone()),
-                        )
-                        .map_err(journal_failure)?;
+                        .map_err(journal_failure)?,
+                    (None, Some(failure)) => {
+                        self.journal
+                            .retain_terminal_failure(
+                                &selected.id,
+                                turn_id,
+                                serde_json::to_value(failure).expect("serializable failure"),
+                                None,
+                                Some(order.clone()),
+                            )
+                            .map_err(journal_failure)?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1323,7 +1381,7 @@ impl T3Gateway {
         if !same_turn {
             self.observe_summary_failure(
                 &snapshot.thread.shell,
-                Some(&snapshot.thread),
+                &snapshot.thread,
                 snapshot.snapshot_sequence,
                 read_started_at,
                 None,
@@ -1331,7 +1389,7 @@ impl T3Gateway {
         }
         let observed = self.observe_summary_failure(
             shell,
-            Some(&snapshot.thread),
+            &snapshot.thread,
             snapshot.snapshot_sequence,
             read_started_at,
             Some(shell_order),
