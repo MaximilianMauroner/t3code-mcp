@@ -257,7 +257,10 @@ async fn rejected_catalog_refresh_disables_native_operations() {
         .unwrap()
         .output_schema["properties"]["native"]["properties"];
     for key in status["native"].as_object().unwrap().keys() {
-        assert!(schema.get(key).is_some(), "native.{key} is not in the output schema");
+        assert!(
+            schema.get(key).is_some(),
+            "native.{key} is not in the output schema"
+        );
     }
     assert_eq!(
         disabled(&status, "t3_thread_read")["reason"],

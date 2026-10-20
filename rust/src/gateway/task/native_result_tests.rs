@@ -270,24 +270,20 @@ async fn native_protocol_errors_follow_gateway_error_and_retry_contract() {
                 let response = fixture.call(name, id.clone()).await;
                 assert_eq!(response["id"], id);
                 let unknown = matches!(code, -32000 | -32001);
-                if code == -32800 {
-                    assert_eq!(response, json!({"jsonrpc":"2.0","id":id,"error":error}));
-                } else {
-                    assert!(response.get("error").is_none(), "{response}");
-                    assert_eq!(response["result"]["isError"], true, "{response}");
-                    assert_eq!(
-                        response["result"]["structuredContent"]["error"]["code"],
-                        if unknown {
-                            if name == "t3_thread_list" {
-                                "native_unavailable"
-                            } else {
-                                "native_outcome_unknown"
-                            }
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                assert_eq!(
+                    response["result"]["structuredContent"]["error"]["code"],
+                    if unknown {
+                        if name == "t3_thread_list" {
+                            "native_unavailable"
                         } else {
-                            "native_rejected"
-                        },
-                    );
-                }
+                            "native_outcome_unknown"
+                        }
+                    } else {
+                        "native_rejected"
+                    },
+                );
                 assert_eq!(
                     fixture.calls(),
                     if unknown && name == "t3_thread_list" {

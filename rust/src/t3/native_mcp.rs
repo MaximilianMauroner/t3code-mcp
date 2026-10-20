@@ -629,9 +629,11 @@ impl NativeMcpClient {
                         return Err(NativeError {
                             code: "native_rejected".into(),
                             message: format!("Native T3 rejected {name}: {}", error.message),
-                            protocol_error: error
-                                .protocol_error
-                                .filter(|error| error.code == -32800),
+                            protocol_error: error.protocol_error.filter(|_| {
+                                invocation
+                                    .as_ref()
+                                    .is_some_and(crate::mcp::Invocation::is_cancelled)
+                            }),
                         });
                     }
                     if failure == "unauthorized" {
