@@ -11,7 +11,8 @@ Deployment options include the provided [OpenAI Secure MCP Tunnel](https://devel
 Render host-specific units with `setup` instead of editing committed paths. `deploy/systemd/*` are templates with placeholder IDs and paths:
 
 ```sh
-node dist/cli.js setup --workspace=/opt/t3code-mcp --node=/usr/bin/node \
+rust/target/release/t3-code-mcp setup --workspace=/opt/t3code-mcp \
+  --executable=/opt/t3code-mcp/rust/target/release/t3-code-mcp \
   --tunnel-bin=/usr/local/bin/tunnel-client --tunnel-id=tunnel_YOURS \
   --environment-id=YOUR_ENV_ID --out="$HOME/.config/systemd/user"
 ```

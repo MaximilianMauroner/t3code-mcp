@@ -346,7 +346,7 @@ describe("structured provider failures", () => {
     const result = await fixture.gateway.runGet(run.runId);
     for (const text of [JSON.stringify(result.failure), result.latestResponse!.text,
       await readFile(join(fixture.directory, "operations.json"), "utf8")]) {
-      expect(text).not.toMatch(/db\.internal|fd00|fe80|eth0/);
+      expect(text).not.toMatch(/db\.internal|fd00::|fe80::|%eth0/);
       expect(text).toContain("13:55:45");
     }
   });

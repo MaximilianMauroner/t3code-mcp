@@ -8,7 +8,7 @@ For T3 orchestration protocol 2, the upstream URL must route HTTP API requests a
 
 ## Run the gateway
 
-Install Node.js 20 or newer and pnpm, then build:
+Install Cargo and Rust 1.88 or newer. Install Node.js 20 or newer and pnpm for the package commands, then build:
 
 ```sh
 pnpm install
@@ -20,10 +20,13 @@ chmod 600 .env
 Edit `.env` and set `T3_ACCESS_TOKEN` and a separate random `MCP_BEARER_TOKEN`. For a remote MCP connection, set `MCP_TRANSPORT=http`; use `MCP_READ_ONLY=true` for the initial connection check. Start with:
 
 ```sh
-node --env-file=.env dist/cli.js serve
+set -a
+. ./.env
+set +a
+pnpm start
 ```
 
-The CLI reads process environment variables; it does not load `.env` automatically. The command above uses Node's `--env-file` support, available in Node 20.6 and later. On earlier Node 20 releases, export the variables before starting the CLI.
+The CLI reads process environment variables. The shell commands above export the values from `.env` before starting it.
 
 The default HTTP address is `http://127.0.0.1:8787/mcp`. `/healthz` reports that the gateway HTTP server is alive; use `t3_connection_status` to check T3 connectivity. For a local MCP host that launches a process, leave `MCP_TRANSPORT` unset or set it to `stdio`.
 
@@ -58,7 +61,7 @@ The [native T3 tools](usage.md#native-t3-tools) need a separate credential. T3's
 2. Run the login with the same environment as the gateway, and supply the code from the `credential` field at the hidden prompt or on stdin:
 
    ```sh
-   node --env-file=.env dist/cli.js native-login --access full-access
+   rust/target/release/t3-code-mcp native-login --access full-access
    ```
 
 The command refuses a pairing code given as an argument, because process lists show arguments. It checks the new session with a native `tools/list`, then writes `native-mcp-credential.json` with mode `600` to `T3_MCP_DATA_DIR`. It prints the access level, scopes, expiry, and tool counts, never the token.
@@ -75,7 +78,7 @@ Run the gateway on a machine that can reach T3, then choose the connection your 
 
 | Setup | How to connect |
 | --- | --- |
-| Local MCP client | Launch `node dist/cli.js serve` with `MCP_TRANSPORT=stdio` and the required T3 environment variables. |
+| Local MCP client | Launch `rust/target/release/t3-code-mcp serve` with `MCP_TRANSPORT=stdio` and the required T3 environment variables. |
 | Remote MCP client | Run with `MCP_TRANSPORT=http` and connect to a reachable `/mcp` endpoint using `Authorization: Bearer <MCP_BEARER_TOKEN>`. |
 
 The gateway can run alongside T3 or on another machine that can reach its HTTP API. For remote access, use the included [tunnel deployment](deployment.md) or an authenticated route through your own network or HTTPS reverse proxy. A localhost URL on the gateway machine is not reachable from a remote client or hosted tool runner. The included tunnel launcher supplies the bearer header on the local gateway connection.

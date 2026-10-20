@@ -6,14 +6,15 @@ StartLimitIntervalSec=1min
 StartLimitBurst=5
 
 # Template: do not edit host paths here. Render host-specific units with:
-#   node dist/cli.js setup --workspace=/opt/t3code-mcp --node=/usr/bin/node \
+#   rust/target/release/t3-code-mcp setup --workspace=/opt/t3code-mcp \
+#     --executable=/opt/t3code-mcp/rust/target/release/t3-code-mcp \
 #     --tunnel-bin=/usr/local/bin/tunnel-client --tunnel-id=tunnel_YOURS \
 #     --environment-id=YOUR_ENV_ID
 [Service]
 Type=simple
 WorkingDirectory=/opt/t3code-mcp
 EnvironmentFile=%h/.config/t3-code-mcp.env
-ExecStart=/usr/bin/node /opt/t3code-mcp/dist/cli.js serve
+ExecStart=/opt/t3code-mcp/rust/target/release/t3-code-mcp serve
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=10s
