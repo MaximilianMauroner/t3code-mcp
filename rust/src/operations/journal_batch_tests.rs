@@ -26,6 +26,28 @@ fn recoveries() -> Vec<TerminalRecovery> {
     ]
 }
 
+fn failures() -> Vec<TerminalFailure> {
+    [
+        ("a", "a", 20, 300, "original"),
+        ("new", "missing", 10, 300, "new failure"),
+        ("b", "b", 21, 300, "changed failure"),
+        ("b", "b", 19, 400, "stale failure"),
+        ("b", "b", 22, 500, "latest failure"),
+        ("b", "b", 22, 600, "latest failure"),
+    ]
+    .into_iter()
+    .map(
+        |(thread, operation, sequence, admission, message)| TerminalFailure {
+            thread_id: thread.into(),
+            turn_id: "turn-1".into(),
+            failure: failure("t3_session", "quota", message),
+            operation_id: Some(operation.into()),
+            order: Some(order(2, "shell", sequence, admission)),
+        },
+    )
+    .collect()
+}
+
 fn populated(file: &Fixture) -> OperationJournal {
     let mut operations = Vec::new();
     for id in ["a", "a-second", "b", "stale", "unrelated"] {
@@ -139,14 +161,16 @@ fn journal_transactions_survive_create_write_and_rename_errors() {
         }
         return;
     };
-    for batch in [false, true] {
+    for batch in ["singleton", "recovery", "failure"] {
         let file = Fixture::new();
         let journal = populated(&file);
         let before = observable(&journal);
         let bytes = fs::read(&file.path).unwrap();
         let attempt = || {
-            if batch {
+            if batch == "recovery" {
                 journal.clear_terminal_failures(&recoveries())
+            } else if batch == "failure" {
+                journal.retain_terminal_failures(&failures()).map(|_| ())
             } else {
                 journal
                     .retain_terminal_failure(
@@ -187,7 +211,7 @@ fn journal_transactions_survive_create_write_and_rename_errors() {
         attempt().unwrap();
         let reopened = file.journal();
         assert_eq!(observable(&reopened), observable(&journal));
-        if batch {
+        if batch == "recovery" {
             for id in ["a", "a-second", "b"] {
                 let receipt = reopened.get_by_operation_id(id).unwrap().unwrap();
                 assert!(receipt.get("terminalRunStatus").is_none());
@@ -219,6 +243,26 @@ fn journal_transactions_survive_create_write_and_rename_errors() {
                     .unwrap()["readStartedAt"],
                 300
             );
+        } else if batch == "failure" {
+            assert_eq!(
+                reopened
+                    .get_failure_by_turn_id("new", "turn-1")
+                    .unwrap()
+                    .unwrap()["message"],
+                "new failure"
+            );
+            assert_eq!(
+                reopened.get_by_operation_id("b").unwrap().unwrap()["terminalFailure"]["message"],
+                "latest failure"
+            );
+            for (thread, sequence, admission) in [("a", 20, 300), ("b", 22, 600)] {
+                let order = reopened
+                    .get_failure_evidence_order(thread, "turn-1")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(order["snapshotSequence"], sequence);
+                assert_eq!(order["readStartedAt"], admission);
+            }
         } else {
             assert_eq!(
                 reopened.get_by_operation_id("a").unwrap().unwrap()["terminalFailure"]["message"],
@@ -246,14 +290,29 @@ fn unchanged_observations_succeed_without_storage_and_advance_admission() {
             Some(order(2, "shell", 20, 300)),
         )
         .unwrap();
-    for id in ["a", "admission"] {
+    let unchanged = ["a", "b"]
+        .into_iter()
+        .map(|thread| TerminalFailure {
+            thread_id: thread.into(),
+            turn_id: "turn-1".into(),
+            failure: failure("t3_session", "quota", "original"),
+            operation_id: Some(thread.into()),
+            order: Some(order(2, "shell", 20, 400)),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        journal.retain_terminal_failures(&unchanged).unwrap().len(),
+        2
+    );
+    assert!(journal.retain_terminal_failures(&[]).unwrap().is_empty());
+    for id in ["a", "b", "admission"] {
         assert_eq!(
             journal
                 .get_failure_evidence_order(id, "turn-1")
                 .unwrap()
                 .unwrap()["readStartedAt"]
                 .as_f64(),
-            Some(300.0)
+            Some(if id == "admission" { 300.0 } else { 400.0 })
         );
         journal
             .retain_terminal_failure(

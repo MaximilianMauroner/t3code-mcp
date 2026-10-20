@@ -91,3 +91,33 @@ async fn discovery_retains_only_selected_failures_and_recovers_hidden_rows() {
         }
     }
 }
+
+#[tokio::test]
+async fn discovery_retains_failures_beyond_page_and_highlights_when_enrichment_fails() {
+    for (name, args, returned) in [
+        ("t3_threads_overview", json!({}), 5),
+        ("t3_threads_list", json!({"status": "all", "detail": "summary", "limit": 1}), 1),
+        ("t3_threads_list", json!({"status": "all", "detail": "full", "limit": 1}), 1),
+    ] {
+        let fixture = Fixture::empty().await;
+        *fixture.shell_threads.lock().unwrap() = (0..8).map(|index| {
+            let mut row = failed_thread(&format!("Failure {index}"));
+            row["id"] = json!(format!("selected-{index}"));
+            row
+        }).collect();
+        fixture.shell_sequence.store(101, Ordering::SeqCst);
+        fixture.missing(503, "unavailable", None);
+        let result = mcp_value(&fixture.gateway, name, args).await;
+        let rows = if name == "t3_threads_overview" { &result["highlights"] } else { &result["page"]["items"] };
+        assert_eq!(rows.as_array().unwrap().len(), returned);
+        for row in rows.as_array().unwrap() {
+            assert!(row["failure"]["message"].as_str().unwrap().starts_with("Failure "));
+        }
+        let journal = stored_journal(&fixture);
+        for index in 0..8 {
+            let id = format!("selected-{index}");
+            assert_eq!(journal.get_failure_by_turn_id(&id, TURN).unwrap().unwrap()["message"], format!("Failure {index}"));
+            assert_eq!(journal.get_failure_evidence_order(&id, TURN).unwrap().unwrap()["snapshotSequence"], 101);
+        }
+    }
+}
