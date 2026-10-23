@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const GATEWAY_VERSION: &str = "0.1.0";
-pub const TOOL_SCHEMA_VERSION: u32 = 11;
+pub const TOOL_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +80,7 @@ macro_rules! gateway_routes {
 
 gateway_routes! {
     ConnectionStatus => "t3_connection_status",
+    ModelsUsage => "t3_models_usage",
     AuditLog => "t3_audit_log",
     GitStatus => "t3_git_status",
     GitDiff => "t3_git_diff",

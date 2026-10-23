@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod failure;
 pub mod http_client;
+pub mod models_usage;
 pub mod native_mcp;
 pub mod rpc_client;
 pub mod thread_state;

@@ -1,3 +1,4 @@
+import { ProvidersConfigSchema, type ProvidersConfig } from "./models-usage.js";
 import { randomUUID } from "node:crypto";
 import {
   AuthSessionSchema,
@@ -129,6 +130,11 @@ export class T3HttpClient {
       else signal.addEventListener("abort", onAbort, { once: true });
       void request.finally(() => signal.removeEventListener("abort", onAbort)).then(resolve, reject);
     });
+  }
+
+  async getProviders(signal?: AbortSignal): Promise<ProvidersConfig["providers"]> {
+    const config = await this.rpc("server.getConfig", {}, ProvidersConfigSchema, signal);
+    return config.providers;
   }
 
   async getSession(signal?: AbortSignal): Promise<AuthSession> {

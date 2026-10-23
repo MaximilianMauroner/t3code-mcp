@@ -1,3 +1,4 @@
+import { modelsUsage } from "./t3/models-usage.js";
 import { compareFailureOrder } from "./t3/failure-order.js";
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
@@ -916,6 +917,18 @@ export class T3Gateway {
       status: outcome.status,
       nextAction: "Confirm the stop with t3_thread_wait or t3_task_get. Interrupt acceptance alone does not prove the run stopped.",
     };
+  }
+
+  async modelsUsage(input: { readonly providerInstanceId?: string }) {
+    const environmentId = await this.environmentId();
+    const providers = await this.client.getProviders();
+    const selected = input.providerInstanceId === undefined
+      ? providers
+      : providers.filter((provider) => provider.instanceId === input.providerInstanceId);
+    if (input.providerInstanceId !== undefined && selected.length === 0) {
+      throw new GatewayError("provider_instance_not_found", `Provider instance ${input.providerInstanceId} was not found in the connected T3 environment.`);
+    }
+    return { environmentId, observedAt: new Date().toISOString(), providers: modelsUsage(selected) };
   }
 
   async threadsList(input: {

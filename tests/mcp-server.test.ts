@@ -54,6 +54,7 @@ describe("MCP tool contract", () => {
       "t3_git_compare",
       "t3_git_diff",
       "t3_git_status",
+      "t3_models_usage",
       "t3_pending_action_respond",
       "t3_pending_actions_list",
       "t3_result_get",

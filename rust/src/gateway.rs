@@ -386,6 +386,7 @@ impl T3Gateway {
         })?;
         let value = match tool {
             GatewayTool::ConnectionStatus => self.connection_status().await,
+            GatewayTool::ModelsUsage => self.models_usage(&call.arguments).await?,
             GatewayTool::AuditLog => return self.audit_query(&call.arguments),
             GatewayTool::GitStatus => self.git_status(&call.arguments).await?,
             GatewayTool::GitDiff => self.git_diff(&call.arguments).await?,
@@ -405,6 +406,42 @@ impl T3Gateway {
         };
         ToolResult::structured(&value)
             .map_err(|error| ToolFailure::new("gateway_error", error.to_string()))
+    }
+
+    async fn models_usage(&self, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+        let provider_id = optional_string(args, "providerInstanceId")?;
+        let descriptor = self
+            .client
+            .get_descriptor(None)
+            .await
+            .map_err(|error| ToolFailure::new("gateway_error", error.message))?;
+        self.assert_environment(&descriptor)?;
+        let providers = self
+            .client
+            .get_providers(None)
+            .await
+            .map_err(|error| ToolFailure::new("gateway_error", error.message))?;
+        let selected = providers
+            .into_iter()
+            .filter(|provider| {
+                provider_id
+                    .as_deref()
+                    .is_none_or(|id| id == provider.instance_id())
+            })
+            .collect::<Vec<_>>();
+        if let Some(id) = provider_id
+            && selected.is_empty()
+        {
+            return Err(ToolFailure::new(
+                "provider_instance_not_found",
+                format!("Provider instance {id} was not found in the connected T3 environment."),
+            ));
+        }
+        Ok(json!({
+            "environmentId":descriptor.environment_id,
+            "observedAt":now_iso(),
+            "providers":selected.into_iter().map(|provider| provider.into_usage()).collect::<Vec<_>>()
+        }))
     }
 
     fn audit_query(&self, args: &Map<String, Value>) -> Result<ToolResult, ToolFailure> {

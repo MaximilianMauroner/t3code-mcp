@@ -254,6 +254,7 @@ fn parse_value(
                         | "outcome"
                         | "projectId"
                         | "threadId"
+                        | "providerInstanceId"
                         | "baseRevision"
                         | "headRevision"
                         | "query"

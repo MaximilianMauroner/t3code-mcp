@@ -1,3 +1,4 @@
+import { ModelsUsageOutputSchema } from "../t3/models-usage.js";
 import { ProviderRetrySchema } from "../t3/types.js";
 import { settingsReceiptSchema } from "../operations/settings.js";
 import { randomUUID } from "node:crypto";
@@ -628,6 +629,18 @@ export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | nul
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async (args) => runTool(auditLog, "t3_git_compare", args, () => gateway.gitCompare(args satisfies GitCompareInput)),
+  );
+
+  server.registerTool(
+    "t3_models_usage",
+    {
+      title: "List T3 models and reported usage",
+      description: "Read the complete model catalog and usage snapshot for each provider instance. Optionally filter by exact providerInstanceId. Windows are provider/account reported and labels can scope subsets of models. They are shared budgets, never independent per-model allowances. Do not sum windows or providers. remainingPercent is 100 minus usedPercent. Source checkedAt is distinct from this call's observedAt. Missing, unsupported, failed probes, and empty windows are explicit states and do not mean unlimited usage. Valid windows remain visible when a probe is unavailable. This read does not refresh providers or credentials.",
+      inputSchema: { providerInstanceId: z.string().trim().min(1).optional() },
+      outputSchema: ModelsUsageOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(auditLog, "t3_models_usage", args, () => gateway.modelsUsage(args)),
   );
 
   server.registerTool(

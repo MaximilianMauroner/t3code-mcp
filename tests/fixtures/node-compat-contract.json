@@ -1,8 +1,9 @@
 {
   "gatewayVersion": "0.1.0",
-  "toolSchemaVersion": 11,
+  "toolSchemaVersion": 12,
   "gatewayToolNames": [
     "t3_connection_status",
+    "t3_models_usage",
     "t3_audit_log",
     "t3_git_status",
     "t3_git_diff",
@@ -113,6 +114,7 @@
   ],
   "toolNames": [
     "t3_connection_status",
+    "t3_models_usage",
     "t3_audit_log",
     "t3_git_status",
     "t3_git_diff",
@@ -170,5 +172,5 @@
     "unwatch_pull_request",
     "write_pull_request_guides"
   ],
-  "toolSchemaFingerprint": "b5fb9354831b51bb"
+  "toolSchemaFingerprint": "20e1540ccd132834"
 }

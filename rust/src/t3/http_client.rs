@@ -142,6 +142,14 @@ impl T3HttpClient {
         };
         tokio::select! {biased;_=cancelled(cancel)=>{let error=ClientError::boxed(ErrorKind::Cancelled,"The operation was aborted.");self.failed(&error);Err(error)}, result=request=>result}
     }
+    pub async fn get_providers(
+        &self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<super::models_usage::ProviderSnapshot>, Box<ClientError>> {
+        let config: super::models_usage::ProvidersConfig =
+            self.rpc("server.getConfig", json!({}), cancel).await?;
+        Ok(config.providers)
+    }
     pub async fn get_session(
         &self,
         cancel: Option<&CancellationToken>,

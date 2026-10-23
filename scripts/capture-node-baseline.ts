@@ -11,6 +11,11 @@ import { createMcpServer } from "../src/mcp/server.js";
 import { listenHttp } from "../src/mcp/transport.js";
 import { gatewayFixture } from "../tests/support/gateway-fixture.js";
 import { FakeT3 } from "../tests/support/fake-t3.js";
+import {
+  GATEWAY_VERSION, TOOL_SCHEMA_VERSION, GATEWAY_TOOL_NAMES,
+  NATIVE_READ_TOOL_NAMES, NATIVE_MUTATING_TOOL_NAMES, NATIVE_CALLED_TOOL_NAMES,
+  NATIVE_TOOL_NAMES, TOOL_NAMES, toolSchemaFingerprint,
+} from "../src/contract.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const fixturePath = join(root, "tests/fixtures/node-compat-baseline.json");
@@ -250,6 +255,18 @@ try {
   assert.deepEqual(normalize((stdio.tools as { result: { tools: unknown } }).result.tools, paths), toolList);
   const toolsPath = join(root, "tests/fixtures/node-compat-tools.json");
   await writeFile(toolsPath, `${JSON.stringify(toolList, null, 2)}\n`);
+  await writeFile(join(root, "rust/src/contract-tools.json"), `${JSON.stringify(toolList, null, 2)}\n`);
+  await writeFile(join(root, "tests/fixtures/node-compat-contract.json"), `${JSON.stringify({
+    gatewayVersion: GATEWAY_VERSION,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION,
+    gatewayToolNames: GATEWAY_TOOL_NAMES,
+    nativeReadToolNames: NATIVE_READ_TOOL_NAMES,
+    nativeMutatingToolNames: NATIVE_MUTATING_TOOL_NAMES,
+    nativeInternalToolNames: NATIVE_CALLED_TOOL_NAMES.filter((name) => !(NATIVE_TOOL_NAMES as readonly string[]).includes(name)),
+    nativeToolNames: NATIVE_TOOL_NAMES,
+    toolNames: TOOL_NAMES,
+    toolSchemaFingerprint: toolSchemaFingerprint(),
+  }, null, 2)}\n`);
   const toolsSha256 = createHash("sha256").update(JSON.stringify(toolList)).digest("hex");
   const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(normalize(value, paths))).digest("hex");
   const captured = normalize({
