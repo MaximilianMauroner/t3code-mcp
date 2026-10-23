@@ -1,3 +1,4 @@
+import { UsageHistoryInputSchema, UsageHistoryOutputSchema } from "../t3/usage-history.js";
 import { ModelsUsageOutputSchema } from "../t3/models-usage.js";
 import { ProviderRetrySchema } from "../t3/types.js";
 import { settingsReceiptSchema } from "../operations/settings.js";
@@ -632,11 +633,23 @@ export function createMcpServer(gateway: T3Gateway, native: NativeSnapshot | nul
   );
 
   server.registerTool(
+    "t3_usage_history",
+    {
+      title: "Read T3 Usage tab history",
+      description: "Read the same token and cost history as T3 Code's Usage tab through server.getUsageSummary. Requires diagnostics:read. sinceDay and untilDay are inclusive calendar dates in timeZone. Limit date windows to 366 days. Hour resolution requires both sinceTime and untilTime, with an interval greater than zero and at most 24 hours. awaitRefresh waits for slow sources; otherwise a source may report refreshing:true. Preserves provider/model buckets, source statuses and pricing provenance. reasoningTokens are a subset of outputTokens. Bucket session counts can overlap; use source distinctSessions. Cost totals are history, not remaining subscription allowance. Source identifiers are pseudonymous and transcript paths are omitted.",
+      inputSchema: UsageHistoryInputSchema,
+      outputSchema: UsageHistoryOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async (args) => runTool(auditLog, "t3_usage_history", args, () => gateway.usageHistory(args)),
+  );
+
+  server.registerTool(
     "t3_models_usage",
     {
       title: "List T3 models and reported usage",
-      description: "Read the complete model catalog and usage snapshot for each provider instance. Optionally filter by exact providerInstanceId. Windows are provider/account reported and labels can scope subsets of models. They are shared budgets, never independent per-model allowances. Do not sum windows or providers. remainingPercent is 100 minus usedPercent. Source checkedAt is distinct from this call's observedAt. Missing, unsupported, failed probes, and empty windows are explicit states and do not mean unlimited usage. Valid windows remain visible when a probe is unavailable. This read does not refresh providers or credentials.",
-      inputSchema: { providerInstanceId: z.string().trim().min(1).optional() },
+      description: "Read the complete model catalog and usage snapshots for native providers and external account sources. Optionally filter native providers by exact providerInstanceId. The filter does not affect sources. Windows are provider/account reported and labels can scope subsets of models. They are shared budgets, never independent per-model allowances. Do not sum windows or providers. remainingPercent is 100 minus usedPercent. Source checkedAt is distinct from this call's observedAt. Missing, unsupported, failed probes, and empty windows are explicit states and do not mean unlimited usage. Valid windows remain visible when a probe is unavailable. Set refresh to true to request server.refreshProviders once before reading. Refresh failure is reported separately. No plan-wide allowance is inferred.",
+      inputSchema: { providerInstanceId: z.string().trim().min(1).optional(), refresh: z.boolean().default(false) },
       outputSchema: ModelsUsageOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },

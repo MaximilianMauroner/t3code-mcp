@@ -1,4 +1,6 @@
-import { ProvidersConfigSchema, type ProvidersConfig } from "./models-usage.js";
+import { UsageSummarySchema, type UsageSummary, type UsageHistoryInput } from "./usage-history.js";
+import { usageLimitsCollector, type RefreshOutput, type UsageLimitsRead } from "./models-usage.js";
+import { sanitizeFailureText } from "./failure.js";
 import { randomUUID } from "node:crypto";
 import {
   AuthSessionSchema,
@@ -15,7 +17,7 @@ import {
 import type { T3Command } from "./commands.js";
 import { summarizeForAudit, type AuditLog } from "../operations/audit-log.js";
 import { z } from "zod";
-import { requestT3Rpc } from "./rpc-client.js";
+import { collectT3Rpc, requestT3Rpc } from "./rpc-client.js";
 import { V2ArchivedShellSchema, V2ShellSchema, V2ThreadSchema, normalizeV2ShellThread, normalizeV2Thread } from "./v2.js";
 
 export class T3HttpError extends Error {
@@ -132,9 +134,27 @@ export class T3HttpClient {
     });
   }
 
-  async getProviders(signal?: AbortSignal): Promise<ProvidersConfig["providers"]> {
-    const config = await this.rpc("server.getConfig", {}, ProvidersConfigSchema, signal);
-    return config.providers;
+  async getUsageLimits(input: { refresh?: boolean } = {}, signal?: AbortSignal): Promise<UsageLimitsRead> {
+    let refresh: RefreshOutput = { status: "notRequested" };
+    if (input.refresh) {
+      try {
+        await this.rpc("server.refreshProviders", {}, z.unknown(), signal);
+        refresh = { status: "completed" };
+      } catch (error) {
+        signal?.throwIfAborted();
+        refresh = { status: "failed", error: sanitizeFailureText(error instanceof Error ? error.message : String(error), 2_000) };
+      }
+    }
+    const method = "subscribeServerConfig";
+    const payload = { usageLimitSources: true };
+    const result = await this.auditedRpc(method, payload, () => collectT3Rpc(
+      this.baseUrl, this.accessToken, this.requestTimeoutMs, method, payload, usageLimitsCollector(), signal,
+    ));
+    return { ...result, refresh };
+  }
+
+  async getUsageHistory(input: UsageHistoryInput, signal?: AbortSignal): Promise<UsageSummary> {
+    return this.rpc("server.getUsageSummary", input, UsageSummarySchema, signal);
   }
 
   async getSession(signal?: AbortSignal): Promise<AuthSession> {
@@ -257,11 +277,15 @@ export class T3HttpClient {
   }
 
   private async rpc<T>(method: string, payload: unknown, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T> {
+    return this.auditedRpc(method, payload, () => requestT3Rpc(this.baseUrl, this.accessToken, this.requestTimeoutMs, method, payload, schema, signal));
+  }
+
+  private async auditedRpc<T>(method: string, payload: unknown, read: () => Promise<T>): Promise<T> {
     const correlationId = `t3_${randomUUID()}`;
     const startedAt = Date.now();
     await this.auditLog?.record({ source: "t3", event: "upstream.request", correlationId, operation: method, outcome: "started", details: { body: summarizeForAudit(payload), transport: "websocket" } });
     try {
-      const result = await requestT3Rpc(this.baseUrl, this.accessToken, this.requestTimeoutMs, method, payload, schema, signal);
+      const result = await read();
       this.lastSuccessfulAt = Date.now();
       this.lastError = null;
       await this.auditLog?.record({ source: "t3", event: "upstream.response", correlationId, operation: method, outcome: "completed", durationMs: Date.now() - startedAt });

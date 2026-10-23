@@ -142,14 +142,59 @@ impl T3HttpClient {
         };
         tokio::select! {biased;_=cancelled(cancel)=>{let error=ClientError::boxed(ErrorKind::Cancelled,"The operation was aborted.");self.failed(&error);Err(error)}, result=request=>result}
     }
-    pub async fn get_providers(
+    pub async fn get_usage_limits(
         &self,
+        refresh_requested: bool,
         cancel: Option<&CancellationToken>,
-    ) -> Result<Vec<super::models_usage::ProviderSnapshot>, Box<ClientError>> {
-        let config: super::models_usage::ProvidersConfig =
-            self.rpc("server.getConfig", json!({}), cancel).await?;
-        Ok(config.providers)
+    ) -> Result<super::models_usage::UsageLimitsRead, Box<ClientError>> {
+        let refresh = if refresh_requested {
+            match self
+                .rpc::<Value>("server.refreshProviders", json!({}), cancel)
+                .await
+            {
+                Ok(_) => json!({"status":"completed"}),
+                Err(error) if error.kind == ErrorKind::Cancelled => return Err(error),
+                Err(error) => {
+                    json!({"status":"failed","error":super::failure::sanitize_failure_text(&error.message, 2000)})
+                }
+            }
+        } else {
+            json!({"status":"notRequested"})
+        };
+        let mut collector = super::models_usage::UsageLimitsCollector::default();
+        let payload = json!({"usageLimitSources":true});
+        let mut result = self
+            .audited_rpc(
+                "subscribeServerConfig",
+                &payload,
+                Box::pin(super::rpc_client::collect_t3_rpc(
+                    &self.0.url,
+                    &self.0.token,
+                    self.0.timeout,
+                    "subscribeServerConfig",
+                    payload.clone(),
+                    cancel,
+                    |event| collector.collect(event),
+                )),
+            )
+            .await?;
+        result.refresh = refresh;
+        Ok(result)
     }
+    pub async fn get_usage_history(
+        &self,
+        input: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value, Box<ClientError>> {
+        let summary = self.rpc("server.getUsageSummary", input, cancel).await?;
+        super::usage_history::parse_summary(summary).map_err(|_| {
+            ClientError::boxed(
+                ErrorKind::InvalidResponse,
+                "T3 RPC server.getUsageSummary returned an invalid response.",
+            )
+        })
+    }
+
     pub async fn get_session(
         &self,
         cancel: Option<&CancellationToken>,
@@ -368,6 +413,26 @@ impl T3HttpClient {
         payload: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<T, Box<ClientError>> {
+        self.audited_rpc(
+            method,
+            &payload,
+            Box::pin(request_t3_rpc(
+                &self.0.url,
+                &self.0.token,
+                self.0.timeout,
+                method,
+                payload.clone(),
+                cancel,
+            )),
+        )
+        .await
+    }
+    async fn audited_rpc<T>(
+        &self,
+        method: &str,
+        payload: &Value,
+        request: std::pin::Pin<Box<impl std::future::Future<Output = Result<T, Box<ClientError>>>>>,
+    ) -> Result<T, Box<ClientError>> {
         let id = format!("t3_{}", uuid::Uuid::new_v4());
         let started = now();
         self.audit(
@@ -376,19 +441,11 @@ impl T3HttpClient {
             "started",
             None,
             Some(AuditValue::object([
-                ("body", summarize_for_audit(&payload)),
+                ("body", summarize_for_audit(payload)),
                 ("transport", "websocket".into()),
             ])),
         );
-        let result = request_t3_rpc(
-            &self.0.url,
-            &self.0.token,
-            self.0.timeout,
-            method,
-            payload,
-            cancel,
-        )
-        .await;
+        let result = request.await;
         match &result {
             Ok(_) => {
                 self.succeeded();

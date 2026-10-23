@@ -6,6 +6,7 @@ pub mod native_mcp;
 pub mod rpc_client;
 pub mod thread_state;
 pub mod types;
+pub mod usage_history;
 pub mod v2;
 
 pub use crate::native_credential;

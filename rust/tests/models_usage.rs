@@ -4,15 +4,18 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use t3_code_mcp::{
     config::load_config_from,
     gateway::T3Gateway,
     mcp::{IncomingMessage, McpServer},
+    t3::{T3HttpClient, http_client::ErrorKind},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::Notify,
     task::{JoinHandle, JoinSet},
 };
 use tokio_tungstenite::tungstenite::{Message, handshake::derive_accept_key, protocol::Role};
@@ -42,6 +45,31 @@ enum Mode {
     Rpc,
     Disconnect,
     Malformed,
+    AfterEnd,
+    AfterDisconnect,
+    AfterTimeout,
+    AfterRpc,
+    AfterDefect,
+    AfterMalformed,
+}
+
+struct Options {
+    sources: Value,
+    events: Option<Vec<Value>>,
+    following_events: Option<Vec<Value>>,
+    refresh_error: Option<String>,
+    refresh_stall: bool,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            sources: json!([]),
+            events: None,
+            following_events: None,
+            refresh_error: None,
+            refresh_stall: false,
+        }
+    }
 }
 
 struct Fixture {
@@ -50,11 +78,25 @@ struct Fixture {
     calls: Arc<Mutex<Vec<Value>>>,
     directory: PathBuf,
     gateway: T3Gateway,
+    client: T3HttpClient,
+    snapshot_ack: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
 impl Fixture {
     async fn new(config: Value, mode: Mode, environment: Option<&str>) -> Self {
+        Self::with_options(config, mode, environment, Options::default()).await
+    }
+
+    async fn with_options(
+        config: Value,
+        mode: Mode,
+        environment: Option<&str>,
+        options: Options,
+    ) -> Self {
+        let options = Arc::new(options);
+        let snapshot_ack = Arc::new(Notify::new());
+        let snapshot_notice = snapshot_ack.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let config = Arc::new(Mutex::new(config));
@@ -67,7 +109,7 @@ impl Fixture {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (mut socket, _) = accepted.unwrap();
-                        let (data, recorded, requests) = (data.clone(), recorded.clone(), requests.clone());
+                        let (data, recorded, requests, options, snapshot_notice) = (data.clone(), recorded.clone(), requests.clone(), options.clone(), snapshot_notice.clone());
                         clients.spawn(async move {
                             let mut head = Vec::new();
                             while !head.ends_with(b"\r\n\r\n") {
@@ -99,11 +141,37 @@ impl Fixture {
                             requests.lock().unwrap().push(request.clone());
                             if matches!(mode, Mode::Disconnect) { let _ = ws.close(None).await; return; }
                             if matches!(mode, Mode::Malformed) { let _ = ws.send(Message::Text("not-json".into())).await; return; }
-                            let exit = if matches!(mode, Mode::Rpc) {
-                                json!({"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"requires orchestration:read"}}]})
-                            } else { json!({"_tag":"Success","value":data.lock().unwrap().clone()}) };
-                            let response = json!({"_tag":"Exit","requestId":request["id"],"exit":exit});
-                            let _ = ws.send(Message::Text(response.to_string().into())).await;
+                            if request["tag"] == "server.refreshProviders" && options.refresh_stall { while ws.next().await.is_some() {} return; }
+                            if matches!(mode, Mode::Rpc) || request["tag"] == "server.refreshProviders" {
+                                let error = if matches!(mode, Mode::Rpc) { Some("requires orchestration:read") } else { options.refresh_error.as_deref() };
+                                let exit = match error {
+                                    Some(message) => json!({"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":message}}]}),
+                                    None => json!({"_tag":"Success","value":null}),
+                                };
+                                let _ = ws.send(Message::Text(json!({"_tag":"Exit","requestId":request["id"],"exit":exit}).to_string().into())).await;
+                                return;
+                            }
+                            assert_eq!(request["tag"], "subscribeServerConfig");
+                            assert_eq!(request["payload"], json!({"usageLimitSources":true}));
+                            let values = options.events.clone().unwrap_or_else(|| vec![json!({"version":1,"type":"snapshot","config":data.lock().unwrap().clone()})]);
+                            let _ = ws.send(Message::Text(json!({"_tag":"Chunk","requestId":request["id"],"values":values}).to_string().into())).await;
+                            let Some(Ok(ack)) = ws.next().await else { return; };
+                            let Ok(ack) = serde_json::from_slice::<Value>(&ack.into_data()) else { return; };
+                            if ack["_tag"] != "Ack" { return; }
+                            assert_eq!(ack["requestId"], request["id"]);
+                            snapshot_notice.notify_one();
+                            if matches!(mode, Mode::AfterDisconnect) { let _ = ws.close(None).await; return; }
+                            if matches!(mode, Mode::AfterTimeout) { while ws.next().await.is_some() {} return; }
+                            let response = match mode {
+                                Mode::AfterEnd => json!({"_tag":"Exit","requestId":request["id"],"exit":{"_tag":"Success","value":null}}).to_string(),
+                                Mode::AfterRpc => json!({"_tag":"Exit","requestId":request["id"],"exit":{"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"source read failed"}}]}}).to_string(),
+                                Mode::AfterDefect => json!({"_tag":"Defect"}).to_string(),
+                                Mode::AfterMalformed => "not-json".to_owned(),
+                                _ => json!({"_tag":"Chunk","requestId":request["id"],"values":options.following_events.clone().unwrap_or_else(||vec![json!({"version":1,"type":"usageLimitSourcesUpdated","payload":{"sources":options.sources}})])}).to_string(),
+                            };
+                            let _ = ws.send(Message::Text(response.into())).await;
+                            while ws.next().await.is_some() {}
+
                         });
                     }
                     result = clients.join_next(), if !clients.is_empty() => { result.unwrap().unwrap(); }
@@ -114,7 +182,7 @@ impl Fixture {
             .unwrap()
             .join(format!(".models-usage-test-{}", uuid::Uuid::new_v4()));
         let mut env = HashMap::from([
-            ("T3_HTTP_BASE_URL".into(), url),
+            ("T3_HTTP_BASE_URL".into(), url.clone()),
             ("T3_ACCESS_TOKEN".into(), "fixture-token".into()),
             (
                 "T3_MCP_DATA_DIR".into(),
@@ -125,6 +193,7 @@ impl Fixture {
         if let Some(id) = environment {
             env.insert("T3_ENVIRONMENT_ID".into(), id.into());
         }
+        let client = T3HttpClient::new(url, "fixture-token", Duration::from_millis(200), None);
         let gateway = T3Gateway::new(load_config_from(&env, &directory).unwrap());
         Self {
             config,
@@ -132,6 +201,8 @@ impl Fixture {
             calls,
             directory,
             gateway,
+            client,
+            snapshot_ack,
             task,
         }
     }
@@ -216,8 +287,8 @@ async fn models_usage_returns_safe_complete_catalogs_and_shared_windows() {
     }
     let calls = fixture.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["tag"], "server.getConfig");
-    assert_eq!(calls[0]["payload"], json!({}));
+    assert_eq!(calls[0]["tag"], "subscribeServerConfig");
+    assert_eq!(calls[0]["payload"], json!({"usageLimitSources":true}));
     assert_eq!(
         *fixture.paths.lock().unwrap(),
         ["/.well-known/t3/environment", "/ws?orchestrationProtocol=2"]
@@ -225,7 +296,7 @@ async fn models_usage_returns_safe_complete_catalogs_and_shared_windows() {
     assert!(
         fixture
             .audit()
-            .contains("\"operation\":\"server.getConfig\"")
+            .contains("\"operation\":\"subscribeServerConfig\"")
     );
 }
 
@@ -363,7 +434,9 @@ async fn models_usage_rejects_positional_arrays_as_source_objects() {
         "checkedAt":CHECKED,"windows":[window(25.0)],
         "unavailable":{"reason":"probeFailed"},"resetCredits":{"availableCount":1}
     }))]});
-    let mut invalid = vec![json!([[]])];
+    let mut invalid_auth = valid.clone();
+    invalid_auth["providers"][0]["auth"] = json!(["private-label"]);
+    let mut invalid = vec![json!([[]]), invalid_auth];
     for (pointer, value) in [
         ("/providers/0", json!([])),
         (
@@ -493,4 +566,370 @@ async fn models_usage_rejects_malformed_catalogs_and_snapshots() {
         );
         assert!(result["structuredContent"].get("providers").is_none());
     }
+}
+
+fn external_source() -> Value {
+    json!({"id":"proxy/private","kind":"future-source","label":"CLIProxy","checkedAt":CHECKED,
+        "error":"token=private-token https://private.example/secret",
+        "accounts":[{"id":"private@example.com","driver":"future-driver","email":"private@example.com",
+            "workspaceId":"private-workspace","plan":"Pro","usageLimits":{"checkedAt":CHECKED,
+                "windows":[{"id":"primary","kind":"other","label":"Primary","usedPercent":18,"windowDurationMins":10080}],
+                "unavailable":{"reason":"probeFailed","message":"private-probe"},
+                "credentialFingerprint":"private-fingerprint",
+                "resetCredits":{"availableCount":1,"nextCreditId":"private-credit"}}}]})
+}
+
+#[tokio::test]
+async fn models_usage_reports_source_only_accounts_safe_labels_and_native_filter() {
+    let mut native = with_usage(
+        "native",
+        external_source()["accounts"][0]["usageLimits"].clone(),
+    );
+    native["auth"] = json!({"label":"ChatGPT Pro 20x Subscription","token":"private-auth"});
+    native["plan"] = json!("private-native-plan");
+    let mut other_source = external_source();
+    other_source["id"] = json!("other-source");
+    let fixture = Fixture::with_options(
+        json!({"providers":[native,provider("other")]}),
+        Mode::Success,
+        None,
+        Options {
+            sources: json!([external_source(), other_source]),
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = fixture.call(json!({"providerInstanceId":" native "})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let output = &result["structuredContent"];
+    assert_eq!(output["refresh"], json!({"status":"notRequested"}));
+    assert_eq!(output["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        output["providers"][0]["accountLabel"],
+        "ChatGPT Pro 20x Subscription"
+    );
+    assert_eq!(output["sources"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        output["sources"]["items"][1]["sourceRef"],
+        "src_e264ed6acf0e847e"
+    );
+    assert_eq!(
+        output["sources"]["items"][1]["accounts"][0]["accountRef"],
+        "acct_732c733411f2e4be"
+    );
+    let source = &output["sources"]["items"][0];
+    assert_eq!(output["sources"]["status"], "reported");
+    assert_eq!(source["sourceRef"], "src_558de6b776f54b2e");
+    assert_eq!(source["kind"], "future-source");
+    assert_eq!(source["label"], "CLIProxy");
+    assert_eq!(source["checkedAt"], CHECKED);
+    assert_eq!(source["accounts"][0]["accountRef"], "acct_0ed7811796e95495");
+    assert_eq!(source["accounts"][0]["driver"], "future-driver");
+    assert_eq!(source["accounts"][0]["plan"], "Pro");
+    assert_eq!(
+        source["accounts"][0]["usage"],
+        output["providers"][0]["usage"]
+    );
+    assert_eq!(source["accounts"][0]["usage"]["status"], "probeFailed");
+    assert_eq!(
+        source["accounts"][0]["usage"]["windows"],
+        json!([
+            {"id":"primary","kind":"other","label":"Primary","usedPercent":18.0,"remainingPercent":82.0,"windowDurationMins":10080}
+        ])
+    );
+    for private in [
+        "proxy/private",
+        "private@",
+        "private-",
+        "workspaceId",
+        "credentialFingerprint",
+        "nextCreditId",
+        "\"auth\"",
+    ] {
+        assert!(!result.to_string().contains(private), "{private}");
+    }
+    assert_eq!(
+        fixture.call(json!({})).await["structuredContent"]["sources"],
+        output["sources"]
+    );
+    let only_sources = Fixture::with_options(
+        json!({"providers":[]}),
+        Mode::Success,
+        None,
+        Options {
+            sources: json!([external_source()]),
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = only_sources.call(json!({})).await;
+    assert_eq!(result["structuredContent"]["providers"], json!([]));
+    assert_eq!(
+        result["structuredContent"]["sources"]["items"][0]["accounts"][0]["plan"],
+        "Pro"
+    );
+}
+
+#[tokio::test]
+async fn models_usage_collects_sources_first_and_all_values_with_provider_updates() {
+    let fixture = Fixture::with_options(json!({}), Mode::Success, None, Options {
+        events: Some(vec![
+            json!({"version":1,"type":"usageLimitSourcesUpdated","payload":{"sources":[]}}),
+        ]), following_events: Some(vec![
+            json!({"version":1,"type":"snapshot","config":{"providers":[provider("before")]}}),
+            json!({"version":1,"type":"providerStatuses","payload":{"providers":[with_usage("after",json!({"checkedAt":CHECKED,"windows":[window(25.0)]}))]}}),
+        ]), ..Default::default()
+    }).await;
+    let result = fixture.call(json!({})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(
+        result["structuredContent"]["providers"][0]["instanceId"],
+        "after"
+    );
+    assert_eq!(
+        result["structuredContent"]["providers"][0]["usage"]["windows"][0]["remainingPercent"],
+        75.0
+    );
+    assert_eq!(
+        result["structuredContent"]["sources"],
+        json!({"status":"reported","items":[]})
+    );
+}
+
+#[tokio::test]
+async fn models_usage_distinguishes_missing_sources_from_explicit_empty_sources() {
+    for (mode, reason) in [
+        (Mode::AfterEnd, "streamEnded"),
+        (Mode::AfterDisconnect, "disconnected"),
+    ] {
+        let fixture = Fixture::new(json!({"providers":[]}), mode, None).await;
+        let result = fixture.call(json!({})).await;
+        assert_ne!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["sources"],
+            json!({"status":"unavailable","reason":reason})
+        );
+    }
+    let fixture = Fixture::new(json!({"providers":[]}), Mode::Success, None).await;
+    assert_eq!(
+        fixture.call(json!({})).await["structuredContent"]["sources"],
+        json!({"status":"reported","items":[]})
+    );
+}
+
+#[tokio::test]
+async fn usage_limits_deadline_returns_partial_but_explicit_cancellation_propagates() {
+    let fixture = Fixture::new(
+        json!({"providers":[provider("native")]}),
+        Mode::AfterTimeout,
+        None,
+    )
+    .await;
+    let result = fixture
+        .client
+        .get_usage_limits(false, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        result.sources,
+        json!({"status":"unavailable","reason":"timeout"})
+    );
+    let other = Fixture::new(
+        json!({"providers":[provider("native")]}),
+        Mode::AfterTimeout,
+        None,
+    )
+    .await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let read = other.client.get_usage_limits(false, Some(&cancel));
+    let abort = async {
+        other.snapshot_ack.notified().await;
+        cancel.cancel();
+    };
+    let (result, _) = tokio::join!(read, abort);
+    assert!(matches!(result, Err(error) if error.kind == ErrorKind::Cancelled));
+    let absent = Fixture::with_options(
+        json!({}),
+        Mode::AfterTimeout,
+        None,
+        Options {
+            events: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(absent.client.get_usage_limits(false, None).await.is_err());
+}
+
+#[tokio::test]
+async fn models_usage_does_not_hide_errors_after_provider_snapshot() {
+    for mode in [Mode::AfterRpc, Mode::AfterDefect, Mode::AfterMalformed] {
+        let fixture = Fixture::new(json!({"providers":[]}), mode, None).await;
+        let result = fixture.call(json!({})).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "gateway_error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn models_usage_refreshes_once_and_preserves_sanitized_failure() {
+    for error in [
+        None,
+        Some("token=private-token https://private.example/secret"),
+    ] {
+        let fixture = Fixture::with_options(
+            json!({"providers":[]}),
+            Mode::Success,
+            None,
+            Options {
+                refresh_error: error.map(str::to_owned),
+                ..Default::default()
+            },
+        )
+        .await;
+        let result = fixture.call(json!({"refresh":true})).await;
+        assert_ne!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["refresh"]["status"],
+            if error.is_some() {
+                "failed"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(
+            result["structuredContent"]["sources"],
+            json!({"status":"reported","items":[]})
+        );
+        assert!(!result.to_string().contains("private-"));
+        if error.is_some() {
+            assert!(
+                result["structuredContent"]["refresh"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("[REDACTED]")
+            );
+        }
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call["tag"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            ["server.refreshProviders", "subscribeServerConfig"]
+        );
+        assert!(
+            fixture
+                .audit()
+                .contains("\"operation\":\"server.refreshProviders\"")
+        );
+    }
+}
+
+#[tokio::test]
+async fn models_usage_rejects_malformed_external_source_boundaries() {
+    let valid = json!([external_source()]);
+    let mut invalid = vec![Value::Null, json!([null]), json!([[]])];
+    for (pointer, value) in [
+        ("/0/accounts/0", json!(["account", "codex"])),
+        ("/0/accounts/0/usageLimits", json!([CHECKED, []])),
+        (
+            "/0/accounts/0/usageLimits/windows/0",
+            json!(["week", "weekly", "Weekly", 18]),
+        ),
+        (
+            "/0/accounts/0/usageLimits/unavailable",
+            json!(["probeFailed"]),
+        ),
+        ("/0/accounts/0/usageLimits/resetCredits", json!([1])),
+        (
+            "/0/accounts/0/usageLimits/windows/0/usedPercent",
+            json!(101),
+        ),
+        ("/0/checkedAt", json!("yesterday")),
+        ("/0/accounts/0/usageLimits", Value::Null),
+    ] {
+        let mut sources = valid.clone();
+        *sources.pointer_mut(pointer).unwrap() = value;
+        invalid.push(sources);
+    }
+    for sources in invalid {
+        let fixture = Fixture::with_options(json!({}), Mode::Success, None, Options {
+            events: Some(vec![json!({"version":1,"type":"snapshot","config":{"providers":[]}}),
+                json!({"version":1,"type":"usageLimitSourcesUpdated","payload":{"sources":sources}})]),
+            ..Default::default()
+        }).await;
+        let result = fixture.call(json!({})).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(
+            result["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid response")
+        );
+    }
+}
+
+#[tokio::test]
+async fn models_usage_sanitizes_permitted_labels_and_plans() {
+    let private = "token=private-value https://private.example/secret";
+    let mut native = provider("native");
+    native["auth"] = json!({"label":private});
+    let mut source = external_source();
+    source["label"] = json!(private);
+    source["accounts"][0]["plan"] = json!(private);
+    let fixture = Fixture::with_options(
+        json!({"providers":[native]}),
+        Mode::Success,
+        None,
+        Options {
+            sources: json!([source]),
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = fixture.call(json!({})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let output = &result["structuredContent"];
+    for label in [
+        &output["providers"][0]["accountLabel"],
+        &output["sources"]["items"][0]["label"],
+        &output["sources"]["items"][0]["accounts"][0]["plan"],
+    ] {
+        assert!(label.as_str().unwrap().contains("[REDACTED]"));
+    }
+    assert!(!result.to_string().contains("private-"));
+}
+
+#[tokio::test]
+async fn models_usage_keeps_cached_snapshots_after_refresh_timeout() {
+    let fixture = Fixture::with_options(
+        json!({"providers":[provider("cached")]}),
+        Mode::Success,
+        None,
+        Options {
+            refresh_stall: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = fixture.client.get_usage_limits(true, None).await.unwrap();
+    assert_eq!(result.refresh["status"], "failed");
+    assert_eq!(result.providers.len(), 1);
+    assert_eq!(result.sources, json!({"status":"reported","items":[]}));
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call["tag"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        ["server.refreshProviders", "subscribeServerConfig"]
+    );
 }

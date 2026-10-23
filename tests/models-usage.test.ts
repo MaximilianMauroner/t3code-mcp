@@ -1,3 +1,4 @@
+import { ModelsUsageOutputSchema } from "../src/t3/models-usage.js";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
@@ -8,6 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpServer } from "../src/mcp/server.js";
 import { gatewayFixture } from "./support/gateway-fixture.js";
+import { T3HttpClient } from "../src/t3/http-client.js";
 import { FakeT3 } from "./support/fake-t3.js";
 
 const checkedAt = "2026-10-22T10:00:00Z";
@@ -20,10 +22,12 @@ const provider = (instanceId: string, usageLimits?: unknown) => ({
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function connected(config: unknown, options: { mode?: "auth" | "rpc" | "disconnect" | "malformed"; environmentId?: string; readOnly?: boolean } = {}) {
+async function connected(config: unknown, options: { mode?: "auth" | "rpc" | "disconnect" | "malformed"; environmentId?: string; readOnly?: boolean; sources?: unknown; events?: unknown[]; followingEvents?: unknown[]; afterSnapshot?: "end" | "disconnect" | "timeout" | "rpc" | "defect" | "malformed"; refreshError?: string; refreshStall?: boolean } = {}) {
   const fake = new FakeT3({ scopes: ["orchestration:read"] });
   await fake.start();
   cleanup.push(() => fake.close());
+  let snapshotReceivedResolve!: () => void;
+  const snapshotReceived = new Promise<void>((resolve) => { snapshotReceivedResolve = resolve; });
   const paths: string[] = [];
   const calls: unknown[] = [];
   const server = createServer(async (request, response) => {
@@ -41,15 +45,44 @@ async function connected(config: unknown, options: { mode?: "auth" | "rpc" | "di
       return;
     }
     ws.handleUpgrade(request, socket, head, (connection) => {
+      let requestId: string;
+      let acknowledged = false;
       connection.on("message", (data) => {
         const call = JSON.parse(data.toString());
+        if (call._tag === "Ack") {
+          expect(call.requestId).toBe(requestId);
+          if (acknowledged) return;
+          acknowledged = true;
+          snapshotReceivedResolve();
+          const mode = options.afterSnapshot;
+          if (mode === "disconnect") { connection.close(); return; }
+          if (mode === "timeout") return;
+          if (mode === "malformed") { connection.send("not-json"); return; }
+          if (mode === "defect") { connection.send(JSON.stringify({ _tag: "Defect" })); return; }
+          if (mode === "end" || mode === "rpc") {
+            connection.send(JSON.stringify({ _tag: "Exit", requestId, exit: mode === "rpc"
+              ? { _tag: "Failure", cause: [{ _tag: "Fail", error: { message: "source read failed" } }] }
+              : { _tag: "Success", value: null } }));
+            return;
+          }
+          connection.send(JSON.stringify({ _tag: "Chunk", requestId, values: options.followingEvents ?? [{ version: 1, type: "usageLimitSourcesUpdated", payload: { sources: options.sources ?? [] } }] }));
+          return;
+        }
         calls.push(call);
+        requestId = call.id;
         if (options.mode === "disconnect") { connection.close(); return; }
         if (options.mode === "malformed") { connection.send("not-json"); return; }
-        const exit = options.mode === "rpc"
-          ? { _tag: "Failure", cause: [{ _tag: "Fail", error: { message: "requires orchestration:read" } }] }
-          : { _tag: "Success", value: config };
-        connection.send(JSON.stringify({ _tag: "Exit", requestId: call.id, exit }));
+        if (call.tag === "server.refreshProviders" && options.refreshStall) return;
+        if (options.mode === "rpc" || call.tag === "server.refreshProviders") {
+          const error = options.mode === "rpc" ? "requires orchestration:read" : options.refreshError;
+          connection.send(JSON.stringify({ _tag: "Exit", requestId, exit: error
+            ? { _tag: "Failure", cause: [{ _tag: "Fail", error: { message: error } }] }
+            : { _tag: "Success", value: null } }));
+          return;
+        }
+        expect(call.tag).toBe("subscribeServerConfig");
+        expect(call.payload).toEqual({ usageLimitSources: true });
+        connection.send(JSON.stringify({ _tag: "Chunk", requestId, values: options.events ?? [{ version: 1, type: "snapshot", config }] }));
       });
     });
   });
@@ -72,7 +105,8 @@ async function connected(config: unknown, options: { mode?: "auth" | "rpc" | "di
   await mcp.connect(serverTransport);
   await client.connect(clientTransport);
   cleanup.push(() => mcp.close(), () => client.close());
-  return { client, paths, calls, fixture, call: (args = {}) => client.callTool({ name: "t3_models_usage", arguments: args }) };
+  const rpcClient = new T3HttpClient(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, fake.accessToken, 200);
+  return { client, rpcClient, snapshotReceived, paths, calls, fixture, call: (args = {}) => client.callTool({ name: "t3_models_usage", arguments: args }) };
 }
 
 describe("t3_models_usage through MCP and authenticated RPC", () => {
@@ -103,10 +137,10 @@ describe("t3_models_usage through MCP and authenticated RPC", () => {
     for (const secret of ["secret-", "hidden-", "capabilities", "credentialFingerprint", "nextCreditId", "externalUsage", "auth", "settings", "config"]) {
       expect(JSON.stringify(result)).not.toContain(secret);
     }
-    expect(calls).toEqual([expect.objectContaining({ tag: "server.getConfig", payload: {} })]);
+    expect(calls).toEqual([expect.objectContaining({ tag: "subscribeServerConfig", payload: { usageLimitSources: true } })]);
     expect(paths).toEqual(["/.well-known/t3/environment", "/ws?orchestrationProtocol=2"]);
     const audit = await readFile(`${fixture.directory}/audit.jsonl`, "utf8");
-    expect(audit).toContain('"operation":"server.getConfig"');
+    expect(audit).toContain('"operation":"subscribeServerConfig"');
     expect(audit).not.toContain("secret-");
   });
 
@@ -154,6 +188,7 @@ describe("t3_models_usage through MCP and authenticated RPC", () => {
     { name: "out of range quota", config: { providers: [provider("bad", { checkedAt, windows: [{ ...window, usedPercent: 101 }] })] } },
     { name: "invalid quota time", config: { providers: [provider("bad", { checkedAt: "yesterday", windows: [] })] } },
     { name: "missing source time", config: { providers: [provider("bad", { windows: [] })] } },
+    { name: "positional auth", config: { providers: [{ ...provider("bad"), auth: ["private-label"] }] } },
   ])("returns schema errors for $name", async ({ config }) => {
     const { call } = await connected(config);
     expect(await call()).toMatchObject({ isError: true, structuredContent: { error: { code: "gateway_error", message: expect.stringContaining("invalid response") } } });
@@ -172,4 +207,117 @@ describe("t3_models_usage through MCP and authenticated RPC", () => {
     const { call } = await connected({ providers: [] });
     expect(await call()).toMatchObject({ structuredContent: { providers: [] } });
   });
+  it("returns source-only accounts, safe labels and exact native filtering without inferred allowances", async () => {
+    const limits = { checkedAt, windows: [{ ...window, id: "primary", kind: "other", label: "Primary", usedPercent: 18, windowDurationMins: 10080 }], unavailable: { reason: "probeFailed", message: "private-probe" }, credentialFingerprint: "private-fingerprint", resetCredits: { availableCount: 1, nextCreditId: "private-credit" } };
+    const source = { id: "proxy/private", kind: "future-source", label: "CLIProxy", checkedAt, error: "token=private-token https://private.example/secret", accounts: [{ id: "private@example.com", driver: "future-driver", email: "private@example.com", workspaceId: "private-workspace", plan: "Pro", usageLimits: limits }] };
+    const native = { ...provider("native", limits), auth: { label: "ChatGPT Pro 20x Subscription", token: "private-auth" }, plan: "private-native-plan" };
+    const { call, calls } = await connected({ providers: [native, provider("other")] }, { sources: [source, { ...source, id: "other-source" }] });
+    const result = await call({ providerInstanceId: " native " });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      refresh: { status: "notRequested" },
+      providers: [{ instanceId: "native", accountLabel: "ChatGPT Pro 20x Subscription", usage: { status: "probeFailed", windows: [{ kind: "other", remainingPercent: 82, windowDurationMins: 10080 }] } }],
+      sources: { status: "reported", items: [{ sourceRef: "src_558de6b776f54b2e", kind: "future-source", label: "CLIProxy", checkedAt, accounts: [{ accountRef: "acct_0ed7811796e95495", driver: "future-driver", plan: "Pro", usage: { status: "probeFailed", windows: [{ kind: "other", remainingPercent: 82 }] } }] }, expect.anything()] },
+    });
+    expect((result.structuredContent as { providers: unknown[] }).providers).toHaveLength(1);
+    for (const privateText of ["proxy/private", "private@", "private-", "workspaceId", "credentialFingerprint", "nextCreditId", '"auth"', '"plan":"private-native-plan"']) expect(JSON.stringify(result)).not.toContain(privateText);
+    expect((result.structuredContent as { sources: { items: unknown[] } }).sources.items).toHaveLength(2);
+    expect(result.structuredContent).toMatchObject({ sources: { items: [expect.anything(), { sourceRef: "src_e264ed6acf0e847e", accounts: [{ accountRef: "acct_732c733411f2e4be" }] }] } });
+    const again = await call();
+    expect(ModelsUsageOutputSchema.parse(again.structuredContent).sources).toEqual(ModelsUsageOutputSchema.parse(result.structuredContent).sources);
+    expect(calls).toHaveLength(2);
+    const onlySources = await connected({ providers: [] }, { sources: [source] });
+    expect((await onlySources.call()).structuredContent).toMatchObject({ providers: [], sources: { status: "reported", items: [{ accounts: [{ plan: "Pro" }] }] } });
+  });
+
+  it("accepts sources first and processes all values and provider status updates before completion", async () => {
+    const { call } = await connected({}, { events: [
+      { version: 1, type: "usageLimitSourcesUpdated", payload: { sources: [] } },
+    ], followingEvents: [
+      { version: 1, type: "snapshot", config: { providers: [provider("before")] } },
+      { version: 1, type: "providerStatuses", payload: { providers: [provider("after", { checkedAt, windows: [window] })] } },
+    ] });
+    expect((await call()).structuredContent).toMatchObject({ providers: [{ instanceId: "after", usage: { windows: [{ remainingPercent: 75 }] } }], sources: { status: "reported", items: [] } });
+  });
+
+  it.each(["end", "disconnect"] as const)("keeps missing sources distinct after %s", async (afterSnapshot) => {
+    const { call } = await connected({ providers: [] }, { afterSnapshot });
+    expect((await call()).structuredContent).toMatchObject({ providers: [], sources: { status: "unavailable", reason: afterSnapshot === "end" ? "streamEnded" : "disconnected" } });
+    const empty = await connected({ providers: [] });
+    expect((await empty.call()).structuredContent).toMatchObject({ sources: { status: "reported", items: [] } });
+  });
+
+  it("returns partial quotas on deadline and propagates explicit cancellation", async () => {
+    const { rpcClient } = await connected({ providers: [provider("native")] }, { afterSnapshot: "timeout" });
+    expect(await rpcClient.getUsageLimits()).toMatchObject({ providers: [{ instanceId: "native" }], sources: { status: "unavailable", reason: "timeout" } });
+    const absent = await connected({}, { events: [], afterSnapshot: "timeout" });
+    await expect(absent.rpcClient.getUsageLimits()).rejects.toThrow("without a provider snapshot");
+    const other = await connected({ providers: [provider("native")] }, { afterSnapshot: "timeout" });
+    const abort = new AbortController();
+    const cancelled = other.rpcClient.getUsageLimits({}, abort.signal);
+    await other.snapshotReceived;
+    abort.abort(new Error("explicit cancellation"));
+    await expect(cancelled).rejects.toThrow("explicit cancellation");
+  });
+
+  it.each(["rpc", "defect", "malformed"] as const)("does not hide %s errors after a provider snapshot", async (afterSnapshot) => {
+    const { call } = await connected({ providers: [] }, { afterSnapshot });
+    expect(await call()).toMatchObject({ isError: true, structuredContent: { error: { code: "gateway_error" } } });
+  });
+
+  it("refreshes once and keeps sanitized refresh failure beside a valid snapshot", async () => {
+    for (const refreshError of [undefined, "token=private-token https://private.example/secret"]) {
+      const { call, calls, fixture } = await connected({ providers: [] }, { refreshError });
+      const result = await call({ refresh: true });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({ refresh: { status: refreshError ? "failed" : "completed" }, providers: [], sources: { status: "reported", items: [] } });
+      expect(calls).toEqual([
+        expect.objectContaining({ tag: "server.refreshProviders", payload: {} }),
+        expect.objectContaining({ tag: "subscribeServerConfig", payload: { usageLimitSources: true } }),
+      ]);
+      if (refreshError) {
+        expect(result.structuredContent).toMatchObject({ refresh: { error: expect.stringContaining("[REDACTED]") } });
+        expect(JSON.stringify(result)).not.toContain("private-");
+      }
+      expect(await readFile(`${fixture.directory}/audit.jsonl`, "utf8")).toContain('"operation":"server.refreshProviders"');
+    }
+  });
+
+  it.each([
+    null, [null], [[]], [{ id: "proxy", kind: "cliproxy", label: "Proxy", checkedAt, accounts: [null] }],
+    [{ id: "proxy", kind: "cliproxy", label: "Proxy", checkedAt, accounts: [["account", "codex"]] }],
+    [{ id: "proxy", kind: "cliproxy", label: "Proxy", checkedAt, accounts: [{ id: "account", driver: "codex", usageLimits: [checkedAt, []] }] }],
+  ].map((sources) => ({ sources })))("rejects malformed external source boundaries %#", async ({ sources }) => {
+    const { call } = await connected({ providers: [] }, { events: [
+      { version: 1, type: "snapshot", config: { providers: [] } },
+      { version: 1, type: "usageLimitSourcesUpdated", payload: { sources } },
+    ] });
+    expect(await call()).toMatchObject({ isError: true, structuredContent: { error: { message: expect.stringContaining("invalid response") } } });
+  });
+
+  it("sanitizes permitted labels and plans without exposing private text", async () => {
+    const privateText = "token=private-value https://private.example/secret";
+    const { call } = await connected({ providers: [{ ...provider("native"), auth: { label: privateText } }] }, { sources: [{
+      id: "source", kind: "cliproxy", label: privateText, checkedAt,
+      accounts: [{ id: "account", driver: "codex", plan: privateText, usageLimits: { checkedAt, windows: [] } }],
+    }] });
+    const result = await call();
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      providers: [{ accountLabel: expect.stringContaining("[REDACTED]") }],
+      sources: { items: [{ label: expect.stringContaining("[REDACTED]"), accounts: [{ plan: expect.stringContaining("[REDACTED]") }] }] },
+    });
+    expect(JSON.stringify(result)).not.toContain("private-");
+  });
+
+});
+
+it("returns cached snapshots after a refresh timeout", async () => {
+  const { rpcClient, calls } = await connected({ providers: [provider("cached")] }, { refreshStall: true });
+  const result = await rpcClient.getUsageLimits({ refresh: true });
+  expect(result).toMatchObject({ refresh: { status: "failed" }, providers: [{ instanceId: "cached" }], sources: { status: "reported", items: [] } });
+  expect(calls).toEqual([
+    expect.objectContaining({ tag: "server.refreshProviders" }),
+    expect.objectContaining({ tag: "subscribeServerConfig" }),
+  ]);
 });

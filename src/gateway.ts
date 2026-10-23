@@ -1,3 +1,4 @@
+import { validateUsageHistoryInput } from "./t3/usage-history.js";
 import { modelsUsage } from "./t3/models-usage.js";
 import { compareFailureOrder } from "./t3/failure-order.js";
 import { randomUUID } from "node:crypto";
@@ -919,16 +920,28 @@ export class T3Gateway {
     };
   }
 
-  async modelsUsage(input: { readonly providerInstanceId?: string }) {
+  async usageHistory(input: unknown) {
+    let parsed;
+    try {
+      parsed = validateUsageHistoryInput(input);
+    } catch (error) {
+      throw new GatewayError("invalid_request", safeErrorMessage(error));
+    }
     const environmentId = await this.environmentId();
-    const providers = await this.client.getProviders();
+    const summary = await this.client.getUsageHistory(parsed);
+    return { environmentId, observedAt: new Date().toISOString(), ...summary };
+  }
+
+  async modelsUsage(input: { readonly providerInstanceId?: string; readonly refresh?: boolean }) {
+    const environmentId = await this.environmentId();
+    const { providers, sources, refresh } = await this.client.getUsageLimits(input);
     const selected = input.providerInstanceId === undefined
       ? providers
       : providers.filter((provider) => provider.instanceId === input.providerInstanceId);
     if (input.providerInstanceId !== undefined && selected.length === 0) {
       throw new GatewayError("provider_instance_not_found", `Provider instance ${input.providerInstanceId} was not found in the connected T3 environment.`);
     }
-    return { environmentId, observedAt: new Date().toISOString(), providers: modelsUsage(selected) };
+    return { environmentId, observedAt: new Date().toISOString(), providers: modelsUsage(selected), sources, refresh };
   }
 
   async threadsList(input: {

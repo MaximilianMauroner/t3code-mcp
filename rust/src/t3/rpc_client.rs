@@ -4,8 +4,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    connect_async_with_config,
+    tungstenite::{Message, client::IntoClientRequest, protocol::WebSocketConfig},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +16,68 @@ pub async fn request_t3_rpc<T: DeserializeOwned>(
     method: &str,
     payload: Value,
     cancel: Option<&CancellationToken>,
+) -> Result<T, Box<ClientError>> {
+    collect_t3_rpc(
+        base_url,
+        access_token,
+        timeout,
+        method,
+        payload,
+        cancel,
+        |event| match event {
+            RpcEvent::Success(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(|_| invalid(method)),
+            RpcEvent::Interrupted(StreamEnd::Timeout) => Err(ClientError::boxed(
+                ErrorKind::Timeout,
+                "The operation was aborted due to timeout",
+            )),
+            RpcEvent::Interrupted(_) => Err(ClientError::boxed(
+                ErrorKind::Rpc,
+                format!("T3 RPC {method} disconnected before acknowledgement."),
+            )),
+            RpcEvent::Chunk(_) => Ok(None),
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub enum StreamEnd {
+    Timeout,
+    StreamEnded,
+    Disconnected,
+}
+impl StreamEnd {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::StreamEnded => "streamEnded",
+            Self::Disconnected => "disconnected",
+        }
+    }
+}
+pub enum RpcEvent {
+    Chunk(Vec<Value>),
+    Success(Value),
+    Interrupted(StreamEnd),
+}
+
+fn invalid(method: &str) -> Box<ClientError> {
+    ClientError::boxed(
+        ErrorKind::Rpc,
+        format!("T3 RPC {method} returned an invalid response."),
+    )
+}
+
+pub async fn collect_t3_rpc<T>(
+    base_url: &str,
+    access_token: &str,
+    timeout: Duration,
+    method: &str,
+    payload: Value,
+    cancel: Option<&CancellationToken>,
+    mut collect: impl FnMut(RpcEvent) -> Result<Option<T>, Box<ClientError>>,
 ) -> Result<T, Box<ClientError>> {
     let execute = async {
         let mut url = url::Url::parse(&format!("{}/ws", base_url.trim_end_matches('/')))
@@ -34,7 +96,17 @@ pub async fn request_t3_rpc<T: DeserializeOwned>(
                 .parse()
                 .map_err(|_| ClientError::boxed(ErrorKind::Rpc, "Invalid authorization header."))?,
         );
-        let (mut socket, _) = connect_async(request).await.map_err(|e| match e {
+        let (mut socket, _) = connect_async_with_config(
+            request,
+            Some(
+                WebSocketConfig::default()
+                    .max_message_size(Some(64 * 1024 * 1024))
+                    .max_frame_size(Some(64 * 1024 * 1024)),
+            ),
+            false,
+        )
+        .await
+        .map_err(|e| match e {
             tokio_tungstenite::tungstenite::Error::Http(response) => ClientError::boxed(
                 ErrorKind::Rpc,
                 format!(
@@ -61,25 +133,25 @@ pub async fn request_t3_rpc<T: DeserializeOwned>(
                     format!("T3 RPC {method} connection failed."),
                 )
             })?;
+        let mut bytes = 0usize;
         while let Some(message) = socket.next().await {
             let data = match message {
                 Ok(Message::Text(t)) => t.to_string(),
                 Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
                 Ok(Message::Close(_)) => break,
                 Ok(_) => continue,
-                Err(_) => {
-                    return Err(ClientError::boxed(
-                        ErrorKind::Rpc,
-                        format!("T3 RPC {method} connection failed."),
-                    ));
-                }
+                Err(
+                    tokio_tungstenite::tungstenite::Error::Io(_)
+                    | tokio_tungstenite::tungstenite::Error::ConnectionClosed
+                    | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
+                ) => break,
+                Err(_) => return Err(invalid(method)),
             };
-            let invalid = || {
-                ClientError::boxed(
-                    ErrorKind::Rpc,
-                    format!("T3 RPC {method} returned an invalid response."),
-                )
-            };
+            bytes = bytes.saturating_add(data.len());
+            if bytes > 64 * 1024 * 1024 {
+                return Err(invalid(method));
+            }
+            let invalid = || invalid(method);
             let frame: Value = serde_json::from_str(&data).map_err(|_| invalid())?;
             let frames = if let Value::Array(v) = frame {
                 v
@@ -100,13 +172,36 @@ pub async fn request_t3_rpc<T: DeserializeOwned>(
                 {
                     return Err(invalid());
                 }
-                if tag != "Exit" || frame["requestId"] != id || frame.get("exit").is_none() {
+                if frame["requestId"] != id {
                     continue;
+                }
+                if tag == "Chunk" {
+                    let values = frame["values"].as_array().ok_or_else(invalid)?.clone();
+                    let value = collect(RpcEvent::Chunk(values))?;
+                    let ack = socket
+                        .send(Message::Text(
+                            json!({"_tag":"Ack","requestId":id}).to_string().into(),
+                        ))
+                        .await;
+                    if let Some(value) = value {
+                        return Ok(value);
+                    }
+                    if ack.is_err() {
+                        return collect(RpcEvent::Interrupted(StreamEnd::Disconnected))?
+                            .ok_or_else(invalid);
+                    }
+                    continue;
+                }
+                if tag != "Exit" {
+                    continue;
+                }
+                if !frame["exit"].is_object() {
+                    return Err(invalid());
                 }
                 match frame["exit"]["_tag"].as_str() {
                     Some("Success") => {
-                        return serde_json::from_value(frame["exit"]["value"].clone())
-                            .map_err(|_| invalid());
+                        return collect(RpcEvent::Success(frame["exit"]["value"].clone()))?
+                            .ok_or_else(invalid);
                     }
                     Some("Failure") => {
                         let causes = frame["exit"]["cause"].as_array().ok_or_else(invalid)?;
@@ -125,10 +220,7 @@ pub async fn request_t3_rpc<T: DeserializeOwned>(
                 }
             }
         }
-        Err(ClientError::boxed(
-            ErrorKind::Rpc,
-            format!("T3 RPC {method} disconnected before acknowledgement."),
-        ))
+        collect(RpcEvent::Interrupted(StreamEnd::Disconnected))?.ok_or_else(|| invalid(method))
     };
     let cancelled = async {
         match cancel {
@@ -136,5 +228,15 @@ pub async fn request_t3_rpc<T: DeserializeOwned>(
             None => std::future::pending().await,
         }
     };
-    tokio::select! {biased; _=cancelled=>Err(ClientError::boxed(ErrorKind::Cancelled,"The operation was aborted.")),result=tokio::time::timeout(timeout,execute)=>result.unwrap_or_else(|_|Err(ClientError::boxed(ErrorKind::Timeout,"The operation was aborted due to timeout")))}
+    let result = tokio::select! {
+        biased;
+        _=cancelled => return Err(ClientError::boxed(ErrorKind::Cancelled,"The operation was aborted.")),
+        result=tokio::time::timeout(timeout,execute) => result,
+    };
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            collect(RpcEvent::Interrupted(StreamEnd::Timeout))?.ok_or_else(|| invalid(method))
+        }
+    }
 }

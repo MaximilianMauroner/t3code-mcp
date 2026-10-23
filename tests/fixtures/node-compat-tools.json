@@ -1388,9 +1388,337 @@
     }
   },
   {
+    "name": "t3_usage_history",
+    "title": "Read T3 Usage tab history",
+    "description": "Read the same token and cost history as T3 Code's Usage tab through server.getUsageSummary. Requires diagnostics:read. sinceDay and untilDay are inclusive calendar dates in timeZone. Limit date windows to 366 days. Hour resolution requires both sinceTime and untilTime, with an interval greater than zero and at most 24 hours. awaitRefresh waits for slow sources; otherwise a source may report refreshing:true. Preserves provider/model buckets, source statuses and pricing provenance. reasoningTokens are a subset of outputTokens. Bucket session counts can overlap; use source distinctSessions. Cost totals are history, not remaining subscription allowance. Source identifiers are pseudonymous and transcript paths are omitted.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "sinceDay": {
+          "type": "string"
+        },
+        "untilDay": {
+          "type": "string"
+        },
+        "timeZone": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution": {
+          "type": "string",
+          "enum": [
+            "day",
+            "hour"
+          ]
+        },
+        "sinceTime": {
+          "type": "string"
+        },
+        "untilTime": {
+          "type": "string"
+        },
+        "awaitRefresh": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sinceDay",
+        "untilDay",
+        "timeZone"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "outputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+        },
+        "contractVersion": {
+          "type": "number"
+        },
+        "readAt": {
+          "type": "string"
+        },
+        "timeZone": {
+          "type": "string"
+        },
+        "sinceDay": {
+          "type": "string"
+        },
+        "untilDay": {
+          "type": "string"
+        },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "day": {
+                "type": "string"
+              },
+              "hourStart": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string",
+                "description": "Usage provider kind. Known values are claude, codex, grok, cursor, opencode, antigravity, and pi. Future provider strings are retained."
+              },
+              "model": {
+                "type": "string"
+              },
+              "totals": {
+                "type": "object",
+                "properties": {
+                  "uncachedInputTokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "cachedInputTokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "cacheCreationTokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "outputTokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "reasoningTokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "uncachedInputTokens",
+                  "cachedInputTokens",
+                  "cacheCreationTokens",
+                  "outputTokens",
+                  "reasoningTokens"
+                ],
+                "additionalProperties": false
+              },
+              "costUsd": {
+                "type": "number"
+              },
+              "cacheSavingsUsd": {
+                "type": "number"
+              },
+              "categoryCostUsd": {
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "number"
+                  },
+                  "cacheRead": {
+                    "type": "number"
+                  },
+                  "cacheWrite": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "input",
+                  "cacheRead",
+                  "cacheWrite",
+                  "output"
+                ],
+                "additionalProperties": false
+              },
+              "fastCostUsd": {
+                "type": "number"
+              },
+              "ultrafastCostUsd": {
+                "type": "number"
+              },
+              "speedPremiumUsd": {
+                "type": "number"
+              },
+              "costSource": {
+                "type": "string",
+                "description": "Cost provenance, including providerReported, modelPriced, or unpriced. Future values are retained."
+              },
+              "records": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "unpricedRecords": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "sessions": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "day",
+              "provider",
+              "model",
+              "totals",
+              "costUsd",
+              "cacheSavingsUsd",
+              "costSource",
+              "records",
+              "unpricedRecords",
+              "sessions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "pricing": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "fresh",
+                "cached",
+                "unavailable"
+              ]
+            },
+            "source": {
+              "type": "string"
+            },
+            "fetchedAt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "knownModels": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "status",
+            "source",
+            "fetchedAt",
+            "knownModels"
+          ],
+          "additionalProperties": false
+        },
+        "scanDurationMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "description": "Source status, including ok, missing, partial, or failed. Future values are retained."
+              },
+              "scannedFiles": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "skippedFiles": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "malformedRecords": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "distinctSessions": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "message": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "action": {
+                "type": "string"
+              },
+              "refreshing": {
+                "type": "boolean",
+                "const": true
+              },
+              "sourceRef": {
+                "type": "string",
+                "minLength": 16,
+                "maxLength": 16,
+                "pattern": "^[a-f0-9]{16}$"
+              },
+              "provider": {
+                "type": "string",
+                "description": "Usage provider kind. Known values are claude, codex, grok, cursor, opencode, antigravity, and pi. Future provider strings are retained."
+              }
+            },
+            "required": [
+              "status",
+              "scannedFiles",
+              "skippedFiles",
+              "malformedRecords",
+              "distinctSessions",
+              "message",
+              "sourceRef",
+              "provider"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "environmentId",
+        "observedAt",
+        "contractVersion",
+        "readAt",
+        "timeZone",
+        "sinceDay",
+        "untilDay",
+        "buckets",
+        "pricing",
+        "scanDurationMs",
+        "sources"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "t3_models_usage",
     "title": "List T3 models and reported usage",
-    "description": "Read the complete model catalog and usage snapshot for each provider instance. Optionally filter by exact providerInstanceId. Windows are provider/account reported and labels can scope subsets of models. They are shared budgets, never independent per-model allowances. Do not sum windows or providers. remainingPercent is 100 minus usedPercent. Source checkedAt is distinct from this call's observedAt. Missing, unsupported, failed probes, and empty windows are explicit states and do not mean unlimited usage. Valid windows remain visible when a probe is unavailable. This read does not refresh providers or credentials.",
+    "description": "Read the complete model catalog and usage snapshots for native providers and external account sources. Optionally filter native providers by exact providerInstanceId. The filter does not affect sources. Windows are provider/account reported and labels can scope subsets of models. They are shared budgets, never independent per-model allowances. Do not sum windows or providers. remainingPercent is 100 minus usedPercent. Source checkedAt is distinct from this call's observedAt. Missing, unsupported, failed probes, and empty windows are explicit states and do not mean unlimited usage. Valid windows remain visible when a probe is unavailable. Set refresh to true to request server.refreshProviders once before reading. Refresh failure is reported separately. No plan-wide allowance is inferred.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "type": "object",
@@ -1398,6 +1726,10 @@
         "providerInstanceId": {
           "type": "string",
           "minLength": 1
+        },
+        "refresh": {
+          "default": false,
+          "type": "boolean"
         }
       }
     },
@@ -1458,6 +1790,9 @@
                 "type": "string",
                 "format": "date-time",
                 "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "accountLabel": {
+                "type": "string"
               },
               "models": {
                 "type": "array",
@@ -1651,12 +1986,288 @@
             ],
             "additionalProperties": false
           }
+        },
+        "refresh": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "notRequested",
+                    "completed"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "const": "failed"
+                },
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "error"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "sources": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "const": "reported"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "sourceRef": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "kind": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "checkedAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "error": {
+                        "type": "string"
+                      },
+                      "accounts": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "accountRef": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "driver": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "plan": {
+                              "type": "string"
+                            },
+                            "usage": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "status": {
+                                      "type": "string",
+                                      "const": "missing"
+                                    },
+                                    "windows": {
+                                      "type": "array",
+                                      "items": {
+                                        "not": {}
+                                      }
+                                    }
+                                  },
+                                  "required": [
+                                    "status",
+                                    "windows"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "checkedAt": {
+                                      "type": "string",
+                                      "format": "date-time",
+                                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                                    },
+                                    "unavailable": {
+                                      "type": "object",
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string",
+                                          "enum": [
+                                            "unsupported",
+                                            "probeFailed"
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "reason"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    "resetCredits": {
+                                      "type": "object",
+                                      "properties": {
+                                        "availableCount": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "nextExpiresAt": {
+                                          "type": "string",
+                                          "format": "date-time",
+                                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                                        }
+                                      },
+                                      "required": [
+                                        "availableCount"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    "status": {
+                                      "type": "string",
+                                      "enum": [
+                                        "reported",
+                                        "unsupported",
+                                        "probeFailed",
+                                        "empty"
+                                      ]
+                                    },
+                                    "windows": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "object",
+                                        "properties": {
+                                          "id": {
+                                            "type": "string",
+                                            "minLength": 1
+                                          },
+                                          "kind": {
+                                            "type": "string",
+                                            "enum": [
+                                              "session",
+                                              "weekly",
+                                              "monthly",
+                                              "other"
+                                            ]
+                                          },
+                                          "label": {
+                                            "type": "string",
+                                            "minLength": 1
+                                          },
+                                          "usedPercent": {
+                                            "type": "number",
+                                            "minimum": 0,
+                                            "maximum": 100
+                                          },
+                                          "resetsAt": {
+                                            "type": "string",
+                                            "format": "date-time",
+                                            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                                          },
+                                          "windowDurationMins": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "remainingPercent": {
+                                            "type": "number",
+                                            "minimum": 0,
+                                            "maximum": 100
+                                          }
+                                        },
+                                        "required": [
+                                          "id",
+                                          "kind",
+                                          "label",
+                                          "usedPercent",
+                                          "remainingPercent"
+                                        ],
+                                        "additionalProperties": false
+                                      }
+                                    }
+                                  },
+                                  "required": [
+                                    "checkedAt",
+                                    "status",
+                                    "windows"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "accountRef",
+                            "driver",
+                            "usage"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "sourceRef",
+                      "kind",
+                      "label",
+                      "checkedAt",
+                      "accounts"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "status",
+                "items"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "const": "unavailable"
+                },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "timeout",
+                    "streamEnded",
+                    "disconnected"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "additionalProperties": false
+            }
+          ]
         }
       },
       "required": [
         "environmentId",
         "observedAt",
-        "providers"
+        "providers",
+        "refresh",
+        "sources"
       ],
       "additionalProperties": false
     }

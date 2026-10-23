@@ -99,6 +99,8 @@ describe("Usage tab history through public MCP and authenticated RPC", () => {
       { ...input, sinceDay: "2026-02-30" },
       { ...input, sinceDay: "2026-10-24" },
       { ...input, sinceDay: "2024-01-01" },
+      { ...input, resolution: "hour" },
+      { ...input, resolution: "hour", sinceTime: "2026-10-23T00:00:00Z", untilTime: "2026-10-23T00:00:00Z" },
     ]) {
       const result = await call(args);
       expect(result.isError).toBe(true);

@@ -64,6 +64,7 @@ describe("MCP tool contract", () => {
       "t3_tasks_list",
       "t3_threads_list",
       "t3_threads_overview",
+      "t3_usage_history",
     ]);
     expect(names).not.toContain("t3_call_rpc");
     expect(names).not.toContain("t3_terminal_write");

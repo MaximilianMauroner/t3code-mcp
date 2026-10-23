@@ -387,6 +387,7 @@ impl T3Gateway {
         let value = match tool {
             GatewayTool::ConnectionStatus => self.connection_status().await,
             GatewayTool::ModelsUsage => self.models_usage(&call.arguments).await?,
+            GatewayTool::UsageHistory => self.usage_history(&call.arguments).await?,
             GatewayTool::AuditLog => return self.audit_query(&call.arguments),
             GatewayTool::GitStatus => self.git_status(&call.arguments).await?,
             GatewayTool::GitDiff => self.git_diff(&call.arguments).await?,
@@ -408,20 +409,50 @@ impl T3Gateway {
             .map_err(|error| ToolFailure::new("gateway_error", error.to_string()))
     }
 
-    async fn models_usage(&self, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
-        let provider_id = optional_string(args, "providerInstanceId")?;
+    async fn usage_history(&self, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+        let input = crate::t3::usage_history::validate_input(args)
+            .map_err(|message| ToolFailure::new("invalid_request", message))?;
         let descriptor = self
             .client
             .get_descriptor(None)
             .await
             .map_err(|error| ToolFailure::new("gateway_error", error.message))?;
         self.assert_environment(&descriptor)?;
-        let providers = self
+        let mut summary = self
             .client
-            .get_providers(None)
+            .get_usage_history(input, None)
             .await
             .map_err(|error| ToolFailure::new("gateway_error", error.message))?;
-        let selected = providers
+        summary["environmentId"] = json!(descriptor.environment_id);
+        summary["observedAt"] = json!(now_iso());
+        Ok(summary)
+    }
+
+    async fn models_usage(&self, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+        let provider_id = optional_string(args, "providerInstanceId")?;
+        let refresh = match args.get("refresh") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(ToolFailure::new(
+                    "invalid_arguments",
+                    "refresh must be a boolean.",
+                ));
+            }
+        };
+        let descriptor = self
+            .client
+            .get_descriptor(None)
+            .await
+            .map_err(|error| ToolFailure::new("gateway_error", error.message))?;
+        self.assert_environment(&descriptor)?;
+        let usage = self
+            .client
+            .get_usage_limits(refresh, None)
+            .await
+            .map_err(|error| ToolFailure::new("gateway_error", error.message))?;
+        let selected = usage
+            .providers
             .into_iter()
             .filter(|provider| {
                 provider_id
@@ -440,7 +471,9 @@ impl T3Gateway {
         Ok(json!({
             "environmentId":descriptor.environment_id,
             "observedAt":now_iso(),
-            "providers":selected.into_iter().map(|provider| provider.into_usage()).collect::<Vec<_>>()
+            "providers":selected.into_iter().map(|provider| provider.into_usage()).collect::<Vec<_>>(),
+            "sources":usage.sources,
+            "refresh":usage.refresh
         }))
     }
 
