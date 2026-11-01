@@ -35,7 +35,7 @@ Start with `MCP_READ_ONLY=true`, connect only trusted clients, and review the [s
 
 ## Quick start
 
-Install Cargo and Rust 1.88 or newer. The package commands and TypeScript reference checks also need Node.js 20 or newer and pnpm.
+Install Cargo and Rust 1.88 or newer. The package commands and TypeScript reference checks also need Node.js 22.13 or newer and pnpm 11.16.0.
 
 Run from the repository root:
 

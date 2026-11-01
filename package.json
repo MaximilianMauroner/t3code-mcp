@@ -1,11 +1,12 @@
 {
   "name": "t3-code-mcp",
   "version": "0.1.0",
+  "packageManager": "pnpm@11.16.0",
   "private": true,
   "description": "MCP tools for hands-free T3 Code workflows through GPTVoice.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "scripts": {
     "build": "cargo build --locked --release --manifest-path rust/Cargo.toml --bin t3-code-mcp",
