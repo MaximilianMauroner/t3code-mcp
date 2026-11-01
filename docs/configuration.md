@@ -8,7 +8,7 @@ For T3 orchestration protocol 2, the upstream URL must route HTTP API requests a
 
 ## Run the gateway
 
-Install Cargo and Rust 1.88 or newer. Install Node.js 20 or newer and pnpm for the package commands, then build:
+Install Cargo and Rust 1.88 or newer. Install Node.js 22.13 or newer and pnpm 11.16.0 for the package commands, then build:
 
 ```sh
 pnpm install
